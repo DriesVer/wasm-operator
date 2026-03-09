@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+SCRIPT_ROOT=$(realpath $(dirname "${BASH_SOURCE}"))
+source "${SCRIPT_ROOT}/tool.sh"
+source "${SCRIPT_ROOT}/lib_functions.sh"
+
+check_tool rust
+check_tool docker
+check_tool kind
+check_tool kubectl
+check_tool wasm-opt
+check_tool cross
+
+cd "${SCRIPT_ROOT}/.."
+
+if [ $# -ne 1 ]; then
+    echo -e "\033[0;31mERROR:\033[0m \t Number of controllers argument is required"
+    echo -e "\t Usage: $0 <number-of-controllers>"
+    exit 1
+fi
+NR_CONTROLLERS=$1
+
+export RUST_BACKTRACE=1
+export COMPILE_WITH_UNINSTANTIATE="TRUE"
+
+# Build the WASM binary & parent controller
+echo ">> Build the WASM binary & parent controller"
+pushd pkg/controller
+ARCH=$(uname -m)
+if [ "$ARCH" == "aarch64" ]; then
+    # Using native cargo build for aarch64 as cross has docker emulation issues
+    cargo build --release --target=aarch64-unknown-linux-musl
+else
+    cross build --release --target=x86_64-unknown-linux-musl
+fi
+popd
+
+CONTROLLER_NAMES=()
+
+pushd controllers/ring-rust-controller
+mkdir -p bin_wasm/
+
+# Compile the ring controller once with "REPLACE_MEREPLACE_ME" as nonce
+echo ">> Build the controller wasm rust"
+# Split in 2 lines?
+COMPILE_NONCE="REPLACE_MEREPLACE_ME" cargo component build --release --features client-wasi --target-dir ./target
+echo ">> optimise wasm"
+# why use wasm opt when it is default already optimised using cargo component
+wasm-opt --version
+#wasm-opt -Os ./target/wasm32-wasip1/release/ring-pod-example.wasm -o ./target/wasm32-wasip1/release/ring-pod-example.opt.wasm
+#cp ./target/wasm32-wasip1/release/ring-pod-example.opt.wasm ./bin_wasm/ring-rust-example.REPLACE_ME.wasm
+cp ./target/wasm32-wasip1/release/ring-pod-example.wasm ./bin_wasm/ring-rust-example.REPLACE_ME.wasm
+
+# Create unique versions of the controller by replacing the "REPLACE_MEREPLACE_ME" nonce value
+echo ">> Create variants"
+for ((i = 0; i < NR_CONTROLLERS; i++)); do
+    CONTROLLER_NAME="controller${i}"
+    NONCE_VALUE=$(echo $CONTROLLER_NAME | md5sum | head -c 20)
+    sed -e "s|REPLACE_MEREPLACE_ME|$NONCE_VALUE|" ./bin_wasm/ring-rust-example.REPLACE_ME.wasm >./bin_wasm/ring-rust-example.$CONTROLLER_NAME.wasm
+    CONTROLLER_NAMES+=($CONTROLLER_NAME)
+done
+popd
+
+pushd tests/wasm_rust
+rm -rf ./temp/ && mkdir -p ./temp/deploy/
+
+cp ../../pkg/controller/target/${ARCH}-unknown-linux-musl/release/controller ./temp/
+#cp ../../pkg/controller/target/x86_64-unknown-linux-musl/debug/controller ./temp/
+cp ../../controllers/ring-rust-controller/bin_wasm/*.wasm ./temp/
+
+HEAP_MEM_SIZE="90000000"
+generate_wasm_yaml_file $HEAP_MEM_SIZE $NR_CONTROLLERS "wasm-rust" >./temp/wasm_config.yaml
+
+# Build the docker image
+echo ">> Build the docker image"
+local_tag="controller0"
+docker build -f Dockerfile -t "github.com/amurant/wasm_rust:${local_tag}" ./temp/
+
+# Load the docker images
+echo ">> Load the docker images into cluster '${KIND_CLUSTER_NAME}'"
+kind load docker-image --name "${KIND_CLUSTER_NAME}" "github.com/amurant/wasm_rust:${local_tag}"
+
+# Generate the yaml files
+echo ">> Generate the yaml files"
+generate_namespace_yaml_file $NR_CONTROLLERS "wasm-rust" >temp/deploy/01_namespaces.yaml
+generate_pod_yaml_file $NR_CONTROLLERS "wasm-rust" "github.com/amurant/wasm_rust:" >temp/deploy/02_pod.yaml
+popd
+
+echo ">> Deploy manifests"
+
+# Setup CRDs, Namespaces, RBAC rules
+kubectl apply -f ./tests/yaml/metricsServer.yaml
+kubectl apply -f ./tests/yaml/crd.yaml
+kubectl apply -f ./tests/yaml/namespace.yaml
+kubectl apply -f ./tests/yaml/rbac.yaml
+
+echo ">> Deploy first"
+
+# Setup CRDs, Namespaces, RBAC rules
+kubectl apply -f ./tests/wasm_rust/temp/deploy/
+
+echo ">> Deploy second"
+
+# Wait for pods to become ready
+kubectl -n wasm-rust wait --for=condition=ready pod --all --timeout=3000s

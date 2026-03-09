@@ -1,0 +1,18 @@
+package local:operator@0.2.0;
+
+// The core world without WASI imports.
+world kube-operator {
+    use types.{reconcile-request, reconcile-result, watch-request};
+    import kubernetes;
+
+    export get-watch-requests: func() -> list<watch-request>;
+    export serialize: func() -> list<u8>;
+    export deserialize: func(state: list<u8>);
+    export reconcile: func(req: reconcile-request) -> reconcile-result;
+}
+
+// The world for go child operators, which includes the core world and WASI.
+world child-world {
+    include kube-operator;
+    include wasi:cli/imports@0.2.6;
+}

@@ -1,0 +1,12 @@
+target
+temp
+build
+temp_*
+*.wasm
+.idea
+bin/
+__pycache__
+tested-operators/
+
+# Crash dumps of qemu
+*.core 

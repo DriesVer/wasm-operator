@@ -1,0 +1,36 @@
+package local:operator@0.2.0;
+
+interface types {
+    record watch-request {
+        kind: string,
+        namespace: string,
+    }
+
+    record reconcile-request {
+        event-type: event-type,
+        name: string,
+        namespace: string,
+        resource-json: string,
+    }
+
+    variant reconcile-result {
+        ok,
+        error(string),
+        requeue(u32),
+    }
+
+    enum event-type {
+        added,
+        modified,
+        deleted,
+    }
+
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+}
+

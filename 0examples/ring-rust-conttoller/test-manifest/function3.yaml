@@ -1,0 +1,7 @@
+apiVersion: amurant.io/v1
+kind: TestResource
+metadata:
+  name: function3
+  namespace: wasm-rust3
+spec:
+  nonce: 1

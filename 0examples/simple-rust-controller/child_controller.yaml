@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: controller
+  namespace: wasm-rust-simple
+spec:
+  serviceAccountName: custom-controller
+  containers:
+    - name: controller
+      image: "wasm-operator-simple-rust:latest"
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: RUST_LOG
+          value: "info"
+        - name: PREDICTION_SERVER
+          value: "{{REPLACE.PREDICTION_SERVER_URL}}"
+      resources:
+        requests:
+          memory: "640Mi"
+        limits:
+          memory: "1280Mi"
