@@ -1,5 +1,5 @@
 name: "simple-child-controller"
-wasm: ./child_controller.wasm
+wasm: ./simple_child_controller.wasm
 env:
   - name: RUST_LOG
     value: "info"

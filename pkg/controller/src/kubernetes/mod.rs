@@ -11,6 +11,47 @@ use kube::{Client, Config, Discovery};
 use serde_json::Value;
 use std::convert::TryFrom;
 
+const IMMUTABLE_METADATA_FIELDS: &[&str] = &[
+    "creationTimestamp",
+    "deletionGracePeriodSeconds",
+    "deletionTimestamp",
+    "generateName",
+    "generation",
+    "managedFields",
+    "resourceVersion",
+    "selfLink",
+    "uid",
+];
+const IMMUTABLE_METADATA_FIELDS_SNAKE_CASE: &[&str] = &[
+    "creation_timestamp",
+    "deletion_grace_period_seconds",
+    "deletion_timestamp",
+    "generate_name",
+    "generation",
+    "managed_fields",
+    "resource_version",
+    "self_link",
+    "uid",
+];
+
+fn sanitize_patch_payload(resource: &mut Value) {
+    let Some(obj) = resource.as_object_mut() else {
+        return;
+    };
+
+    if let Some(metadata) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
+        // Avoid sending immutable/server-managed metadata fields in updates.
+        for &key in IMMUTABLE_METADATA_FIELDS {
+            metadata.remove(key);
+        }
+        for &key in IMMUTABLE_METADATA_FIELDS_SNAKE_CASE {
+            metadata.remove(key);
+        }
+
+        metadata.retain(|_, value| !value.is_null());
+    }
+}
+
 /// A service for interacting with the Kubernetes API dynamically.
 ///
 /// This service discovers available API resources at startup and provides
@@ -109,12 +150,21 @@ impl KubernetesService {
         name: &str,
         namespace: &str,
         resource_json: &str,
+        sanitize: bool,
     ) -> Result<()> {
         let (ar, _) = self.find_api_resource(kind)?;
         let api = self.dynamic_api(ar, namespace);
-        let resource: Value = serde_json::from_str(resource_json)
+        let mut resource: Value = serde_json::from_str(resource_json)
             .context("Failed to deserialize resource from JSON for update")?;
-        api.patch(name, &PatchParams::apply(kind), &Patch::Apply(&resource))
+
+        if sanitize {
+            sanitize_patch_payload(&mut resource);
+        }
+
+        // Force needed if the resource was created by another controller e.g. client-side apply
+        let pp = PatchParams::apply(kind).force();
+
+        let result = api.patch(name, &pp, &Patch::Apply(&resource))
             .await
             .context("Failed to update resource")?;
         Ok(())

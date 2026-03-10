@@ -41,6 +41,7 @@ wasmop_build() {
 
     export RUST_BACKTRACE=1
     export COMPILE_WITH_UNINSTANTIATE="TRUE"
+    export RUSTFLAGS="-A warnings"
 
     mkdir -p "./build"
 
@@ -98,17 +99,18 @@ wasmop_load() {
         SERVER+=":5000/"
         echo "Server URL: $SERVER"
         sed "s|{{REPLACE.PREDICTION_SERVER_URL}}|$SERVER|" "./child_controller.yaml" > ./build/child_controller_parsed.yaml
-        kubectl apply -f ./build/child_controller_parsed.yaml
+        # kubectl apply -f ./build/child_controller_parsed.yaml
+        kubectl replace --force -f ./build/child_controller_parsed.yaml
     else
-        kubectl apply -f ./child_controller.yaml
+        # kubectl apply -f ./child_controller.yaml
+        kubectl replace --force -f ./child_controller.yaml
     fi
 
     # Wait for the controller pod to be running
     echo -e "\033[1m\nWaiting for the controller pod to be running\033[0m"
-    #kubectl wait --namespace $namespace --for=condition=Ready pod/controller --timeout=3000s
-    kubectl wait --namespace $namespace \
-        --for=condition=Ready pods --all \
-        --field-selector=status.phase!=Succeeded,status.phase!=Failed \
-        --timeout=3000s
+    # kubectl wait --namespace $namespace \
+    #     --for=condition=Ready pods --all \
+    #     --field-selector=status.phase!=Succeeded,status.phase!=Failed \
+    #     --timeout=3000s
 
 }

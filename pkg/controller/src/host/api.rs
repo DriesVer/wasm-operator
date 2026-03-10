@@ -82,12 +82,13 @@ impl bindings::local::operator::kubernetes::Host for State {
         name: String,
         namespace: String,
         resource_json: String,
+        sanitize: bool,
     ) -> impl Future<Output=Result<(), String>> + Send {
         async move {
             self.kubernetes_service
-                .update_resource(&kind, &name, &namespace, &resource_json)
+                .update_resource(&kind, &name, &namespace, &resource_json, sanitize)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| format!("{:#}", e))
         }
     }
 

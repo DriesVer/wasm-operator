@@ -6,6 +6,6 @@ interface kubernetes {
   get-resource: func(kind: string, name: string, namespace: string) -> result<string, string>;
   list-resources: func(kind: string, namespace: string) -> result<list<string>, string>;
   create-resource: func(kind: string, namespace: string, resource-json: string) -> result<_, string>;
-  update-resource: func(kind: string, name: string, namespace: string, resource-json: string) -> result<_, string>;
+  update-resource: func(kind: string, name: string, namespace: string, resource-json: string, sanitize: bool) -> result<_, string>;
   delete-resource: func(kind: string, name: string, namespace: string) -> result<_, string>;
 }

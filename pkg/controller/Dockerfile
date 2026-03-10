@@ -10,4 +10,5 @@ COPY ./wasm_config.yaml .
 ENV  RUST_BACKTRACE=full
 USER 65532:65532
 
-ENTRYPOINT ["/parent_controller.bin", "/"]
+#ENTRYPOINT ["/parent_controller.bin", "--debug", "/wasm_config.yaml"]
+ENTRYPOINT ["/parent_controller.bin", "/wasm_config.yaml"]

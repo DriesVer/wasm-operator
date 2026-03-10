@@ -8,10 +8,11 @@ spec:
   containers:
     - name: controller
       image: "wasm-operator-simple-rust:latest"
+      #command: ["sh", "-c", "sleep 3600"]
       imagePullPolicy: IfNotPresent
       env:
         - name: RUST_LOG
-          value: "info"
+          value: "debug"
         - name: PREDICTION_SERVER
           value: "{{REPLACE.PREDICTION_SERVER_URL}}"
       resources:

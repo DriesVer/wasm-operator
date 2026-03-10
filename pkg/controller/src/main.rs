@@ -23,6 +23,7 @@ fn main() -> anyhow::Result<()> {
     let (config_path, debug) = parse_args()?;
 
     setup_logging(debug);
+    debug!("Config path: {}", config_path.display());
     let components_metadata = WasmComponentMetadata::load_from_yaml(&config_path)?;
 
     info!("Loaded {} WASM component(s):", components_metadata.len());
