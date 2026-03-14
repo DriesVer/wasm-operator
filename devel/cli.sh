@@ -1,14 +1,30 @@
 #!/usr/bin/env bash
 
-SOURCE_ROOT=$(realpath $(dirname "${BASH_SOURCE}"))
-ROOT=$(realpath "${SOURCE_ROOT}/..")
-CMD_ROOT=$(pwd)
+if [ -n "$BASH_VERSION" ]; then
+    SOURCE_ROOT=$(realpath $(dirname "${BASH_SOURCE}"))
+elif [ -n "$ZSH_VERSION" ]; then
+    SOURCE_ROOT=$(realpath $(dirname "${(%):-%x}"))
+else
+    echo "Unsupported shell. Please use bash or zsh."
+    exit 1
+fi
 
-source "${ROOT}/devel/tool.sh"
+ROOT=$(realpath "${SOURCE_ROOT}/..")
+
+#source "${ROOT}/devel/tool.sh"
 
 PKG_FOLDER="${ROOT}/pkg/controller"
 
 ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+    ARCH="amd64"
+elif [[ "$ARCH" == armv* ]] || [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    ARCH="aarch64"
+else
+    echo "Unknown architecture: $ARCH. Defaulting to amd64."
+    ARCH="amd64"
+fi
+OS=$(uname -s)
 
 executable_exist() {
   local cmd="$1"
@@ -19,9 +35,10 @@ executable_exist() {
 }
 
 wasmop() (
-
     set -o errexit
     set -o pipefail
+
+    CMD_ROOT=$(pwd)
 
     local cmd="$1"
     shift
@@ -47,14 +64,20 @@ wasmop_build() {
 
     echo -e "\033[1m\nBuilding the parent operator\033[0m"
     cd "${PKG_FOLDER}"
-    cargo build --release --target=${ARCH}-unknown-linux-musl --target-dir "${CMD_ROOT}/build/parent-target"
+    parent_target="${ARCH}-unknown-linux-musl"
+    if [ "$OS" = "Darwin" ]; then
+        # Use zigbuild for macOS to build for Linux
+        cargo zigbuild --release --target=${parent_target} --target-dir "${CMD_ROOT}/build/parent-target"
+    else
+        cargo build --release --target=${parent_target} --target-dir "${CMD_ROOT}/build/parent-target"
+    fi
     
     cd "${CMD_ROOT}"
     echo -e "\033[1m\nBuilding the child operator\033[0m"
     #cargo component build --release --target wasm32-wasip2 --target-dir "./build/child-target"
     cargo build --release --target wasm32-wasip2 --target-dir "./build/child-target"
 
-    cp ./build/parent-target/${ARCH}-unknown-linux-musl/release/controller ./build/parent_controller.bin
+    cp ./build/parent-target/${parent_target}/release/controller ./build/parent_controller.bin
     cp ./build/child-target/wasm32-wasip2/release/${operator_name}.wasm ./build/${operator_name}.wasm  
 }
 
