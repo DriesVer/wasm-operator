@@ -10,3 +10,9 @@ tested-operators/
 
 # Crash dumps of qemu
 *.core 
+
+# MacOS specific files
+.DS_Store
+
+# Visual Studio Code specific files
+.vscode/

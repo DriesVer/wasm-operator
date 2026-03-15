@@ -53,7 +53,8 @@ pub struct WasmRuntime {
     operators: DashMap<OperatorId, OperatorState>,
 }
 
-const IDLE_THRESHOLD: Duration = Duration::from_secs(300); // 5 minutes
+// TODO: change back to 5 minutes in production, set to 3 seconds for testing purposes
+const IDLE_THRESHOLD: Duration = Duration::from_secs(3); // 5 minutes
 
 impl WasmRuntime {
     /// Creates a new `WasmRuntime`.

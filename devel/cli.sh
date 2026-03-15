@@ -131,9 +131,9 @@ wasmop_load() {
 
     # Wait for the controller pod to be running
     echo -e "\033[1m\nWaiting for the controller pod to be running\033[0m"
-    # kubectl wait --namespace $namespace \
-    #     --for=condition=Ready pods --all \
-    #     --field-selector=status.phase!=Succeeded,status.phase!=Failed \
-    #     --timeout=3000s
+    kubectl wait --namespace $namespace \
+        --for=condition=Ready pods --all \
+        --field-selector=status.phase!=Succeeded,status.phase!=Failed \
+        --timeout=3000s
 
 }

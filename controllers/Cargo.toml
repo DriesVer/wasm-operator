@@ -1,7 +1,7 @@
 [workspace]
 
 members = [
-    "comb-rust-controller",
+#    "comb-rust-controller",
 #    "ring-go-controller",
 #    "simple-rust-controller",
 #    "mongodbSpammer", 

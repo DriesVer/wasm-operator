@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
     for metadata in &components_metadata {
         info!(" - {}", metadata.name);
     }
-
+    
     // Create a tokio runtime and run the async code
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
