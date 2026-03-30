@@ -4,10 +4,15 @@
 //! the creation of a Kubernetes client, execution of HTTP requests against the API,
 //! and serialization/deserialization of Kubernetes API responses.
 
+pub mod crd;
+
+use crd::WasmOperator;
+
 use anyhow::{anyhow, Context, Result};
 use kube::api::{Api, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
 use kube::discovery::{ApiGroup, ApiResource};
-use kube::{Client, Config, Discovery};
+use kube::{Client, Config, Discovery, Resource};
+use log::info;
 use serde_json::Value;
 use std::convert::TryFrom;
 
@@ -114,17 +119,20 @@ impl KubernetesService {
     pub async fn list_resources(&self, kind: &str, namespace: &str) -> Result<Vec<String>> {
         let (ar, _) = self.find_api_resource(kind)?;
         let api = self.dynamic_api(ar, namespace);
-        
-        let list = api.list(&kube::api::ListParams::default())
+
+        let list = api
+            .list(&kube::api::ListParams::default())
             .await
             .context("Failed to list resources")?;
-        
+
         // Serialize each resource in the list to a JSON string
-        let json_list = list.items.into_iter()
+        let json_list = list
+            .items
+            .into_iter()
             .map(|item| serde_json::to_string(&item))
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to serialize resource list to JSON")?;
-            
+
         Ok(json_list)
     }
 
@@ -164,7 +172,8 @@ impl KubernetesService {
         // Force needed if the resource was created by another controller e.g. client-side apply
         let pp = PatchParams::apply(kind).force();
 
-        let result = api.patch(name, &pp, &Patch::Apply(&resource))
+        let result = api
+            .patch(name, &pp, &Patch::Apply(&resource))
             .await
             .context("Failed to update resource")?;
         Ok(())
@@ -176,6 +185,83 @@ impl KubernetesService {
         api.delete(name, &DeleteParams::default())
             .await
             .context("Failed to delete resource")?;
+        Ok(())
+    }
+
+    pub async fn patch_status(
+        &self,
+        kind: &str,
+        name: &str,
+        namespace: &str,
+        status_json: &str,
+    ) -> Result<()> {
+        let (ar, _) = self.find_api_resource(kind)?;
+        let api = self.dynamic_api(ar, namespace);
+
+        let status: Value = serde_json::from_str(status_json)
+            .context("Failed to deserialize status from JSON for patching")?;
+
+        let pp = PatchParams::default();
+        api.patch_status(name, &pp, &Patch::Merge(&status))
+            .await
+            .context("Failed to patch resource status")?;
+
+        Ok(())
+    }
+
+    pub async fn patch_observed_generation(
+        &self,
+        kind: &str,
+        name: &str,
+        namespace: &str,
+        observed_generation: i64,
+    ) -> Result<()> {
+        let (ar, _) = self.find_api_resource(kind)?;
+        let api = self.dynamic_api(ar, namespace);
+
+        let patch = serde_json::json!({
+            "status": {
+                "observedGeneration": observed_generation,
+            }
+        });
+
+        let pp = PatchParams::default();
+        api.patch_status(name, &pp, &Patch::Merge(&patch))
+            .await
+            .context("Failed to patch observed generation in resource status")?;
+
+        Ok(())
+    }
+
+    pub async fn patch_operator_observed_generation(
+        &self,
+        name: &str,
+        observed_generation: i64,
+    ) -> Result<()> {
+        let kind = WasmOperator::kind(&());
+        let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+
+        self.patch_observed_generation(&kind, name, &namespace, observed_generation)
+            .await
+            .context("Failed to patch observed generation for operator")?;
+        Ok(())
+    }
+
+    pub async fn patch_operator_status(&self, name: &str, loaded: bool) -> Result<()> {
+        let kind = WasmOperator::kind(&());
+        let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+
+        let patch = serde_json::json!({
+            "status": {
+                "loaded": loaded,
+                "lastUpdated": chrono::Utc::now().to_rfc3339(),
+            }
+        });
+
+        self.patch_status(&kind, name, &namespace, &patch.to_string())
+            .await
+            .context("Failed to patch operator status")?;
+
         Ok(())
     }
 }

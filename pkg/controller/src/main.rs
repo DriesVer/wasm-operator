@@ -24,13 +24,13 @@ fn main() -> anyhow::Result<()> {
 
     setup_logging(debug);
     debug!("Config path: {}", config_path.display());
-    let components_metadata = WasmComponentMetadata::load_from_yaml(&config_path)?;
+    // let components_metadata = WasmComponentMetadata::load_from_yaml(&config_path)?;
 
-    info!("Loaded {} WASM component(s):", components_metadata.len());
-    for metadata in &components_metadata {
-        info!(" - {}", metadata.name);
-    }
-    
+    // info!("Loaded {} WASM component(s):", components_metadata.len());
+    // for metadata in &components_metadata {
+    //     info!(" - {}", metadata.name);
+    // }
+
     // Create a tokio runtime and run the async code
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -42,7 +42,8 @@ fn main() -> anyhow::Result<()> {
         // The future inside block_on needs to return a Result.
         // After run_components (which returns a Result) is awaited, we wrap the
         // successful `()` value in an `Ok` to match the expected return type.
-        wasm_runtime.run_components(components_metadata).await?;
+        //wasm_runtime.run_components(components_metadata).await?;
+        wasm_runtime.start().await?;
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -62,7 +63,7 @@ fn setup_logging(debug: bool) {
     tracing::subscriber::set_global_default(
         FmtSubscriber::builder().with_max_level(level).finish(),
     )
-        .expect("setting default subscriber failed");
+    .expect("setting default subscriber failed");
 
     if debug {
         debug!("Debug logging enabled.");

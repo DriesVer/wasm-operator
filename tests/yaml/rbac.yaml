@@ -5,8 +5,11 @@ metadata:
 rules:
 - apiGroups:
   - amurant.io
+  - test.dev
   resources:
   - testresources
+  - wasmoperators
+  - wasmoperators/status
   verbs:
   - "*"
 ---

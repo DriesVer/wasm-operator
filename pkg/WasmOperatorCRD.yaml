@@ -1,0 +1,68 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: wasmoperators.test.dev
+spec:
+  group: test.dev
+  names:
+    categories: []
+    kind: WasmOperator
+    plural: wasmoperators
+    shortNames: [wasmops]
+    singular: wasmoperator
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns: []
+      name: v1
+      schema:
+        openAPIV3Schema:
+          description: "WasmOperator is a custom resource that defines a WebAssembly-based operator used in the wasm-operator framework."
+          properties:
+            spec:
+              properties:
+                args:
+                  default: []
+                  items:
+                    type: string
+                  type: array
+                env:
+                  default: []
+                  items:
+                    properties:
+                      name:
+                        type: string
+                      value:
+                        type: string
+                    required:
+                      - name
+                      - value
+                    type: object
+                  type: array
+                wasm:
+                  type: string
+              required:
+                - wasm
+              type: object
+            status:
+              nullable: true
+              properties:
+                lastUpdated:
+                  nullable: true
+                  type: string
+                loaded:
+                  type: boolean
+                observedGeneration:
+                  format: int64
+                  nullable: true
+                  type: integer
+              required:
+                - loaded
+              type: object
+          required:
+            - spec
+          title: WasmOperator
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

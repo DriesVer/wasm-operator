@@ -21,7 +21,8 @@ wasmtime = { version = "34.0.1", default-features = false, features = [
     "component-model-async",
 ] }
 wasmtime-wasi = { version = "34.0.1" }
-kube = { path = "../kube-rs/kube", version = "0.71.0", default-features = false, features = ["client", "rustls-tls", "derive", "runtime"] }
+#kube = { path = "../kube-rs/kube", version = "0.71.0", default-features = false, features = ["client", "rustls-tls", "derive", "runtime"] }
+kube = { version = "0.71.0", default-features = false, features = ["client", "rustls-tls", "derive", "runtime"] }
 hyper = { version = "0.14.18", features = ["client", "http1", "http2", "stream", "tcp"] }
 hyper-rustls = "^0.23.0"
 tower = { version = "^0.4.12", features = ["limit", "timeout", "load-shed"] }
@@ -49,6 +50,7 @@ chrono = "0.4.10"
 
 reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 dashmap = "6.1.0"
+schemars = { version = "0.8", features = ["derive"] }
 
 
 [profile.release]
