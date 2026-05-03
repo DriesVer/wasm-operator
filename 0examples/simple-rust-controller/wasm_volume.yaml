@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: wasm-source-pv
+  labels:
+    usage: wasm-operator-source-code
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 512Mi
+  accessModes:
+    - ReadOnlyMany
+  hostPath:
+    path: "/wasm_source_dir" # Path inside the kind cluster
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wasm-source-pvc
+  namespace: wasm-rust-simple
+spec:
+  storageClassName: manual
+  selector:
+    matchLabels:
+      usage: wasm-operator-source-code
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 512Mi

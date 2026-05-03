@@ -10,14 +10,14 @@ mod host;
 mod kubernetes;
 mod runtime;
 
-use std::sync::Arc;
 use std::{env, path::PathBuf};
 
-use config::metadata::WasmComponentMetadata;
 use kubernetes::KubernetesService;
-use runtime::WasmRuntime;
+use runtime::MainController;
 use tracing::{debug, info};
 use tracing_subscriber::FmtSubscriber;
+
+use crate::runtime::WasmEngineSingleton;
 
 fn main() -> anyhow::Result<()> {
     let (config_path, debug) = parse_args()?;
@@ -31,19 +31,23 @@ fn main() -> anyhow::Result<()> {
     //     info!(" - {}", metadata.name);
     // }
 
-    // Create a tokio runtime and run the async code
+    // TODO: maybe go to a non local runtime
+    // Create a tokio runtime to run the async code
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let local = tokio::task::LocalSet::new();
+
+    // Initialize global singletons before starting the main async block
     local.block_on(&tokio_runtime, async {
-        let k8s_service = Arc::new(KubernetesService::new().await?);
-        let wasm_runtime = Arc::new(WasmRuntime::new(k8s_service.clone())?);
-        // The future inside block_on needs to return a Result.
-        // After run_components (which returns a Result) is awaited, we wrap the
-        // successful `()` value in an `Ok` to match the expected return type.
-        //wasm_runtime.run_components(components_metadata).await?;
-        wasm_runtime.start().await?;
+        KubernetesService::global().await?;
+        wasmtime::Engine::global().await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    local.block_on(&tokio_runtime, async {
+        let main_controller = MainController::new();
+        main_controller.start().await?;
         Ok::<(), anyhow::Error>(())
     })?;
 

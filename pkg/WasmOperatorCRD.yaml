@@ -39,7 +39,16 @@ spec:
                     type: object
                   type: array
                 wasm:
-                  type: string
+                  properties:
+                    sourceType:
+                      enum: [pvc] # Extend with other types like Git, S3, etc. in the future
+                      type: string
+                    source:
+                      type: string
+                  required:
+                    - sourceType
+                    - source
+                  type: object
               required:
                 - wasm
               type: object
@@ -55,6 +64,9 @@ spec:
                   format: int64
                   nullable: true
                   type: integer
+                owner:
+                  type: string
+                  nullable: true
               required:
                 - loaded
               type: object

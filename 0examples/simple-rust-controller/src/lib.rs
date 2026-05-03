@@ -1,7 +1,7 @@
 use crate::local::operator::kubernetes;
 use crate::local::operator::kubernetes::LogLevel;
-use serde::{Deserialize, Serialize};
 use bincode;
+use serde::{Deserialize, Serialize};
 
 use std::sync::{Mutex, OnceLock};
 
@@ -44,7 +44,6 @@ fn get_mem_alloc() -> &'static Mutex<Vec<u32>> {
 struct SimpleOperator;
 
 impl Guest for SimpleOperator {
-
     fn get_watch_requests() -> Vec<WatchRequest> {
         // TODO: get this from the environment
         const NAMESPACE: &str = "default";
@@ -66,15 +65,21 @@ impl Guest for SimpleOperator {
 
     fn deserialize(_bytes: Vec<u8>) {
         kubernetes::log(LogLevel::Info, "Rust operator deserialize called");
-        let decoded  = bincode::deserialize::<Vec<u32>>(&_bytes);
+        let decoded = bincode::deserialize::<Vec<u32>>(&_bytes);
         match decoded {
             Ok(vec) => {
-                kubernetes::log(LogLevel::Info, &format!("Successfully deserialized data with {} elements", vec.len()));
+                kubernetes::log(
+                    LogLevel::Info,
+                    &format!("Successfully deserialized data with {} elements", vec.len()),
+                );
                 let mut data = get_mem_alloc().lock().unwrap();
                 *data = vec;
             }
             Err(e) => {
-                kubernetes::log(LogLevel::Error, &format!("Failed to deserialize data: {}", e));
+                kubernetes::log(
+                    LogLevel::Error,
+                    &format!("Failed to deserialize data: {}", e),
+                );
             }
         }
     }
@@ -87,14 +92,19 @@ impl Guest for SimpleOperator {
                 return ReconcileResult::Error(format!("Failed to parse resource: {}", e));
             }
         };
-        kubernetes::log(LogLevel::Info, &format!("Reconciling resource: {}/{}", resource.kind, resource.metadata.name));
 
         let mut data = get_mem_alloc().lock().unwrap();
         let first_element = data.first().cloned().unwrap_or(0);
         if first_element == 0 {
             let now: i64 = chrono::Utc::now().timestamp_millis();
             let timecode_u32: u32 = (now & 0xFFFF_FFFF) as u32;
-            kubernetes::log(LogLevel::Info, &format!("In-memory data is empty, filling it with new values. First value is {}", timecode_u32));
+            kubernetes::log(
+                LogLevel::Info,
+                &format!(
+                    "In-memory data is empty, filling it with new values. First value is {}",
+                    timecode_u32
+                ),
+            );
             const HEAP_MEM_SIZE: usize = 10 * 1024 * 1024; // 10 million u32s, ~40MB
             let mut huge_mem_alloc = Vec::<u32>::with_capacity(HEAP_MEM_SIZE);
             for i in 0..HEAP_MEM_SIZE {
@@ -103,7 +113,10 @@ impl Guest for SimpleOperator {
             //let mut data = get_mem_alloc().lock().unwrap();
             *data = huge_mem_alloc.clone();
         } else {
-            kubernetes::log(LogLevel::Info, &format!("First element of in-memory data: {}", first_element));
+            kubernetes::log(
+                LogLevel::Info,
+                &format!("First element of in-memory data: {}", first_element),
+            );
         }
 
         let namespace = resource
@@ -173,4 +186,3 @@ impl Guest for SimpleOperator {
 }
 
 export!(SimpleOperator);
-

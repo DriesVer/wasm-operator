@@ -6,15 +6,14 @@
 
 pub mod crd;
 
-use crd::WasmOperator;
-
 use anyhow::{anyhow, Context, Result};
 use kube::api::{Api, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
-use kube::discovery::{ApiGroup, ApiResource};
-use kube::{Client, Config, Discovery, Resource};
-use log::info;
+use kube::discovery::ApiResource;
+use kube::{Client, Config, Discovery};
 use serde_json::Value;
 use std::convert::TryFrom;
+use std::sync::Arc;
+use tokio::sync::{OnceCell, RwLock};
 
 const IMMUTABLE_METADATA_FIELDS: &[&str] = &[
     "creationTimestamp",
@@ -64,45 +63,103 @@ fn sanitize_patch_payload(resource: &mut Value) {
 /// with any Kubernetes resource kind, including Custom Resources.
 pub struct KubernetesService {
     client: Client,
-    discovery: Discovery,
+    //discovery: Discovery,
+    discovery: RwLock<Discovery>,
 }
+
+//static INSTANCE: OnceCell<KubernetesService> = OnceCell::const_new();
+static INSTANCE: OnceCell<Arc<KubernetesService>> = OnceCell::const_new();
 
 impl KubernetesService {
     /// Creates a new `KubernetesService`.
     ///
     /// This function infers the Kubernetes configuration from the environment,
     /// creates a Kubernetes client, and performs API discovery.
-    pub async fn new() -> Result<Self> {
-        let config = Config::infer()
-            .await
-            .context("Failed to infer Kubernetes config")?;
-        let client = Client::try_from(config).context("Failed to create Kubernetes client")?;
-        let discovery = Discovery::new(client.clone())
-            .run()
-            .await
-            .context("Failed to run Kubernetes API discovery")?;
-        Ok(KubernetesService { client, discovery })
+    // pub async fn new() -> Result<Self> {
+    //     let config = Config::infer()
+    //         .await
+    //         .context("Failed to infer Kubernetes config")?;
+    //     let client = Client::try_from(config).context("Failed to create Kubernetes client")?;
+    //     let discovery = Discovery::new(client.clone())
+    //         .run()
+    //         .await
+    //         .context("Failed to run Kubernetes API discovery")?;
+    //     Ok(KubernetesService { client, discovery })
+    // }
+
+    /// Returns a reference to the global `KubernetesService` instance.
+    ///
+    /// During initialization, the function infers the Kubernetes configuration
+    /// from the environment, creates a Kubernetes client, and performs API discovery.
+    pub async fn global() -> Result<Arc<Self>> {
+        let instance = INSTANCE
+            .get_or_try_init(|| async {
+                let config = Config::infer()
+                    .await
+                    .context("Failed to infer Kubernetes config")?;
+
+                let client =
+                    Client::try_from(config).context("Failed to create Kubernetes client")?;
+
+                let discovery = Discovery::new(client.clone())
+                    .run()
+                    .await
+                    .context("Failed to run Kubernetes API discovery")?;
+
+                Ok::<Arc<KubernetesService>, anyhow::Error>(Arc::new(KubernetesService {
+                    client,
+                    discovery: RwLock::new(discovery),
+                }))
+            })
+            .await?;
+
+        // Clone the Arc to return an owned handle with a 'static lifetime
+        Ok(Arc::clone(instance))
     }
 
-    /// Finds the `ApiResource` and (optional) `ApiGroup` for a given kind.
-    ///
-    /// This function searches the discovered API resources for a kind matching
-    /// the provided name (case-insensitive).
-    pub fn find_api_resource(&self, kind: &str) -> Result<(ApiResource, Option<&ApiGroup>)> {
-        for group in self.discovery.groups() {
+    pub async fn refresh_discovery(&self) -> Result<()> {
+        let discovery = Discovery::new(self.client.clone())
+            .run()
+            .await
+            .context("Failed to refresh Kubernetes API discovery")?;
+        *self.discovery.write().await = discovery;
+        Ok(())
+    }
+
+    pub async fn find_api_resource(&self, kind: &str) -> Result<ApiResource> {
+        let discovery_guard = self.discovery.read().await;
+
+        for group in discovery_guard.groups() {
             for version in group.versions() {
                 for (ar, _caps) in group.versioned_resources(version) {
                     if ar.kind.eq_ignore_ascii_case(kind) {
-                        return Ok((ar.clone(), Some(group)));
+                        return Ok(ar.clone());
                     }
                 }
             }
         }
+
         Err(anyhow!(
             "Kind '{}' not found in discovered API resources",
             kind
         ))
     }
+
+    // pub fn find_api_resource(&self, kind: &str) -> Result<(ApiResource, Option<&ApiGroup>)> {
+    //     for group in self.discovery.groups() {
+    //         for version in group.versions() {
+    //             for (ar, _caps) in group.versioned_resources(version) {
+    //                 if ar.kind.eq_ignore_ascii_case(kind) {
+    //                     return Ok((ar.clone(), Some(group)));
+    //                 }
+    //             }
+    //         }
+    //     }
+    //     Err(anyhow!(
+    //         "Kind '{}' not found in discovered API resources",
+    //         kind
+    //     ))
+    // }
 
     /// Returns a dynamic, namespaced API client for a given `ApiResource`.
     pub fn dynamic_api(&self, ar: ApiResource, namespace: &str) -> Api<DynamicObject> {
@@ -110,14 +167,14 @@ impl KubernetesService {
     }
 
     pub async fn get_resource(&self, kind: &str, name: &str, namespace: &str) -> Result<String> {
-        let (ar, _) = self.find_api_resource(kind)?;
+        let ar = self.find_api_resource(kind).await?;
         let api = self.dynamic_api(ar, namespace);
         let resource = api.get(name).await.context("Failed to get resource")?;
         serde_json::to_string(&resource).context("Failed to serialize resource to JSON")
     }
 
     pub async fn list_resources(&self, kind: &str, namespace: &str) -> Result<Vec<String>> {
-        let (ar, _) = self.find_api_resource(kind)?;
+        let ar = self.find_api_resource(kind).await?;
         let api = self.dynamic_api(ar, namespace);
 
         let list = api
@@ -142,7 +199,7 @@ impl KubernetesService {
         namespace: &str,
         resource_json: &str,
     ) -> Result<()> {
-        let (ar, _) = self.find_api_resource(kind)?;
+        let ar = self.find_api_resource(kind).await?;
         let api = self.dynamic_api(ar, namespace);
         let resource: DynamicObject = serde_json::from_str(resource_json)
             .context("Failed to deserialize resource from JSON")?;
@@ -160,7 +217,7 @@ impl KubernetesService {
         resource_json: &str,
         sanitize: bool,
     ) -> Result<()> {
-        let (ar, _) = self.find_api_resource(kind)?;
+        let ar = self.find_api_resource(kind).await?;
         let api = self.dynamic_api(ar, namespace);
         let mut resource: Value = serde_json::from_str(resource_json)
             .context("Failed to deserialize resource from JSON for update")?;
@@ -172,7 +229,7 @@ impl KubernetesService {
         // Force needed if the resource was created by another controller e.g. client-side apply
         let pp = PatchParams::apply(kind).force();
 
-        let result = api
+        let _ = api
             .patch(name, &pp, &Patch::Apply(&resource))
             .await
             .context("Failed to update resource")?;
@@ -180,7 +237,7 @@ impl KubernetesService {
     }
 
     pub async fn delete_resource(&self, kind: &str, name: &str, namespace: &str) -> Result<()> {
-        let (ar, _) = self.find_api_resource(kind)?;
+        let ar = self.find_api_resource(kind).await?;
         let api = self.dynamic_api(ar, namespace);
         api.delete(name, &DeleteParams::default())
             .await
@@ -195,7 +252,7 @@ impl KubernetesService {
         namespace: &str,
         status_json: &str,
     ) -> Result<()> {
-        let (ar, _) = self.find_api_resource(kind)?;
+        let ar = self.find_api_resource(kind).await?;
         let api = self.dynamic_api(ar, namespace);
 
         let status: Value = serde_json::from_str(status_json)
@@ -209,59 +266,59 @@ impl KubernetesService {
         Ok(())
     }
 
-    pub async fn patch_observed_generation(
-        &self,
-        kind: &str,
-        name: &str,
-        namespace: &str,
-        observed_generation: i64,
-    ) -> Result<()> {
-        let (ar, _) = self.find_api_resource(kind)?;
-        let api = self.dynamic_api(ar, namespace);
+    // pub async fn patch_observed_generation(
+    //     &self,
+    //     kind: &str,
+    //     name: &str,
+    //     namespace: &str,
+    //     observed_generation: i64,
+    // ) -> Result<()> {
+    //     let ar = self.find_api_resource(kind).await?;
+    //     let api = self.dynamic_api(ar, namespace);
 
-        let patch = serde_json::json!({
-            "status": {
-                "observedGeneration": observed_generation,
-            }
-        });
+    //     let patch = serde_json::json!({
+    //         "status": {
+    //             "observedGeneration": observed_generation,
+    //         }
+    //     });
 
-        let pp = PatchParams::default();
-        api.patch_status(name, &pp, &Patch::Merge(&patch))
-            .await
-            .context("Failed to patch observed generation in resource status")?;
+    //     let pp = PatchParams::default();
+    //     api.patch_status(name, &pp, &Patch::Merge(&patch))
+    //         .await
+    //         .context("Failed to patch observed generation in resource status")?;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    pub async fn patch_operator_observed_generation(
-        &self,
-        name: &str,
-        observed_generation: i64,
-    ) -> Result<()> {
-        let kind = WasmOperator::kind(&());
-        let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+    // pub async fn patch_operator_observed_generation(
+    //     &self,
+    //     name: &str,
+    //     observed_generation: i64,
+    // ) -> Result<()> {
+    //     let kind = WasmOperator::kind(&());
+    //     let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
 
-        self.patch_observed_generation(&kind, name, &namespace, observed_generation)
-            .await
-            .context("Failed to patch observed generation for operator")?;
-        Ok(())
-    }
+    //     self.patch_observed_generation(&kind, name, &namespace, observed_generation)
+    //         .await
+    //         .context("Failed to patch observed generation for operator")?;
+    //     Ok(())
+    // }
 
-    pub async fn patch_operator_status(&self, name: &str, loaded: bool) -> Result<()> {
-        let kind = WasmOperator::kind(&());
-        let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+    // pub async fn patch_operator_status(&self, name: &str, loaded: bool) -> Result<()> {
+    //     let kind = WasmOperator::kind(&());
+    //     let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
 
-        let patch = serde_json::json!({
-            "status": {
-                "loaded": loaded,
-                "lastUpdated": chrono::Utc::now().to_rfc3339(),
-            }
-        });
+    //     let patch = serde_json::json!({
+    //         "status": {
+    //             "loaded": loaded,
+    //             "lastUpdated": chrono::Utc::now().to_rfc3339(),
+    //         }
+    //     });
 
-        self.patch_status(&kind, name, &namespace, &patch.to_string())
-            .await
-            .context("Failed to patch operator status")?;
+    //     self.patch_status(&kind, name, &namespace, &patch.to_string())
+    //         .await
+    //         .context("Failed to patch operator status")?;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }

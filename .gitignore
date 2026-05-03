@@ -16,3 +16,6 @@ tested-operators/
 
 # Visual Studio Code specific files
 .vscode/
+
+wasm_source_dir/*
+!tests/wasm_source_dir/README.md

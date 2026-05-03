@@ -4,7 +4,9 @@ metadata:
   name: simple-rust-operator
   namespace: default
 spec:
-  wasm: ./simple_child_controller.wasm
+  wasm:
+    sourceType: pvc
+    source: "/wasm-source-pvc/simple_child_controller.wasm"
   env:
     - name: RUST_LOG
       value: "info"

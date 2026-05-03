@@ -20,3 +20,10 @@ spec:
           memory: "640Mi"
         limits:
           memory: "1280Mi"
+      volumeMounts:
+        - mountPath: "/wasm-source-pvc"
+          name: wasm-source-pvc
+  volumes:
+    - name: wasm-source-pvc
+      persistentVolumeClaim:
+        claimName: wasm-source-pvc
