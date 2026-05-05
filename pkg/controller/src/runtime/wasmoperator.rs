@@ -127,12 +127,7 @@ impl WasmOperator {
 
         // Write state to memory to a file
         let wasm_dir = option_env!("WASMOP_CACHE_DIR").unwrap_or("/tmp/wasmop-cache");
-        let state_path = PathBuf::from(format!(
-            "{}/{}/{}.mem",
-            wasm_dir,
-            CONTROLLER_UUID.get().unwrap(),
-            self.metadata.uid
-        ));
+        let state_path = PathBuf::from(format!("{}/{}/state.mem", wasm_dir, self.metadata.uid));
         if let Some(parent) = state_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
