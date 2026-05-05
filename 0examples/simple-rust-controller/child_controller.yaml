@@ -23,7 +23,12 @@ spec:
       volumeMounts:
         - mountPath: "/wasm-source-pvc"
           name: wasm-source-pvc
+        - mountPath: "/tmp/wasmop-cache"
+          name: wasmop-cache-pvc
   volumes:
     - name: wasm-source-pvc
       persistentVolumeClaim:
         claimName: wasm-source-pvc
+    - name: wasmop-cache-pvc
+      persistentVolumeClaim:
+        claimName: wasmop-cache-pvc

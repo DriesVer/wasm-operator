@@ -17,7 +17,7 @@ use kube::Resource;
 use tokio::sync::OnceCell;
 use tracing::{error, info, warn};
 
-use crate::config::metadata::WasmComponentMetadata;
+use crate::config::metadata::{OperatorUid, WasmComponentMetadata};
 use crate::kubernetes::crd::WasmOperator as WasmOperatorCRD;
 use crate::kubernetes::KubernetesService;
 
@@ -26,8 +26,6 @@ use self::wasmoperator::WasmOperator;
 
 pub mod wasmengine;
 mod wasmoperator;
-
-type OperatorUid = String;
 
 // TODO: change back to 5 minutes in production, set to 5 seconds for testing purposes
 const IDLE_THRESHOLD: Duration = Duration::from_secs(5); // 5 minutes

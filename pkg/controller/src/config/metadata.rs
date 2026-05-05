@@ -13,6 +13,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::kubernetes::crd::WasmSource;
+
+pub type OperatorUid = String;
+
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 pub struct EnvironmentVariable {
     pub name: String,
@@ -24,6 +27,7 @@ pub struct WasmComponentMetadata {
     pub name: String,
     pub wasm: WasmSource,
     pub generation: Option<i64>,
+    pub uid: OperatorUid,
     #[serde(default)]
     pub env: Vec<EnvironmentVariable>,
     #[serde(default)]
@@ -56,16 +60,6 @@ impl WasmComponentMetadata {
     pub fn load_from_k8s_object(k8s_object: &kube::api::DynamicObject) -> Result<Self> {
         let name = k8s_object.name_any();
 
-        // let wasm_str: &str = k8s_object
-        //     .data
-        //     .pointer("/spec/wasm")
-        //     .and_then(|v| v.as_str())
-        //     .ok_or_else(|| {
-        //         anyhow::anyhow!(
-        //             "Missing or invalid 'wasm' field in Kubernetes object '{}'",
-        //             name.clone()
-        //         )
-        //     })?;
         let wasm_value = k8s_object.data.pointer("/spec/wasm").ok_or_else(|| {
             anyhow::anyhow!(
                 "Missing 'wasm' field in Kubernetes object '{}'",
@@ -87,6 +81,10 @@ impl WasmComponentMetadata {
         })?;
 
         let generation = k8s_object.metadata.generation;
+
+        let uid = k8s_object.uid().ok_or_else(|| {
+            anyhow::anyhow!("Missing UID in Kubernetes object '{}'", name.clone())
+        })?;
 
         let env: Vec<EnvironmentVariable> = k8s_object
             .data
@@ -129,9 +127,9 @@ impl WasmComponentMetadata {
 
         Ok(Self {
             name,
-            //wasm: PathBuf::from(wasm_str),
             wasm,
             generation,
+            uid,
             env,
             args,
         })
