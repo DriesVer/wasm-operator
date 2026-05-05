@@ -10,10 +10,9 @@ else
 fi
 
 ROOT=$(realpath "${SOURCE_ROOT}/..")
-
-#source "${ROOT}/devel/tool.sh"
-
 PKG_FOLDER="${ROOT}/pkg/controller"
+
+CONFIG_FILE="${SOURCE_ROOT}/wasmop_config.sh"
 
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
@@ -34,23 +33,167 @@ executable_exist() {
   return 1 # executable was not found
 }
 
+confirm() {
+    echo -n "$1 [Y/n]: "
+    read response
+    case "$response" in
+        [yY][eE][sS]|[yY]|"") 
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 wasmop() (
     set -o errexit
     set -o pipefail
 
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    else
+        wasmop_createconfig
+    fi
+
     CMD_ROOT=$(pwd)
 
     local cmd="$1"
+    local sub_cmd="$2"
+
     shift
-    if ! executable_exist "wasmop_${cmd}"; then
+    if executable_exist "wasmop_${cmd}_${sub_cmd}"; then
+        shift
+        "wasmop_${cmd}_${sub_cmd}" "$@"
+        exit 0
+    elif executable_exist "wasmop_${cmd}"; then
+        "wasmop_${cmd}" "$@"
+    else
         echo "ERROR: tool '${cmd}' not found for wasm-operator"
         exit 1
     fi
-    "wasmop_${cmd}" "$@"
 )
 
 wasmop_test() {
     echo "This works!"
+}
+
+wasmop_createconfig() {
+    content="
+    HOST_FOLDER=
+    "
+    printf "%s\n" "$content" > "$CONFIG_FILE"
+}
+
+wasmop_check_install() {
+    echo "Checking for required tools:"
+    if ! executable_exist "kind"; then
+        echo -e "\033[31mERROR: kind is not installed. Please install kind to proceed.\033[0m"
+        exit 1
+    else 
+        echo -e "\tkind: \033[32m[installed]\033[0m $(kind version)"
+    fi
+
+    if ! executable_exist "kubectl"; then
+        echo -e "\033[31mERROR: kubectl is not installed. Please install kubectl to proceed.\033[0m"
+        exit 1
+    else 
+        echo -e "\tkubectl: \033[32m[installed]\033[0m See kubectl version for details"
+    fi
+
+    if ! executable_exist "docker"; then
+        echo -e "\033[31mERROR: docker is not installed. Please install docker to proceed.\033[0m"
+        exit 1
+    else 
+        echo -e "\tdocker: \033[32m[installed]\033[0m $(docker --version)"
+    fi
+
+    if ! executable_exist "rustc"; then
+        echo -e "\033[31mERROR: rustc is not installed. Please install rustc to proceed.\033[0m"
+        exit 1
+    else 
+        echo -e "\trustc: \033[32m[installed]\033[0m $(rustc --version)"
+    fi
+
+    if ! executable_exist "cargo"; then
+        echo -e "\033[31mERROR: cargo is not installed. Please install cargo to proceed.\033[0m"
+        exit 1
+    else 
+        echo -e "\tcargo: \033[32m[installed]\033[0m $(cargo --version)"
+    fi
+
+    if [ "$OS" = "Darwin" ]; then
+        if ! executable_exist "cargo-zigbuild"; then
+            echo -e "\033[31mERROR: cargo-zigbuild is not installed. Please install cargo-zigbuild to proceed.\033[0m"
+            exit 1
+        else 
+            echo -e "\tcargo-zigbuild: \033[32m[installed]\033[0m $(cargo-zigbuild --version)"
+        fi
+    fi
+
+    echo "All required tools are installed."
+}
+
+wasmop_check() {
+    echo -e "\033[1m\nChecking the environment for wasm-operator\n\033[0m"
+    wasmop check install
+}
+
+
+
+wasmop_setup() {
+    wasmop check install
+
+    if confirm "\nDo you want to create a kind cluster?"; then
+        echo -n "Kind cluster name: " 
+        read cluster_name
+        if [ -z "$cluster_name" ]; then
+            echo "No cluster name provided. Using default name \033[1m'wasm-operator'\033[0m."
+            cluster_name="wasm-operator"
+        fi
+
+        echo "Using kind config from './devel/kind-config.yaml'."
+        config_file="${ROOT}/devel/kind-config.yaml"
+
+        if [ ! -f "$config_file" ]; then
+                echo -e "\033[31mERROR: Kind config file not found at '$config_file'. Please create the config file or provide the correct path.\033[0m"
+                exit 1
+            fi
+
+        if confirm "Do you want to mount a folder into the kind cluster?"; then
+            echo -n "Host folder to mount: " 
+            read host_folder
+            if [ -z "$host_folder" ]; then
+                echo "No host folder provided. Skipping folder mount."
+            else
+                echo -n "Container folder to mount to (default: /mnt/host): " 
+                read container_folder
+                if [ -z "$container_folder" ]; then
+                    container_folder="/mnt/host"
+                fi
+                echo "Mounting host folder '$host_folder' to container folder '$container_folder' in kind cluster '$cluster_name'."
+
+                temp_config=$(mktemp)
+                trap 'rm -f "$temp_config"' EXIT
+                cp "${ROOT}/devel/kind-config.yaml" "$temp_config"
+
+                perl -i -pe "s|role: control-plane|role: control-plane\n  extraMounts:\n  - hostPath: ${host_folder}\n    containerPath: ${container_folder}|" "$temp_config"
+                
+                config_file="$temp_config"
+
+                # Save the host folder path to the config file for later use
+                perl -i -pe "s|^\s*HOST_FOLDER=.*|HOST_FOLDER=\"$host_folder\"|" "$CONFIG_FILE"
+            fi
+        fi
+
+        kind create cluster --name "${cluster_name}" --config "${config_file}"
+    fi
+
+    if confirm "\nDo you want to install the prediction server in the cluster?"; then
+        docker build -t prediction_webserver:webserver "${ROOT}/prediction/webserver"
+        kind load docker-image --name $cluster_name prediction_webserver:webserver
+        kubectl apply -f "${ROOT}/tests/yaml/deploymentFlask.yaml"
+    fi
 }
 
 wasmop_build() {

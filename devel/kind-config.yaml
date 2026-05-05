@@ -2,14 +2,6 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
-  extraMounts:
-  # TODO: change this in setup script to be configurable
-  - hostPath: /Users/driesverhoeve/Documents/GitHub/unief/thesis/wasm-operator/tests/wasm_source_dir
-    containerPath: /wasm_source_dir
-
-  # extraMounts:
-  # - hostPath: /tmp/kind-containerd
-  #   containerPath: /var/lib/containerd
 
   # Ammend the kubeadm config to support a lot of pods
   kubeadmConfigPatches:

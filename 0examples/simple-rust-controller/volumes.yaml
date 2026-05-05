@@ -11,7 +11,7 @@ spec:
   accessModes:
     - ReadOnlyMany
   hostPath:
-    path: "/wasm_source_dir" # Path inside the kind cluster
+    path: "/mnt/host" # Path inside the kind cluster
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
