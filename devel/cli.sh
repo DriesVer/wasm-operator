@@ -222,6 +222,7 @@ wasmop_build() {
 
     cp ./build/parent-target/${parent_target}/release/controller ./build/parent_controller.bin
     cp ./build/child-target/wasm32-wasip2/release/${operator_name}.wasm ./build/${operator_name}.wasm  
+    cp ./build/${operator_name}.wasm ${ROOT}/tests/wasm_source_dir/${operator_name}.wasm
 }
 
 wasmop_load() {

@@ -12,6 +12,17 @@ wit_bindgen::generate!(
     }
 );
 
+// Artificially inflate the size of the code base
+#[unsafe(no_mangle)]
+//static BIG_DATA: &[u8; 1048576] = include_bytes!("1MB_of_junk.bin");
+static BIG_DATA: &[u8; 5242880] = include_bytes!("5MB_of_junk.bin");
+#[unsafe(no_mangle)]
+pub extern "C" fn check_data() -> usize {
+    // Doing a simple calculation on the data prevents
+    // the compiler from optimizing it away.
+    BIG_DATA.as_ptr() as usize
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TestResourceSpec {
     nonce: i64,

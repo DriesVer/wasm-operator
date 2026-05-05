@@ -182,14 +182,40 @@ impl WasmOperator {
     async fn load_wasm_instance(&self) -> Result<(bindings::KubeOperator, Store<State>)> {
         let wasmtime_engine = wasmtime::Engine::global().await?;
 
-        // let component =
-        //     Component::from_file(wasmtime_engine, &self.metadata.wasm).map_err(|e| {
-        //         anyhow::anyhow!("Failed to load component '{}': {}", self.metadata.name, e)
-        //     })?;
-        let wasm_bytes = self.load_wasm_file();
-        let component = Component::new(wasmtime_engine, &wasm_bytes).map_err(|e| {
-            anyhow::anyhow!("Failed to load component '{}': {}", self.metadata.name, e)
-        })?;
+        let cache_path = "/tmp/wasmop-cache/my_component.cwasm";
+
+        let start = Instant::now();
+        let component = if std::path::Path::new(cache_path).exists() {
+            info!("Loading component from cache at {}...", cache_path);
+            let component_bytes = std::fs::read(cache_path)?;
+            (unsafe {
+                Component::deserialize(&wasmtime_engine, &component_bytes).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to deserialize cached component '{}': {}",
+                        cache_path,
+                        e
+                    )
+                })
+            })?
+        } else {
+            info!("No cached component at {}, will load wasm", cache_path);
+            //let wasm_bytes = self.load_wasm_file();
+            let wasm_bytes = std::fs::read("/wasm-source-pvc/simple_child_controller.wasm")?;
+            Component::new(wasmtime_engine, &wasm_bytes).map_err(|e| {
+                anyhow::anyhow!("Failed to load component '{}': {}", self.metadata.name, e)
+            })?
+        };
+        let duration = start.elapsed();
+
+        info!(
+            "Component '{}' loaded in {:?} milliseconds",
+            self.metadata.name,
+            duration.as_millis()
+        );
+
+        // TEST write the component to a file and load it back instead of loading wasm
+        let component_bytes: Vec<u8> = component.serialize()?;
+        std::fs::write("/tmp/wasmop-cache/my_component.cwasm", component_bytes)?;
 
         let wasi_ctx = WasiCtxBuilder::new()
             .inherit_stdio()
