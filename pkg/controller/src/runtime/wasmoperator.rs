@@ -11,10 +11,11 @@ use futures::StreamExt;
 use kube::runtime::watcher::Event;
 use kube::Resource;
 use serde_json;
+use target_lexicon::Triple;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::Store;
 use wasmtime_wasi::p2::{add_to_linker_async, WasiCtxBuilder};
@@ -25,8 +26,8 @@ use crate::host::api::bindings::local::operator::types as wit_types;
 use crate::host::state::State;
 use crate::kubernetes::crd::{WasmOperator as WasmOperatorCRD, WasmSource};
 use crate::kubernetes::KubernetesService;
-use crate::runtime::WasmEngineSingleton;
 use crate::runtime::CONTROLLER_UUID;
+use crate::runtime::{WasmEngineSingleton, WASMOP_CACHE_DIR};
 
 // This struct mirrors the WatchRequest from WIT bindgen but enables us to use it as a key in a DashMap for managing watchers.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -126,8 +127,10 @@ impl WasmOperator {
         );
 
         // Write state to memory to a file
-        let wasm_dir = option_env!("WASMOP_CACHE_DIR").unwrap_or("/tmp/wasmop-cache");
-        let state_path = PathBuf::from(format!("{}/{}/state.mem", wasm_dir, self.metadata.uid));
+        let state_path = PathBuf::from(format!(
+            "{}/{}/state.mem",
+            WASMOP_CACHE_DIR, self.metadata.uid
+        ));
         if let Some(parent) = state_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -182,14 +185,18 @@ impl WasmOperator {
     async fn load_wasm_instance(&self) -> Result<(bindings::KubeOperator, Store<State>)> {
         let wasmtime_engine = wasmtime::Engine::global().await?;
 
-        let cache_path = "/tmp/wasmop-cache/my_component.cwasm";
+        let target_arch = Triple::host();
+        let cache_path = format!(
+            "{}/{}/{}.cwasm",
+            WASMOP_CACHE_DIR, self.metadata.uid, target_arch
+        );
 
-        let start = Instant::now();
-        let component = if std::path::Path::new(cache_path).exists() {
-            info!("Loading component from cache at {}...", cache_path);
-            let component_bytes = std::fs::read(cache_path)?;
+        let component = if std::path::Path::new(&cache_path).exists() {
+            debug!("Loading component {} from cache...", self.metadata.name);
+            let component_bytes = std::fs::read(&cache_path)?;
             (unsafe {
                 Component::deserialize(&wasmtime_engine, &component_bytes).map_err(|e| {
+                    std::fs::remove_file(&cache_path).ok();
                     anyhow::anyhow!(
                         "Failed to deserialize cached component '{}': {}",
                         cache_path,
@@ -198,24 +205,14 @@ impl WasmOperator {
                 })
             })?
         } else {
-            info!("No cached component at {}, will load wasm", cache_path);
-            //let wasm_bytes = self.load_wasm_file();
-            let wasm_bytes = std::fs::read("/wasm-source-pvc/simple_child_controller.wasm")?;
-            Component::new(wasmtime_engine, &wasm_bytes).map_err(|e| {
+            let wasm_bytes = self.load_wasm_file();
+            let component = Component::new(wasmtime_engine, &wasm_bytes).map_err(|e| {
                 anyhow::anyhow!("Failed to load component '{}': {}", self.metadata.name, e)
-            })?
+            })?;
+            let component_bytes: Vec<u8> = component.serialize()?;
+            std::fs::write(cache_path, component_bytes)?;
+            component
         };
-        let duration = start.elapsed();
-
-        info!(
-            "Component '{}' loaded in {:?} milliseconds",
-            self.metadata.name,
-            duration.as_millis()
-        );
-
-        // TEST write the component to a file and load it back instead of loading wasm
-        let component_bytes: Vec<u8> = component.serialize()?;
-        std::fs::write("/tmp/wasmop-cache/my_component.cwasm", component_bytes)?;
 
         let wasi_ctx = WasiCtxBuilder::new()
             .inherit_stdio()
