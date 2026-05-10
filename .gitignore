@@ -5,6 +5,8 @@ temp_*
 *.wasm
 .idea
 bin/
+!pkg/controller/src/bin/
+
 __pycache__
 tested-operators/
 

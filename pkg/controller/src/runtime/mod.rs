@@ -24,6 +24,7 @@ use crate::kubernetes::KubernetesService;
 pub use self::wasmengine::WasmEngineSingleton;
 use self::wasmoperator::WasmOperator;
 
+mod stats;
 pub mod wasmengine;
 mod wasmoperator;
 

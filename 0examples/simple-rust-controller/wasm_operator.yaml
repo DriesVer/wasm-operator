@@ -5,8 +5,9 @@ metadata:
   namespace: default
 spec:
   wasm:
-    sourceType: pvc
-    source: "/wasm-source-pvc/simple_child_controller.wasm"
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "simple_child_controller.wasm"
   env:
     - name: RUST_LOG
       value: "info"

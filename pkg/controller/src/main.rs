@@ -24,28 +24,23 @@ fn main() -> anyhow::Result<()> {
 
     setup_logging(debug);
     debug!("Config path: {}", config_path.display());
-    // let components_metadata = WasmComponentMetadata::load_from_yaml(&config_path)?;
-
-    // info!("Loaded {} WASM component(s):", components_metadata.len());
-    // for metadata in &components_metadata {
-    //     info!(" - {}", metadata.name);
-    // }
 
     // TODO: maybe go to a non local runtime
     // Create a tokio runtime to run the async code
-    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+    let global_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1) // 1 worker thread for checking idle + watching CRs, in case of heavier idling logic we can increase this to 2 or more
         .enable_all()
         .build()?;
     let local = tokio::task::LocalSet::new();
 
     // Initialize global singletons before starting the main async block
-    local.block_on(&tokio_runtime, async {
+    global_rt.block_on(async {
         KubernetesService::global().await?;
         wasmtime::Engine::global().await?;
         Ok::<(), anyhow::Error>(())
     })?;
 
-    local.block_on(&tokio_runtime, async {
+    local.block_on(&global_rt, async {
         let main_controller = MainController::new();
         main_controller.start().await?;
         Ok::<(), anyhow::Error>(())
