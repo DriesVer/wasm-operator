@@ -145,7 +145,7 @@ impl WasmOperatorStatisticsRecorder {
         ((cold_executions * 100) / total_reconciles) as u8
     }
 
-    fn get_wasm_load_duration_ms_avg(&self) -> u32 {
+    fn get_wasm_load_duration_msec_avg(&self) -> u32 {
         let load_total = self.get_load_total();
         if load_total == 0 {
             return 0;
@@ -153,7 +153,7 @@ impl WasmOperatorStatisticsRecorder {
         (self.load_total_duration_ms.load(Ordering::Relaxed) / load_total) as u32
     }
 
-    fn get_reconcile_duration_ms_avg(&self) -> u32 {
+    fn get_reconcile_duration_msec_avg(&self) -> u32 {
         let reconcile_total = self.reconcile_total.load(Ordering::Relaxed);
         if reconcile_total == 0 {
             return 0;
@@ -171,7 +171,7 @@ impl WasmOperatorStatisticsRecorder {
         ((running_duration * 100) / total_duration) as u8
     }
 
-    fn get_idle_duration_s_avg(&self) -> u64 {
+    fn get_idle_duration_sec_avg(&self) -> u64 {
         let unload_total = self.get_unload_total();
         if unload_total == 0 {
             return 0;
@@ -191,16 +191,16 @@ impl WasmOperatorStatisticsRecorder {
         WasmOperatorStatistics {
             reconcile_total_24h: self.get_reconcile_total_24h(),
             reconcile_cold_start_ratio: self.get_reconcile_cold_start_ratio(),
-            wasm_load_duration_ms_avg: self.get_wasm_load_duration_ms_avg(),
-            wasm_load_duration_ms_max: self.load_max_duration_ms.load(Ordering::Relaxed),
-            reconcile_duration_ms_avg: self.get_reconcile_duration_ms_avg(),
-            reconcile_duration_ms_max: self.reconcile_max_duration_ms.load(Ordering::Relaxed),
+            wasm_load_duration_msec_avg: self.get_wasm_load_duration_msec_avg(),
+            wasm_load_duration_msec_max: self.load_max_duration_ms.load(Ordering::Relaxed),
+            reconcile_duration_msec_avg: self.get_reconcile_duration_msec_avg(),
+            reconcile_duration_msec_max: self.reconcile_max_duration_ms.load(Ordering::Relaxed),
             memory_usage_bytes: self.memory_usage_bytes.load(Ordering::Relaxed),
             activity_ratio: self.get_activity_ratio(),
-            idle_duration_s_avg: self.get_idle_duration_s_avg(),
-            idle_duration_s_max: self.idle_max_duration_s.load(Ordering::Relaxed),
-            active_duration_s_avg: self.get_running_duration_s_avg(),
-            active_duration_s_max: self.active_max_duration_s.load(Ordering::Relaxed),
+            idle_duration_sec_avg: self.get_idle_duration_sec_avg(),
+            idle_duration_sec_max: self.idle_max_duration_s.load(Ordering::Relaxed),
+            active_duration_sec_avg: self.get_running_duration_s_avg(),
+            active_duration_sec_max: self.active_max_duration_s.load(Ordering::Relaxed),
         }
     }
 }

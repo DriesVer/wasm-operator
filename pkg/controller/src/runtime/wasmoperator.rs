@@ -15,7 +15,7 @@ use target_lexicon::Triple;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::Store;
 use wasmtime_wasi::p2::{add_to_linker_async, WasiCtxBuilder};
@@ -23,7 +23,9 @@ use wasmtime_wasi::p2::{add_to_linker_async, WasiCtxBuilder};
 use crate::host::api::bindings;
 use crate::host::api::bindings::local::operator::types as wit_types;
 use crate::host::state::State;
-use crate::kubernetes::crd::{EnvironmentVariable, WasmOperator as WasmOperatorCRD, WasmSource};
+use crate::kubernetes::crd::{
+    EnvironmentVariable, WasmOperator as WasmOperatorCRD, WasmOperatorStatus, WasmSource,
+};
 use crate::kubernetes::KubernetesService;
 use crate::runtime::CONTROLLER_UUID;
 use crate::runtime::{WasmEngineSingleton, WASMOP_CACHE_DIR};
@@ -117,14 +119,16 @@ impl WasmOperatorRuntime {
             .await
             .expect("Failed to initialize K8s service");
 
+        let status = WasmOperatorStatus {
+            loaded,
+            last_updated: chrono::Utc::now().to_rfc3339(),
+            observed_generation: self.cr.generation,
+            owner: CONTROLLER_UUID.get().cloned(),
+            statistics: Some(self.stats.get_statistics()),
+        };
+
         let patch = serde_json::json!({
-            "status": {
-                "loaded": loaded,
-                "lastUpdated": chrono::Utc::now().to_rfc3339(),
-                "observedGeneration": self.cr.generation,
-                "owner": CONTROLLER_UUID.get().cloned().unwrap_or_default(),
-                "stats": self.stats.get_statistics(),
-            }
+            "status": status
         });
 
         // Update the Kubernetes resource status
@@ -241,7 +245,6 @@ impl WasmOperatorRuntime {
         let cache_path = PathBuf::from(cache_path);
 
         let component = if cache_path.exists() {
-            debug!("Loading component {} from cache...", self.cr.name);
             let component_bytes = std::fs::read(&cache_path)?;
             (unsafe {
                 Component::deserialize(&wasmtime_engine, &component_bytes).map_err(|e| {

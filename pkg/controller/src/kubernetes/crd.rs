@@ -45,8 +45,7 @@ pub enum WasmSource {
 #[serde(rename_all = "camelCase")]
 pub struct WasmOperatorStatus {
     pub loaded: bool,
-
-    pub last_updated: Option<String>,
+    pub last_updated: String,
     pub observed_generation: Option<i64>,
     pub owner: Option<String>,
 
@@ -58,14 +57,14 @@ pub struct WasmOperatorStatus {
 pub struct WasmOperatorStatistics {
     pub reconcile_total_24h: u32,
     pub reconcile_cold_start_ratio: u8,
-    pub wasm_load_duration_ms_avg: u32,
-    pub wasm_load_duration_ms_max: u32,
-    pub reconcile_duration_ms_avg: u32,
-    pub reconcile_duration_ms_max: u32,
+    pub wasm_load_duration_msec_avg: u32,
+    pub wasm_load_duration_msec_max: u32,
+    pub reconcile_duration_msec_avg: u32,
+    pub reconcile_duration_msec_max: u32,
     pub memory_usage_bytes: u32,
     pub activity_ratio: u8,
-    pub idle_duration_s_avg: u64,
-    pub idle_duration_s_max: u64,
-    pub active_duration_s_avg: u64,
-    pub active_duration_s_max: u64,
+    pub idle_duration_sec_avg: u64,
+    pub idle_duration_sec_max: u64,
+    pub active_duration_sec_avg: u64,
+    pub active_duration_sec_max: u64,
 }

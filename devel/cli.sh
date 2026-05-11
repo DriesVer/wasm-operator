@@ -207,7 +207,6 @@ wasmop_setup_crd() {
 
     temp_crd_manifest=$(mktemp)
     trap 'rm -f "$temp_crd_manifest"' EXIT
-    echo $temp_crd_manifest
 
     cargo run --bin export_crd > "$temp_crd_manifest"
     kubectl apply -f "$temp_crd_manifest"
