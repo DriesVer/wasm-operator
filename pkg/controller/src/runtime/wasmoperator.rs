@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use futures::StreamExt;
 use kube::runtime::watcher::Event;
-use kube::Resource;
+use kube::{Resource, ResourceExt};
 use serde_json;
 use target_lexicon::Triple;
 use tokio::sync::{Mutex, RwLock};
@@ -20,11 +20,10 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::Store;
 use wasmtime_wasi::p2::{add_to_linker_async, WasiCtxBuilder};
 
-use crate::config::metadata::WasmComponentMetadata;
 use crate::host::api::bindings;
 use crate::host::api::bindings::local::operator::types as wit_types;
 use crate::host::state::State;
-use crate::kubernetes::crd::{WasmOperator as WasmOperatorCRD, WasmSource};
+use crate::kubernetes::crd::{EnvironmentVariable, WasmOperator as WasmOperatorCRD, WasmSource};
 use crate::kubernetes::KubernetesService;
 use crate::runtime::CONTROLLER_UUID;
 use crate::runtime::{WasmEngineSingleton, WASMOP_CACHE_DIR};
@@ -48,6 +47,31 @@ impl From<&wit_types::WatchRequest> for WatchRequestKey {
     }
 }
 
+pub type OperatorUid = String;
+
+// This struct is a reduced version of the WasmOperator CRD that only contains the fields relevant for the runtime, this way we can reduce the memory usage of one WasmOperatorRuntime instance by not storing the entire CRD spec in memory.
+pub struct WasmOperatorReduced {
+    pub name: String,
+    pub generation: Option<i64>,
+    pub uid: OperatorUid,
+
+    pub wasm: WasmSource,
+    pub env: Vec<EnvironmentVariable>,
+    pub args: Vec<String>,
+}
+impl From<&WasmOperatorCRD> for WasmOperatorReduced {
+    fn from(crd: &WasmOperatorCRD) -> Self {
+        Self {
+            name: crd.name_any(),
+            generation: crd.metadata.generation,
+            uid: crd.uid().unwrap(),
+            wasm: crd.spec.wasm.clone(),
+            env: crd.spec.env.clone(),
+            args: crd.spec.args.clone(),
+        }
+    }
+}
+
 struct LoadedState {
     operator: bindings::KubeOperator,
     store: Mutex<Store<State>>,
@@ -65,8 +89,8 @@ enum OperatorState {
     Unloaded(Arc<UnloadedState>),
 }
 
-pub struct WasmOperator {
-    pub metadata: WasmComponentMetadata,
+pub struct WasmOperatorRuntime {
+    pub cr: WasmOperatorReduced,
     state: RwLock<OperatorState>,
     watchers: DashMap<WatchRequestKey, CancellationToken>,
     task_tracker: Mutex<TaskTracker>,
@@ -74,10 +98,10 @@ pub struct WasmOperator {
     last_patch_time: Mutex<Instant>,
 }
 
-impl WasmOperator {
-    pub fn new(metadata: WasmComponentMetadata) -> Arc<Self> {
+impl WasmOperatorRuntime {
+    pub fn new(wasmop_cr: WasmOperatorReduced) -> Arc<Self> {
         Arc::new(Self {
-            metadata,
+            cr: wasmop_cr,
             state: RwLock::new(OperatorState::Unloaded(Arc::new(UnloadedState {
                 state_path: PathBuf::new(),
             }))),
@@ -97,7 +121,7 @@ impl WasmOperator {
             "status": {
                 "loaded": loaded,
                 "lastUpdated": chrono::Utc::now().to_rfc3339(),
-                "observedGeneration": self.metadata.generation,
+                "observedGeneration": self.cr.generation,
                 "owner": CONTROLLER_UUID.get().cloned().unwrap_or_default(),
                 "stats": self.stats.get_statistics(),
             }
@@ -107,7 +131,7 @@ impl WasmOperator {
         let kind = WasmOperatorCRD::kind(&());
         let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
         k8s_service
-            .patch_status(&kind, &self.metadata.name, &namespace, &patch.to_string())
+            .patch_status(&kind, &self.cr.name, &namespace, &patch.to_string())
             .await?;
 
         Ok(())
@@ -144,14 +168,11 @@ impl WasmOperator {
         info!(
             "Serializing {} bytes of memory for operator {}",
             memory_data.len(),
-            self.metadata.name
+            self.cr.name
         );
 
         // Write state to memory to a file
-        let state_path = PathBuf::from(format!(
-            "{}/{}/state.mem",
-            WASMOP_CACHE_DIR, self.metadata.uid
-        ));
+        let state_path = PathBuf::from(format!("{}/{}/state.mem", WASMOP_CACHE_DIR, self.cr.uid));
         if let Some(parent) = state_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -168,7 +189,7 @@ impl WasmOperator {
     }
 
     async fn load(&self) -> Result<()> {
-        info!("Loading operator {}...", self.metadata.name);
+        info!("Loading operator {}...", self.cr.name);
 
         self.stats.record_loading_operation();
         let start_load = Instant::now();
@@ -181,9 +202,7 @@ impl WasmOperator {
             return Ok(());
         };
 
-        info!("HIER1");
         let (operator, mut store) = self.load_wasm_instance().await?;
-        info!("HIER2");
 
         // If no state was saved this means it is the first time loading the component, otherwise we try to restore the previous state
         if unloaded_state.state_path.exists() {
@@ -193,13 +212,12 @@ impl WasmOperator {
             operator.call_deserialize(&mut store, &saved_state).await?;
             info!(
                 "Successfully restored memory state for operator {}",
-                self.metadata.name
+                self.cr.name
             );
 
             tokio::fs::remove_file(&unloaded_state.state_path).await?;
         }
 
-        info!("HIER3");
         self.patch_k8s_status_throttled(true, true).await?;
 
         // Update the state to Loaded
@@ -219,14 +237,11 @@ impl WasmOperator {
         let wasmtime_engine = wasmtime::Engine::global().await?;
 
         let target_arch = Triple::host();
-        let cache_path = format!(
-            "{}/{}/{}.cwasm",
-            WASMOP_CACHE_DIR, self.metadata.uid, target_arch
-        );
+        let cache_path = format!("{}/{}/{}.cwasm", WASMOP_CACHE_DIR, self.cr.uid, target_arch);
         let cache_path = PathBuf::from(cache_path);
 
         let component = if cache_path.exists() {
-            debug!("Loading component {} from cache...", self.metadata.name);
+            debug!("Loading component {} from cache...", self.cr.name);
             let component_bytes = std::fs::read(&cache_path)?;
             (unsafe {
                 Component::deserialize(&wasmtime_engine, &component_bytes).map_err(|e| {
@@ -239,34 +254,31 @@ impl WasmOperator {
                 })
             })?
         } else {
-            info!("HIER1.1");
             let wasm_bytes = self.load_wasm_file();
             let component = Component::new(wasmtime_engine, &wasm_bytes).map_err(|e| {
-                anyhow::anyhow!("Failed to load component '{}': {}", self.metadata.name, e)
+                anyhow::anyhow!("Failed to load component '{}': {}", self.cr.name, e)
             })?;
             let component_bytes: Vec<u8> = component.serialize()?;
-            info!("HIER1.2");
 
             if let Some(parent) = cache_path.parent() {
                 std::fs::create_dir_all(parent).context(format!(
                     "Failed to create cache directory structure for {}",
-                    self.metadata.name
+                    self.cr.name
                 ))?;
             }
             std::fs::write(cache_path, component_bytes).context(format!(
                 "Failed to write compiled cwasm for component {}",
-                self.metadata.name
+                self.cr.name
             ))?;
-            info!("HIER1.3");
             component
         };
 
         let wasi_ctx = WasiCtxBuilder::new()
             .inherit_stdio()
-            .args(&self.metadata.args)
+            .args(&self.cr.args)
             .envs(
                 &self
-                    .metadata
+                    .cr
                     .env
                     .iter()
                     .map(|e| (e.name.as_str(), e.value.as_str()))
@@ -274,7 +286,6 @@ impl WasmOperator {
             )
             .build();
 
-        info!("HIER1.4");
         let k8s_service = KubernetesService::global().await?;
 
         let state = State {
@@ -284,7 +295,6 @@ impl WasmOperator {
         };
         let mut store = Store::new(wasmtime_engine, state);
 
-        info!("HIER1.5");
         let mut linker = Linker::new(wasmtime_engine);
         add_to_linker_async(&mut linker)?;
 
@@ -293,12 +303,11 @@ impl WasmOperator {
         let operator =
             bindings::KubeOperator::instantiate_async(&mut store, &component, &linker).await?;
 
-        info!("HIER1.6");
         Ok((operator, store))
     }
 
     fn load_wasm_file(&self) -> Vec<u8> {
-        match self.metadata.wasm.clone() {
+        match self.cr.wasm.clone() {
             WasmSource::Pvc { path, file } => {
                 info!(
                     "Loading WASM from PVC path '{}' and file '{}'...",
@@ -374,7 +383,7 @@ impl WasmOperator {
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        info!("Stoppin watcher for kind '{}' in namespace '{}' for operator '{}'.", request.kind, request.namespace, operator.metadata.name.clone());
+                        info!("Stoppin watcher for kind '{}' in namespace '{}' for operator '{}'.", request.kind, request.namespace, operator.cr.name.clone());
                         break;
                     }
 
@@ -489,7 +498,7 @@ impl WasmOperator {
         {
             error!(
                 "Reconciliation for operator '{}' failed: {}",
-                self.metadata.name, e
+                self.cr.name, e
             );
         }
 

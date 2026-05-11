@@ -3,7 +3,6 @@
 //! This module defines the Rust structs for Kubernetes Custom Resources (CRDs)
 //! used by the operator to represent Wasm components and their configuration.
 
-//use crate::config::metadata::EnvironmentVariable;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -33,8 +32,6 @@ pub struct WasmOperatorSpec {
     #[serde(default)]
     pub args: Vec<String>,
 }
-
-//#[serde(tag = "sourceType", rename_all = "camelCase")]
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

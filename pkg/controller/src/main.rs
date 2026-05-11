@@ -5,7 +5,6 @@
 //! configuration, and orchestrating the Kubernetes service and the WASM runtime
 //! to execute the Wasm modules.
 
-mod config;
 mod host;
 mod kubernetes;
 mod runtime;
@@ -17,7 +16,7 @@ use runtime::MainController;
 use tracing::{debug, info};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::runtime::WasmEngineSingleton;
+use crate::runtime::wasmengine::WasmEngineSingleton;
 
 fn main() -> anyhow::Result<()> {
     let (config_path, debug) = parse_args()?;

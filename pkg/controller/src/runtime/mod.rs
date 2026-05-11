@@ -11,18 +11,15 @@ use std::time::Duration;
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::StreamExt;
-use kube::api::ResourceExt;
 use kube::runtime::watcher::{self, Event};
-use kube::Resource;
+use kube::ResourceExt;
 use tokio::sync::OnceCell;
 use tracing::{error, info, warn};
 
-use crate::config::metadata::{OperatorUid, WasmComponentMetadata};
 use crate::kubernetes::crd::WasmOperator as WasmOperatorCRD;
 use crate::kubernetes::KubernetesService;
-
-pub use self::wasmengine::WasmEngineSingleton;
-use self::wasmoperator::WasmOperator;
+use crate::runtime::wasmengine::WasmEngineSingleton;
+use crate::runtime::wasmoperator::{OperatorUid, WasmOperatorReduced, WasmOperatorRuntime};
 
 mod stats;
 pub mod wasmengine;
@@ -39,7 +36,7 @@ pub const WASMOP_CACHE_DIR: &str = match option_env!("WASMOP_CACHE_DIR") {
 pub static CONTROLLER_UUID: OnceCell<String> = OnceCell::const_new();
 
 pub struct MainController {
-    operators: DashMap<OperatorUid, Arc<WasmOperator>>,
+    operators: DashMap<OperatorUid, Arc<WasmOperatorRuntime>>,
 }
 
 impl MainController {
@@ -64,13 +61,13 @@ impl MainController {
         Ok(())
     }
 
-    async fn apply_operator(&self, obj: &kube::api::DynamicObject) -> Result<()> {
-        let op_uid = obj
+    async fn apply_operator(&self, wasmop_cr: &WasmOperatorCRD) -> Result<()> {
+        let op_uid = wasmop_cr
             .uid()
             .ok_or_else(|| anyhow::anyhow!("Kubernetes object is missing a UID"))?;
 
         if let Some(op) = self.operators.get(&op_uid) {
-            if op.metadata.generation >= obj.metadata.generation {
+            if op.cr.generation >= wasmop_cr.metadata.generation {
                 return Ok(());
             }
             self.delete_operator(&op_uid).await;
@@ -83,8 +80,8 @@ impl MainController {
             }
         }
 
-        let op_metadata = WasmComponentMetadata::load_from_k8s_object(obj)?;
-        let op = WasmOperator::new(op_metadata);
+        let red_crd = WasmOperatorReduced::from(wasmop_cr);
+        let op = WasmOperatorRuntime::new(red_crd);
         op.clone().start_watching().await?;
 
         self.operators.insert(op_uid, op);
@@ -107,13 +104,10 @@ impl MainController {
                 if op.is_idle(IDLE_THRESHOLD).await {
                     info!(
                         "Operator '{}' is idle for more than {:?}, unloading it.",
-                        op.metadata.name, IDLE_THRESHOLD
+                        op.cr.name, IDLE_THRESHOLD
                     );
                     if let Err(e) = op.unload().await {
-                        error!(
-                            "Failed to unload idle operator '{}': {}",
-                            op.metadata.name, e
-                        );
+                        error!("Failed to unload idle operator '{}': {}", op.cr.name, e);
                     }
                 }
             }
@@ -123,17 +117,11 @@ impl MainController {
     async fn wasmoperator_watch_loop(self: Arc<Self>) -> Result<()> {
         let k8s_service: Arc<KubernetesService> = KubernetesService::global().await?;
 
-        // Get the API resource for WasmOperator CRD to be able to watch it for changes.
-        let kind = WasmOperatorCRD::kind(&());
-        let api_resource = k8s_service.find_api_resource(&kind).await?;
-
         // Get the K8S watcher stream for the WasmOperator CRD.
         let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
-        let mut wasmop_watcher = watcher(
-            k8s_service.dynamic_api(api_resource, &namespace),
-            Default::default(),
-        )
-        .boxed();
+
+        let mut wasmop_watcher =
+            watcher(k8s_service.wasmoperator_api(&namespace), Default::default()).boxed();
 
         // Empty vector to keep track of operators when watch stream is restarted
         let mut control_restarted: Vec<OperatorUid> = Vec::new();
@@ -143,9 +131,9 @@ impl MainController {
             match wasmop_watcher.next().await {
                 Some(Ok(event)) => {
                     match event {
-                        Event::Apply(obj) => {
+                        Event::Apply(wasmop_cr) => {
                             // TODO: handle the result if loading is unsuccessful
-                            self.apply_operator(&obj).await?;
+                            self.apply_operator(&wasmop_cr).await?;
                         }
                         Event::Delete(obj) => {
                             let op_uid = obj.uid().unwrap();
@@ -182,14 +170,14 @@ impl MainController {
                 }
                 Some(Err(e)) => {
                     warn!(
-                        "Watcher for '{}' in namespace '{}' encountered an error: {}",
-                        &kind, namespace, e
+                        "Watcher for 'WasmOperator' in namespace '{}' encountered an error: {}",
+                        namespace, e
                     );
                 }
                 None => {
                     info!(
-                        "Watcher for '{}' in namespace '{}' stream ended.",
-                        &kind, namespace,
+                        "Watcher for 'WasmOperator' in namespace '{}' stream ended.",
+                        namespace,
                     );
                     return Err(anyhow::anyhow!(
                         "WasmOperator watcher stream ended unexpectedly."

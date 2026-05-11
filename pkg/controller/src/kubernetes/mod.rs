@@ -15,6 +15,8 @@ use std::convert::TryFrom;
 use std::sync::Arc;
 use tokio::sync::{OnceCell, RwLock};
 
+use crate::kubernetes::crd::WasmOperator as WasmOperatorCRD;
+
 const IMMUTABLE_METADATA_FIELDS: &[&str] = &[
     "creationTimestamp",
     "deletionGracePeriodSeconds",
@@ -71,22 +73,6 @@ pub struct KubernetesService {
 static INSTANCE: OnceCell<Arc<KubernetesService>> = OnceCell::const_new();
 
 impl KubernetesService {
-    /// Creates a new `KubernetesService`.
-    ///
-    /// This function infers the Kubernetes configuration from the environment,
-    /// creates a Kubernetes client, and performs API discovery.
-    // pub async fn new() -> Result<Self> {
-    //     let config = Config::infer()
-    //         .await
-    //         .context("Failed to infer Kubernetes config")?;
-    //     let client = Client::try_from(config).context("Failed to create Kubernetes client")?;
-    //     let discovery = Discovery::new(client.clone())
-    //         .run()
-    //         .await
-    //         .context("Failed to run Kubernetes API discovery")?;
-    //     Ok(KubernetesService { client, discovery })
-    // }
-
     /// Returns a reference to the global `KubernetesService` instance.
     ///
     /// During initialization, the function infers the Kubernetes configuration
@@ -145,25 +131,13 @@ impl KubernetesService {
         ))
     }
 
-    // pub fn find_api_resource(&self, kind: &str) -> Result<(ApiResource, Option<&ApiGroup>)> {
-    //     for group in self.discovery.groups() {
-    //         for version in group.versions() {
-    //             for (ar, _caps) in group.versioned_resources(version) {
-    //                 if ar.kind.eq_ignore_ascii_case(kind) {
-    //                     return Ok((ar.clone(), Some(group)));
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     Err(anyhow!(
-    //         "Kind '{}' not found in discovered API resources",
-    //         kind
-    //     ))
-    // }
-
     /// Returns a dynamic, namespaced API client for a given `ApiResource`.
     pub fn dynamic_api(&self, ar: ApiResource, namespace: &str) -> Api<DynamicObject> {
         Api::namespaced_with(self.client.clone(), namespace, &ar)
+    }
+
+    pub fn wasmoperator_api(&self, namespace: &str) -> Api<WasmOperatorCRD> {
+        Api::namespaced(self.client.clone(), namespace)
     }
 
     pub async fn get_resource(&self, kind: &str, name: &str, namespace: &str) -> Result<String> {
@@ -265,60 +239,4 @@ impl KubernetesService {
 
         Ok(())
     }
-
-    // pub async fn patch_observed_generation(
-    //     &self,
-    //     kind: &str,
-    //     name: &str,
-    //     namespace: &str,
-    //     observed_generation: i64,
-    // ) -> Result<()> {
-    //     let ar = self.find_api_resource(kind).await?;
-    //     let api = self.dynamic_api(ar, namespace);
-
-    //     let patch = serde_json::json!({
-    //         "status": {
-    //             "observedGeneration": observed_generation,
-    //         }
-    //     });
-
-    //     let pp = PatchParams::default();
-    //     api.patch_status(name, &pp, &Patch::Merge(&patch))
-    //         .await
-    //         .context("Failed to patch observed generation in resource status")?;
-
-    //     Ok(())
-    // }
-
-    // pub async fn patch_operator_observed_generation(
-    //     &self,
-    //     name: &str,
-    //     observed_generation: i64,
-    // ) -> Result<()> {
-    //     let kind = WasmOperator::kind(&());
-    //     let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
-
-    //     self.patch_observed_generation(&kind, name, &namespace, observed_generation)
-    //         .await
-    //         .context("Failed to patch observed generation for operator")?;
-    //     Ok(())
-    // }
-
-    // pub async fn patch_operator_status(&self, name: &str, loaded: bool) -> Result<()> {
-    //     let kind = WasmOperator::kind(&());
-    //     let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
-
-    //     let patch = serde_json::json!({
-    //         "status": {
-    //             "loaded": loaded,
-    //             "lastUpdated": chrono::Utc::now().to_rfc3339(),
-    //         }
-    //     });
-
-    //     self.patch_status(&kind, name, &namespace, &patch.to_string())
-    //         .await
-    //         .context("Failed to patch operator status")?;
-
-    //     Ok(())
-    // }
 }

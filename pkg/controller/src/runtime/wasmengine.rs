@@ -2,8 +2,6 @@ use anyhow::Result;
 use tokio::sync::OnceCell;
 use wasmtime::Engine;
 
-// TODO: normally all binary that is created is cached inside the engine, check if not to big and add eviction strategy if needed, save compiled binaries to disk to avoid recompilation on restarts
-
 static WASM_ENGINE: OnceCell<Engine> = OnceCell::const_new();
 
 pub trait WasmEngineSingleton {
