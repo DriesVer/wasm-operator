@@ -44,12 +44,21 @@ pub enum WasmSource {
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WasmOperatorStatus {
-    pub loaded: bool,
+    pub state: WasmOperatorState,
     pub last_updated: String,
     pub observed_generation: Option<i64>,
     pub owner: Option<String>,
 
     pub statistics: Option<WasmOperatorStatistics>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum WasmOperatorState {
+    Unclaimed,
+    Running,
+    Idle,
+    Error,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
@@ -67,4 +76,5 @@ pub struct WasmOperatorStatistics {
     pub idle_duration_sec_max: u64,
     pub active_duration_sec_avg: u64,
     pub active_duration_sec_max: u64,
+    pub recent_errors: Vec<String>,
 }

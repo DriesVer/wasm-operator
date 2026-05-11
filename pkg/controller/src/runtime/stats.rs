@@ -1,10 +1,42 @@
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use std::cmp::min;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use tokio::sync::Mutex;
 
 use crate::kubernetes::crd::WasmOperatorStatistics;
 
 // TODO: maybe use prometheus but prometheus can be more resource intensive
+
+struct AsyncFixedBuffer<T> {
+    data: Mutex<VecDeque<T>>,
+    limit: usize,
+}
+
+impl<T> AsyncFixedBuffer<T> {
+    fn new(limit: usize) -> Self {
+        Self {
+            data: Mutex::new(VecDeque::with_capacity(limit)),
+            limit,
+        }
+    }
+
+    async fn push(&self, item: T) {
+        let mut data = self.data.lock().await;
+        if data.len() >= self.limit {
+            data.pop_back();
+        }
+        data.push_front(item);
+    }
+
+    async fn get_all(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        let data = self.data.lock().await;
+        data.iter().cloned().collect()
+    }
+}
 
 pub struct WasmOperatorStatisticsRecorder {
     last_reconcile: AtomicI64,   // Unix timestamp in hours of last reconcile
@@ -26,10 +58,15 @@ pub struct WasmOperatorStatisticsRecorder {
     active_max_duration_s: AtomicU64,
 
     memory_usage_bytes: AtomicU32, // Max 4GB
+
+    error_log: AsyncFixedBuffer<String>,
 }
 
 impl WasmOperatorStatisticsRecorder {
     pub fn new() -> Self {
+        let err_buffer_size = option_env!("WASMOP_ERROR_LOG_SIZE")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
         Self {
             last_reconcile: AtomicI64::new(0),
             reconciles: Default::default(),
@@ -45,6 +82,7 @@ impl WasmOperatorStatisticsRecorder {
             active_total_duration_s: AtomicU64::new(0),
             active_max_duration_s: AtomicU64::new(0),
             memory_usage_bytes: AtomicU32::new(0),
+            error_log: AsyncFixedBuffer::new(err_buffer_size),
         }
     }
 
@@ -118,6 +156,16 @@ impl WasmOperatorStatisticsRecorder {
         }
     }
 
+    pub async fn record_error(&self, error: String) {
+        self.error_log
+            .push(format!(
+                "[{}] {}",
+                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                error
+            ))
+            .await;
+    }
+
     fn get_reconcile_total_24h(&self) -> u32 {
         self.reconciles.iter().fold(0, |acc, hour_count| {
             acc + hour_count.load(Ordering::Relaxed) as u32
@@ -187,7 +235,7 @@ impl WasmOperatorStatisticsRecorder {
         self.active_total_duration_s.load(Ordering::Relaxed) / load_total
     }
 
-    pub fn get_statistics(&self) -> WasmOperatorStatistics {
+    pub async fn get_statistics(&self) -> WasmOperatorStatistics {
         WasmOperatorStatistics {
             reconcile_total_24h: self.get_reconcile_total_24h(),
             reconcile_cold_start_ratio: self.get_reconcile_cold_start_ratio(),
@@ -201,6 +249,7 @@ impl WasmOperatorStatisticsRecorder {
             idle_duration_sec_max: self.idle_max_duration_s.load(Ordering::Relaxed),
             active_duration_sec_avg: self.get_running_duration_s_avg(),
             active_duration_sec_max: self.active_max_duration_s.load(Ordering::Relaxed),
+            recent_errors: self.error_log.get_all().await,
         }
     }
 }

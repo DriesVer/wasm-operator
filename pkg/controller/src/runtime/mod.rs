@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use dashmap::DashMap;
 use futures::StreamExt;
 use kube::runtime::watcher::{self, Event};
@@ -37,6 +38,7 @@ pub static CONTROLLER_UUID: OnceCell<String> = OnceCell::const_new();
 
 pub struct MainController {
     operators: DashMap<OperatorUid, Arc<WasmOperatorRuntime>>,
+    crashed_operators: DashMap<OperatorUid, Option<i64>>,
 }
 
 impl MainController {
@@ -44,6 +46,7 @@ impl MainController {
         let _ = CONTROLLER_UUID.set(uuid::Uuid::new_v4().to_string());
         Arc::new(Self {
             operators: DashMap::new(),
+            crashed_operators: DashMap::new(),
         })
     }
 
@@ -66,6 +69,17 @@ impl MainController {
             .uid()
             .ok_or_else(|| anyhow::anyhow!("Kubernetes object is missing a UID"))?;
 
+        let crash_gen = self.crashed_operators.get(&op_uid).and_then(|v| *v);
+        if wasmop_cr.metadata.generation <= crash_gen {
+            warn!(
+                    "Skipping operator '{}' with generation '{}' since it previously crashed with generation '{}'",
+                    wasmop_cr.name_any(), 
+                    wasmop_cr.metadata.generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string()), 
+                    crash_gen.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string())
+                );
+            return Ok(());
+        }
+
         if let Some(op) = self.operators.get(&op_uid) {
             if op.cr.generation >= wasmop_cr.metadata.generation {
                 return Ok(());
@@ -80,9 +94,18 @@ impl MainController {
             }
         }
 
-        let red_crd = WasmOperatorReduced::from(wasmop_cr);
-        let op = WasmOperatorRuntime::new(red_crd);
-        op.clone().start_watching().await?;
+        let red_cr = WasmOperatorReduced::from(wasmop_cr);
+        let op = WasmOperatorRuntime::new(red_cr);
+
+        if let Err(e) = op.clone().start_watching().await {
+            self.crashed_operators
+                .insert(op_uid.clone(), op.cr.generation);
+            error!(
+                "Failed to start operator '{}' with generation {:?}: {}",
+                op.cr.name, op.cr.generation, e
+            );
+            return Ok(());
+        }
 
         self.operators.insert(op_uid, op);
 

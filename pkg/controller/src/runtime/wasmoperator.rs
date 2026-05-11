@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use dashmap::DashMap;
 use futures::StreamExt;
 use kube::runtime::watcher::Event;
@@ -15,7 +16,7 @@ use target_lexicon::Triple;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::Store;
 use wasmtime_wasi::p2::{add_to_linker_async, WasiCtxBuilder};
@@ -24,7 +25,8 @@ use crate::host::api::bindings;
 use crate::host::api::bindings::local::operator::types as wit_types;
 use crate::host::state::State;
 use crate::kubernetes::crd::{
-    EnvironmentVariable, WasmOperator as WasmOperatorCRD, WasmOperatorStatus, WasmSource,
+    EnvironmentVariable, WasmOperator as WasmOperatorCRD, WasmOperatorState, WasmOperatorStatus,
+    WasmSource,
 };
 use crate::kubernetes::KubernetesService;
 use crate::runtime::CONTROLLER_UUID;
@@ -32,7 +34,7 @@ use crate::runtime::{WasmEngineSingleton, WASMOP_CACHE_DIR};
 
 use super::stats::WasmOperatorStatisticsRecorder;
 
-const STATUS_PATCH_THROTTLE_DURATION: Duration = Duration::from_secs(1);
+const STATUS_PATCH_THROTTLE_DURATION: Duration = Duration::from_secs(1); // TODO: increase this and  make another process to update status periodically
 
 // This struct mirrors the WatchRequest from WIT bindgen but enables us to use it as a key in a DashMap for managing watchers.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -114,17 +116,17 @@ impl WasmOperatorRuntime {
         })
     }
 
-    async fn patch_k8s_status(&self, loaded: bool) -> Result<()> {
+    async fn patch_k8s_status(&self, state: WasmOperatorState) -> Result<()> {
         let k8s_service: Arc<KubernetesService> = KubernetesService::global()
             .await
             .expect("Failed to initialize K8s service");
 
         let status = WasmOperatorStatus {
-            loaded,
-            last_updated: chrono::Utc::now().to_rfc3339(),
+            state,
+            last_updated: Utc::now().to_rfc3339(),
             observed_generation: self.cr.generation,
             owner: CONTROLLER_UUID.get().cloned(),
-            statistics: Some(self.stats.get_statistics()),
+            statistics: Some(self.stats.get_statistics().await),
         };
 
         let patch = serde_json::json!({
@@ -141,11 +143,15 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
-    async fn patch_k8s_status_throttled(&self, loaded: bool, force: bool) -> Result<()> {
+    async fn patch_k8s_status_throttled(
+        &self,
+        state: WasmOperatorState,
+        force: bool,
+    ) -> Result<()> {
         let mut last_patch_time_guard = self.last_patch_time.lock().await;
         if force || last_patch_time_guard.elapsed() > STATUS_PATCH_THROTTLE_DURATION {
             *last_patch_time_guard = Instant::now();
-            self.patch_k8s_status(loaded).await?;
+            self.patch_k8s_status(state).await?;
         }
         Ok(())
     }
@@ -182,7 +188,8 @@ impl WasmOperatorRuntime {
         }
         tokio::fs::write(&state_path, &memory_data).await?;
 
-        self.patch_k8s_status_throttled(false, true).await?;
+        self.patch_k8s_status_throttled(WasmOperatorState::Idle, true)
+            .await?;
 
         // Update the state to Unloaded
         *state_guard = OperatorState::Unloaded(Arc::new(UnloadedState { state_path }));
@@ -222,7 +229,8 @@ impl WasmOperatorRuntime {
             tokio::fs::remove_file(&unloaded_state.state_path).await?;
         }
 
-        self.patch_k8s_status_throttled(true, true).await?;
+        self.patch_k8s_status_throttled(WasmOperatorState::Running, true)
+            .await?;
 
         // Update the state to Loaded
         *state_guard = OperatorState::Loaded(Arc::new(LoadedState {
@@ -257,7 +265,16 @@ impl WasmOperatorRuntime {
                 })
             })?
         } else {
-            let wasm_bytes = self.load_wasm_file();
+            let wasm_bytes = match self.load_wasm_file() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.stats.record_error(e.to_string()).await;
+                    self.patch_k8s_status_throttled(WasmOperatorState::Error, true)
+                        .await
+                        .ok();
+                    return Err(e);
+                }
+            };
             let component = Component::new(wasmtime_engine, &wasm_bytes).map_err(|e| {
                 anyhow::anyhow!("Failed to load component '{}': {}", self.cr.name, e)
             })?;
@@ -309,15 +326,18 @@ impl WasmOperatorRuntime {
         Ok((operator, store))
     }
 
-    fn load_wasm_file(&self) -> Vec<u8> {
+    fn load_wasm_file(&self) -> Result<Vec<u8>> {
         match self.cr.wasm.clone() {
             WasmSource::Pvc { path, file } => {
-                info!(
+                debug!(
                     "Loading WASM from PVC path '{}' and file '{}'...",
                     path, file
                 );
                 let path = std::path::Path::new(&path).join(&file);
-                std::fs::read(path).expect("Failed to read wasm file")
+                std::fs::read(&path).context(format!(
+                    "Failed to read WASM file '{}' from PVC path '{:?}'",
+                    &file, &path
+                ))
             }
         }
     }
@@ -508,7 +528,9 @@ impl WasmOperatorRuntime {
         let duration = start_reconcile.elapsed().as_millis();
         self.stats.record_reconcile(duration as u32);
 
-        self.patch_k8s_status_throttled(true, false).await.ok();
+        self.patch_k8s_status_throttled(WasmOperatorState::Running, false)
+            .await
+            .ok();
     }
 
     pub async fn execute_via_wit<F, T>(&self, f: F) -> Result<T>
