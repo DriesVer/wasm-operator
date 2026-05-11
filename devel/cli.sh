@@ -139,61 +139,92 @@ wasmop_check() {
     wasmop check install
 }
 
+wasmop_setup_kind() {
+    echo -n "Kind cluster name: " 
+    read cluster_name
+    if [ -z "$cluster_name" ]; then
+        echo "No cluster name provided. Using default name \033[1m'wasm-operator'\033[0m."
+        cluster_name="wasm-operator"
+    fi
 
+    echo "Using kind config from './devel/kind-config.yaml'."
+    config_file="${ROOT}/devel/kind-config.yaml"
+
+    if [ ! -f "$config_file" ]; then
+            echo -e "\033[31mERROR: Kind config file not found at '$config_file'. Please create the config file or provide the correct path.\033[0m"
+            exit 1
+        fi
+
+    if confirm "Do you want to mount a folder into the kind cluster?"; then
+        echo -n "Host folder to mount: " 
+        read host_folder
+        if [ -z "$host_folder" ]; then
+            echo "No host folder provided. Skipping folder mount."
+        else
+            echo -n "Container folder to mount to (default: /mnt/host): " 
+            read container_folder
+            if [ -z "$container_folder" ]; then
+                container_folder="/mnt/host"
+            fi
+            echo "Mounting host folder '$host_folder' to container folder '$container_folder' in kind cluster '$cluster_name'."
+
+            temp_config=$(mktemp)
+            trap 'rm -f "$temp_config"' EXIT
+            cp "${ROOT}/devel/kind-config.yaml" "$temp_config"
+
+            perl -i -pe "s|role: control-plane|role: control-plane\n  extraMounts:\n  - hostPath: ${host_folder}\n    containerPath: ${container_folder}|" "$temp_config"
+            
+            config_file="$temp_config"
+
+            # Save the host folder path to the config file for later use
+            perl -i -pe "s|^\s*HOST_FOLDER=.*|HOST_FOLDER=\"$host_folder\"|" "$CONFIG_FILE"
+        fi
+    fi
+
+    kind create cluster --name "${cluster_name}" --config "${config_file}"
+}
+
+wasmop_setup_predictionserver() {
+    local cname=1
+    if [ -n "$cname" ]; then
+        cluser_name="$cname"
+    else
+        if [ -z "$cluster_name" ]; then
+            echo "No cluster name provided."
+            exit 1
+        fi
+    fi
+
+    echo -e "\033[1m\nSetting up the prediction server in the cluster\033[0m"
+    docker build -t prediction_webserver:webserver "${ROOT}/prediction/webserver"
+    kind load docker-image --name $cluster_name prediction_webserver:webserver
+    kubectl apply -f "${ROOT}/tests/yaml/deploymentFlask.yaml"
+}
+
+wasmop_setup_crd() {
+    echo -e "\033[1m\nSetting up the CRD for the wasm-operator\033[0m"
+    cd "${ROOT}/pkg/controller"
+
+    temp_crd_manifest=$(mktemp)
+    trap 'rm -f "$temp_crd_manifest"' EXIT
+    echo $temp_crd_manifest
+
+    cargo run --bin export_crd > "$temp_crd_manifest"
+    kubectl apply -f "$temp_crd_manifest"
+}
 
 wasmop_setup() {
     wasmop check install
 
     if confirm "\nDo you want to create a kind cluster?"; then
-        echo -n "Kind cluster name: " 
-        read cluster_name
-        if [ -z "$cluster_name" ]; then
-            echo "No cluster name provided. Using default name \033[1m'wasm-operator'\033[0m."
-            cluster_name="wasm-operator"
-        fi
-
-        echo "Using kind config from './devel/kind-config.yaml'."
-        config_file="${ROOT}/devel/kind-config.yaml"
-
-        if [ ! -f "$config_file" ]; then
-                echo -e "\033[31mERROR: Kind config file not found at '$config_file'. Please create the config file or provide the correct path.\033[0m"
-                exit 1
-            fi
-
-        if confirm "Do you want to mount a folder into the kind cluster?"; then
-            echo -n "Host folder to mount: " 
-            read host_folder
-            if [ -z "$host_folder" ]; then
-                echo "No host folder provided. Skipping folder mount."
-            else
-                echo -n "Container folder to mount to (default: /mnt/host): " 
-                read container_folder
-                if [ -z "$container_folder" ]; then
-                    container_folder="/mnt/host"
-                fi
-                echo "Mounting host folder '$host_folder' to container folder '$container_folder' in kind cluster '$cluster_name'."
-
-                temp_config=$(mktemp)
-                trap 'rm -f "$temp_config"' EXIT
-                cp "${ROOT}/devel/kind-config.yaml" "$temp_config"
-
-                perl -i -pe "s|role: control-plane|role: control-plane\n  extraMounts:\n  - hostPath: ${host_folder}\n    containerPath: ${container_folder}|" "$temp_config"
-                
-                config_file="$temp_config"
-
-                # Save the host folder path to the config file for later use
-                perl -i -pe "s|^\s*HOST_FOLDER=.*|HOST_FOLDER=\"$host_folder\"|" "$CONFIG_FILE"
-            fi
-        fi
-
-        kind create cluster --name "${cluster_name}" --config "${config_file}"
+        wasmop setup kind
     fi
 
     if confirm "\nDo you want to install the prediction server in the cluster?"; then
-        docker build -t prediction_webserver:webserver "${ROOT}/prediction/webserver"
-        kind load docker-image --name $cluster_name prediction_webserver:webserver
-        kubectl apply -f "${ROOT}/tests/yaml/deploymentFlask.yaml"
+        wamop setup predictionserver
     fi
+
+    wasmop setup crd
 }
 
 wasmop_build() {
