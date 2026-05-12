@@ -13,7 +13,7 @@ use kube::runtime::watcher::Event;
 use kube::{Resource, ResourceExt};
 use serde_json;
 use target_lexicon::Triple;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -98,12 +98,13 @@ pub struct WasmOperatorRuntime {
     state: RwLock<OperatorState>,
     watchers: DashMap<WatchRequestKey, CancellationToken>,
     task_tracker: Mutex<TaskTracker>,
+    shutdown_tx: mpsc::Sender<String>,
     stats: WasmOperatorStatisticsRecorder,
     last_patch_time: Mutex<Instant>,
 }
 
 impl WasmOperatorRuntime {
-    pub fn new(wasmop_cr: WasmOperatorReduced) -> Arc<Self> {
+    pub fn new(wasmop_cr: WasmOperatorReduced, shutdown_tx: mpsc::Sender<String>) -> Arc<Self> {
         Arc::new(Self {
             cr: wasmop_cr,
             state: RwLock::new(OperatorState::Unloaded(Arc::new(UnloadedState {
@@ -111,6 +112,7 @@ impl WasmOperatorRuntime {
             }))),
             watchers: DashMap::new(),
             task_tracker: Mutex::new(TaskTracker::new()),
+            shutdown_tx,
             stats: WasmOperatorStatisticsRecorder::new(),
             last_patch_time: Mutex::new(Instant::now() - STATUS_PATCH_THROTTLE_DURATION * 2),
         })
@@ -156,6 +158,18 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    async fn throw_fatal_error<T>(&self, message: &str) -> Result<T> {
+        self.stats.record_error(message).await;
+        self.patch_k8s_status_throttled(WasmOperatorState::Error, true)
+            .await
+            .ok();
+        self.shutdown_tx
+            .send(self.cr.uid.clone())
+            .await
+            .context("Failed to send shutdown signal for operator")?;
+        Err(anyhow::anyhow!(message.to_string()))
+    }
+
     pub async fn unload(&self) -> Result<()> {
         // Acquire write lock and extract the loaded state
         let mut state_guard = self.state.write().await;
@@ -168,10 +182,17 @@ impl WasmOperatorRuntime {
         let mut store_guard = loaded_state.store.lock().await;
 
         // Ask the component to serialize its own state
-        let memory_data = loaded_state
+        let memory_data = match loaded_state
             .operator
             .call_serialize(&mut *store_guard)
-            .await?;
+            .await
+        {
+            Ok(data) => data,
+            Err(e) => {
+                let error = format!("Failed to serialize state: {}", e);
+                return self.throw_fatal_error(&error).await;
+            }
+        };
 
         self.stats.record_memory_usage(memory_data.len() as u32);
 
@@ -220,7 +241,12 @@ impl WasmOperatorRuntime {
             let saved_state = tokio::fs::read(&unloaded_state.state_path).await?;
 
             // Ask the new component instance to deserialize the state
-            operator.call_deserialize(&mut store, &saved_state).await?;
+            //operator.call_deserialize(&mut store, &saved_state).await?;
+            if let Err(e) = operator.call_deserialize(&mut store, &saved_state).await {
+                let error = format!("Failed to deserialize state: {}", e);
+                return self.throw_fatal_error(&error).await;
+            }
+
             info!(
                 "Successfully restored memory state for operator {}",
                 self.cr.name
@@ -249,7 +275,11 @@ impl WasmOperatorRuntime {
         let wasmtime_engine = wasmtime::Engine::global().await?;
 
         let target_arch = Triple::host();
-        let cache_path = format!("{}/{}/{}.cwasm", WASMOP_CACHE_DIR, self.cr.uid, target_arch);
+        let generation = self.cr.generation.unwrap_or(0);
+        let cache_path = format!(
+            "{}/{}_{}/{}.cwasm",
+            WASMOP_CACHE_DIR, self.cr.uid, generation, target_arch
+        );
         let cache_path = PathBuf::from(cache_path);
 
         let component = if cache_path.exists() {
@@ -268,16 +298,19 @@ impl WasmOperatorRuntime {
             let wasm_bytes = match self.load_wasm_file() {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    self.stats.record_error(e.to_string()).await;
-                    self.patch_k8s_status_throttled(WasmOperatorState::Error, true)
-                        .await
-                        .ok();
-                    return Err(e);
+                    return self.throw_fatal_error(&e.to_string()).await;
                 }
             };
-            let component = Component::new(wasmtime_engine, &wasm_bytes).map_err(|e| {
-                anyhow::anyhow!("Failed to load component '{}': {}", self.cr.name, e)
-            })?;
+            let component = match Component::new(&wasmtime_engine, &wasm_bytes) {
+                Ok(c) => c,
+                Err(e) => {
+                    let error = format!(
+                        "Failed to compile wasm for operator '{}': {}",
+                        self.cr.name, e
+                    );
+                    return self.throw_fatal_error(&error).await;
+                }
+            };
             let component_bytes: Vec<u8> = component.serialize()?;
 
             if let Some(parent) = cache_path.parent() {

@@ -156,7 +156,7 @@ impl WasmOperatorStatisticsRecorder {
         }
     }
 
-    pub async fn record_error(&self, error: String) {
+    pub async fn record_error(&self, error: &str) {
         self.error_log
             .push(format!(
                 "[{}] {}",

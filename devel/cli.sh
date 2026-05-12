@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+echo -e "\033[1mWASM-OPERATOR DEVELOPMENT CLI LOADED\033[0m"
+
 if [ -n "$BASH_VERSION" ]; then
     SOURCE_ROOT=$(realpath $(dirname "${BASH_SOURCE}"))
 elif [ -n "$ZSH_VERSION" ]; then

@@ -9,12 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::Utc;
 use dashmap::DashMap;
 use futures::StreamExt;
 use kube::runtime::watcher::{self, Event};
 use kube::ResourceExt;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, mpsc};
 use tracing::{error, info, warn};
 
 use crate::kubernetes::crd::WasmOperator as WasmOperatorCRD;
@@ -58,13 +57,20 @@ impl MainController {
             runtime.idle_check_loop().await;
         });
 
-        self.wasmoperator_watch_loop().await?;
+        // Start a task to handle operators shutdowns orginating from the wasmoperator runtime itself. E.g. fatal errors
+        let runtime = self.clone();
+        let (op_shutdown_tx, op_shutdown_rx) = mpsc::channel::<String>(10);
+        tokio::spawn(async move {
+            runtime.handle_operator_shutdown(op_shutdown_rx).await;
+        });
+
+        self.wasmoperator_watch_loop(op_shutdown_tx).await?;
 
         // Start watching for WasmOperator CRs and apply them accordingly.
         Ok(())
     }
 
-    async fn apply_operator(&self, wasmop_cr: &WasmOperatorCRD) -> Result<()> {
+    async fn apply_operator(&self, wasmop_cr: &WasmOperatorCRD, op_shutdown_tx: mpsc::Sender<String>) -> Result<()> {
         let op_uid = wasmop_cr
             .uid()
             .ok_or_else(|| anyhow::anyhow!("Kubernetes object is missing a UID"))?;
@@ -95,7 +101,7 @@ impl MainController {
         }
 
         let red_cr = WasmOperatorReduced::from(wasmop_cr);
-        let op = WasmOperatorRuntime::new(red_cr);
+        let op = WasmOperatorRuntime::new(red_cr, op_shutdown_tx.clone());
 
         if let Err(e) = op.clone().start_watching().await {
             self.crashed_operators
@@ -119,6 +125,21 @@ impl MainController {
         }
     }
 
+    async fn handle_operator_shutdown(&self, mut rx: mpsc::Receiver<String>) {
+        while let Some(op_uid) = rx.recv().await {
+            if let Some(op) = self.operators.get(&op_uid) {
+                let op = op.value();
+                self.crashed_operators
+                    .insert(op_uid.clone(), op.cr.generation);
+                warn!(
+                    "Operator '{}' with generation {:?} has shut down unexpectedly, removing it from execution",
+                    op.cr.name, op.cr.generation
+                );
+                self.delete_operator(&op_uid).await;
+            }
+        }
+    }
+
     async fn idle_check_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(IDLE_THRESHOLD / 2).await;
@@ -130,14 +151,17 @@ impl MainController {
                         op.cr.name, IDLE_THRESHOLD
                     );
                     if let Err(e) = op.unload().await {
-                        error!("Failed to unload idle operator '{}': {}", op.cr.name, e);
+                        error!("Failed to unload idle operator '{}', removing it from execution: {}", op.cr.name, e);
+                        self.crashed_operators
+                            .insert(entry.key().clone(), op.cr.generation);
+                        self.delete_operator(entry.key()).await;
                     }
                 }
             }
         }
     }
 
-    async fn wasmoperator_watch_loop(self: Arc<Self>) -> Result<()> {
+    async fn wasmoperator_watch_loop(self: Arc<Self>, op_shutdown_tx: mpsc::Sender<String>) -> Result<()> {
         let k8s_service: Arc<KubernetesService> = KubernetesService::global().await?;
 
         // Get the K8S watcher stream for the WasmOperator CRD.
@@ -156,7 +180,7 @@ impl MainController {
                     match event {
                         Event::Apply(wasmop_cr) => {
                             // TODO: handle the result if loading is unsuccessful
-                            self.apply_operator(&wasmop_cr).await?;
+                            self.apply_operator(&wasmop_cr, op_shutdown_tx.clone()).await?;
                         }
                         Event::Delete(obj) => {
                             let op_uid = obj.uid().unwrap();
@@ -172,7 +196,7 @@ impl MainController {
                             // We add the operator to the control list and ensure it's active, if not already restarted
                             let op_uid = obj.uid().unwrap();
                             control_restarted.push(op_uid.clone());
-                            self.apply_operator(&obj).await?;
+                            self.apply_operator(&obj, op_shutdown_tx.clone()).await?;
                         }
                         Event::InitDone => {
                             // This event is emitted when the initial list of existing objects has been processed after a watcher stream restart
