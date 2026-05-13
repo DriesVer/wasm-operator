@@ -170,6 +170,15 @@ impl WasmOperatorRuntime {
         Err(anyhow::anyhow!(message.to_string()))
     }
 
+    fn get_cache_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "{}/{}_{}",
+            WASMOP_CACHE_DIR,
+            self.cr.uid,
+            self.cr.generation.unwrap_or(0)
+        ))
+    }
+
     pub async fn unload(&self) -> Result<()> {
         // Acquire write lock and extract the loaded state
         let mut state_guard = self.state.write().await;
@@ -203,7 +212,7 @@ impl WasmOperatorRuntime {
         );
 
         // Write state to memory to a file
-        let state_path = PathBuf::from(format!("{}/{}/state.mem", WASMOP_CACHE_DIR, self.cr.uid));
+        let state_path = self.get_cache_path().join("state.mem");
         if let Some(parent) = state_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -275,13 +284,7 @@ impl WasmOperatorRuntime {
         let wasmtime_engine = wasmtime::Engine::global().await?;
 
         let target_arch = Triple::host();
-        let generation = self.cr.generation.unwrap_or(0);
-        let cache_path = format!(
-            "{}/{}_{}/{}.cwasm",
-            WASMOP_CACHE_DIR, self.cr.uid, generation, target_arch
-        );
-        let cache_path = PathBuf::from(cache_path);
-
+        let cache_path = self.get_cache_path().join(format!("{}.cwasm", target_arch));
         let component = if cache_path.exists() {
             let component_bytes = std::fs::read(&cache_path)?;
             (unsafe {
@@ -530,11 +533,6 @@ impl WasmOperatorRuntime {
                 return self.throw_fatal_error(&error).await;
             }
         };
-
-        warn!(
-            "Reconcile result for operator '{}': {:?}",
-            self.cr.name, &reconcile_result
-        );
 
         match reconcile_result {
             wit_types::ReconcileResult::Ok => {}
