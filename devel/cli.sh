@@ -289,6 +289,7 @@ wasmop_load() {
 
     echo -e "\033[34mCreate namespace and controller resource\033[0m"
     kubectl apply -f ./namespaces.yaml
+    kubectl delete -f ./wasm_operator.yaml --ignore-not-found
 
     # Replace prediction server URL in child_controller.yaml
     if [ "$get_flask_server" -eq 1 ]; then
@@ -304,6 +305,8 @@ wasmop_load() {
         # kubectl apply -f ./child_controller.yaml
         kubectl replace --force -f ./child_controller.yaml
     fi
+
+    kubectl apply -f ./wasm_operator.yaml
 
     # Wait for the controller pod to be running
     echo -e "\033[1m\nWaiting for the controller pod to be running\033[0m"

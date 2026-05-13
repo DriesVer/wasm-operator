@@ -22,7 +22,10 @@ pub struct EnvironmentVariable {
     namespaced,
     status = "WasmOperatorStatus",
     shortname = "wasmop",
-    doc = "A custom resource that defines a WebAssembly-based operator used in the wasm-operator framework."
+    doc = "A custom resource that defines a WebAssembly-based operator used in the wasm-operator framework.",
+    printcolumn = r#"{"name":"State", "type":"string", "jsonPath":".status.state"}"#,
+    printcolumn = r#"{"name":"Memory", "type":"integer", "jsonPath":".status.statistics.memoryUsageBytes", "description":"Current memory usage in bytes"}"#,
+    printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct WasmOperatorSpec {
@@ -66,12 +69,15 @@ pub enum WasmOperatorState {
 #[serde(rename_all = "camelCase")]
 pub struct WasmOperatorStatistics {
     pub reconcile_total_24h: u32,
+    #[schemars(range(min = 0, max = 100))]
     pub reconcile_cold_start_ratio: u8,
     pub wasm_load_duration_msec_avg: u32,
     pub wasm_load_duration_msec_max: u32,
     pub reconcile_duration_msec_avg: u32,
     pub reconcile_duration_msec_max: u32,
     pub memory_usage_bytes: u32,
+
+    #[schemars(range(min = 0, max = 100))]
     pub activity_ratio: u8,
     pub idle_duration_sec_avg: u64,
     pub idle_duration_sec_max: u64,
