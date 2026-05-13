@@ -76,11 +76,6 @@ impl Guest for SimpleOperator {
 
     fn deserialize(_bytes: Vec<u8>) {
         kubernetes::log(LogLevel::Info, "Rust operator deserialize called");
-        panic!("The program encountered a fatal error and must stop.");
-        kubernetes::log(
-            LogLevel::Info,
-            "After panic log - this should not be visible",
-        );
         let decoded = bincode::deserialize::<Vec<u32>>(&_bytes);
         match decoded {
             Ok(vec) => {

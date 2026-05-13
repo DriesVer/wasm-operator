@@ -107,8 +107,8 @@ impl MainController {
             self.crashed_operators
                 .insert(op_uid.clone(), op.cr.generation);
             error!(
-                "Failed to start operator '{}' with generation {:?}: {}",
-                op.cr.name, op.cr.generation, e
+                "Failed to start operator '{}' with generation '{}': {}",
+                op.cr.name, op.cr.generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string()), e
             );
             return Ok(());
         }
@@ -132,8 +132,8 @@ impl MainController {
                 self.crashed_operators
                     .insert(op_uid.clone(), op.cr.generation);
                 warn!(
-                    "Operator '{}' with generation {:?} has shut down unexpectedly, removing it from execution",
-                    op.cr.name, op.cr.generation
+                    "Operator '{}' with generation '{}' has shut down unexpectedly, removing it from execution",
+                    op.cr.name, op.cr.generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string())
                 );
                 self.delete_operator(&op_uid).await;
             }

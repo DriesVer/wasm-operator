@@ -443,48 +443,29 @@ impl WasmOperatorRuntime {
                         break;
                     }
 
-                    event_option = k8s_watcher.next() => {
-                        match event_option {
-                            Some(Ok(event)) => match event {
-                                Event::Apply(obj) => {
-                                    operator.reconcile(
-                                        bindings::local::operator::types::EventType::Added,
-                                        &obj,
-                                    )
-                                    .await;
-                                }
-                                Event::Delete(obj) => {
-                                    operator.reconcile(
-                                        bindings::local::operator::types::EventType::Deleted,
-                                        &obj,
-                                    )
-                                    .await;
-                                }
-                                Event::InitApply(obj) => {
-                                    operator.reconcile(
-                                        bindings::local::operator::types::EventType::Added,
-                                        &obj,
-                                    )
-                                    .await;
-                                }
-                                Event::Init | Event::InitDone => {
-                                    // These event indicate start/stop of a restart of a watcher stream, we can ignore these. 
-                                }
-                            }
+                    watcher_event = k8s_watcher.next() => {
+                        // Extract the event itself
+                        let event = match watcher_event {
+                            Some(Ok(e)) => e,
                             Some(Err(e)) => {
-                                warn!(
-                                    "Watcher for kind '{}' in namespace '{}' encountered an error: {}",
-                                    request.kind, request.namespace, e
-                                );
-                            }
+                                warn!("Watcher for '{}' in '{}' error: {}", request.kind, request.namespace, e);
+                                break;
+                            },
                             None => {
-                                // Stream ended, might want to restart the watch.
-                                info!(
-                                    "Watcher for kind '{}' in namespace '{}' stream ended.",
-                                    request.kind, request.namespace
-                                );
+                                info!("Watcher for kind '{}' in namespace '{}' stream ended.", request.kind, request.namespace);
                                 break;
                             }
+                        };
+
+                        // Map the event on WIT event types and extract the K8S object
+                        let (event_type, k8s_obj) = match event {
+                            Event::Apply(obj) | Event::InitApply(obj) => (wit_types::EventType::Added, obj),
+                            Event::Delete(obj) => (wit_types::EventType::Deleted, obj),
+                            _ => continue, // Skips Init and InitDone
+                        };
+
+                        if let Err(e) = operator.clone().reconcile(event_type, &k8s_obj).await {
+                            error!("Failed to reconcile '{:?}' event for operator '{}': {}", event_type, operator.cr.name, e);
                         }
                     }
                 }
@@ -504,58 +485,87 @@ impl WasmOperatorRuntime {
             tracker_guard.close();
             tracker_guard.clone()
         };
-
         task_tracker.wait().await;
 
         self.watchers.clear();
     }
 
     async fn reconcile(
-        &self,
+        self: Arc<Self>,
         event_type: wit_types::EventType,
         k8s_object: &kube::api::DynamicObject,
-    ) {
+    ) -> Result<()> {
         let start_reconcile = Instant::now();
 
-        let name = k8s_object.metadata.name.clone().unwrap_or_default();
-        let namespace = k8s_object.metadata.namespace.clone().unwrap_or_default();
-        let resource_json = match serde_json::to_string(k8s_object) {
-            Ok(json) => json,
-            Err(e) => {
-                error!("Failed to serialize resource to JSON: {}", e);
-                return;
-            }
-        };
+        let name = k8s_object.name_any();
+        let namespace = k8s_object.namespace().unwrap_or_default();
+        let kind = k8s_object
+            .types
+            .as_ref()
+            .map(|t| t.kind.as_str())
+            .unwrap_or("Unknown kind");
+        let resource_json = serde_json::to_string(k8s_object)?;
 
         info!(
             "Dispatching reconcile for event '{:?}' on resource '{}/{}' in namespace '{}'",
-            event_type,
-            k8s_object
-                .types
-                .as_ref()
-                .map(|t| t.kind.as_str())
-                .unwrap_or("Unknown kind"),
-            name,
-            namespace
+            event_type, kind, &name, &namespace
         );
 
         let reconcile_request = wit_types::ReconcileRequest {
             event_type,
-            name,
-            namespace,
+            name: name.clone(),
+            namespace: namespace.clone(),
             resource_json,
         };
 
-        if let Err(e) = self
+        let reconcile_result = match self
             .execute_via_wit(|operator, store| {
                 Box::pin(async move { operator.call_reconcile(store, &reconcile_request).await })
             })
             .await
         {
-            error!(
-                "Reconciliation for operator '{}' failed: {}",
-                self.cr.name, e
-            );
+            Ok(result) => result,
+            Err(e) => {
+                let error = format!("Reconciliation crashed: {}", e);
+                return self.throw_fatal_error(&error).await;
+            }
+        };
+
+        warn!(
+            "Reconcile result for operator '{}': {:?}",
+            self.cr.name, &reconcile_result
+        );
+
+        match reconcile_result {
+            wit_types::ReconcileResult::Ok => {}
+            wit_types::ReconcileResult::Error(e) => {
+                let error = format!(
+                    "Reconcile error for resource '{}/{}' in namespace '{}': \n {}",
+                    kind, &name, &namespace, e
+                );
+                self.stats.record_error(&error).await;
+                error!("Operator '{}' threw error: {}", self.cr.name, error);
+            }
+            wit_types::ReconcileResult::Requeue(milis) => {
+                let op_clone = self.clone();
+                let event_type_clone = event_type.clone();
+                let k8s_object_clone = k8s_object.clone();
+
+                let tracker = self.task_tracker.lock().await;
+                tracker.spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(milis as u64)).await;
+                    if let Err(e) = op_clone
+                        .clone()
+                        .reconcile(event_type_clone, &k8s_object_clone)
+                        .await
+                    {
+                        error!(
+                            "Failed to reconcile '{:?}' requeued event for operator '{}': {}",
+                            event_type, op_clone.cr.name, e
+                        );
+                    }
+                });
+            }
         }
 
         let duration = start_reconcile.elapsed().as_millis();
@@ -564,6 +574,7 @@ impl WasmOperatorRuntime {
         self.patch_k8s_status_throttled(WasmOperatorState::Running, false)
             .await
             .ok();
+        Ok(())
     }
 
     pub async fn execute_via_wit<F, T>(&self, f: F) -> Result<T>
