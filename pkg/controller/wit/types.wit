@@ -20,8 +20,7 @@ interface types {
     }
 
     enum event-type {
-        added,
-        modified,
+        applied,
         deleted,
     }
 

@@ -470,7 +470,7 @@ impl WasmOperatorRuntime {
 
                         // Map the event on WIT event types and extract the K8S object
                         let (event_type, k8s_obj) = match event {
-                            Event::Apply(obj) | Event::InitApply(obj) => (wit_types::EventType::Added, obj),
+                            Event::Apply(obj) | Event::InitApply(obj) => (wit_types::EventType::Applied, obj),
                             Event::Delete(obj) => (wit_types::EventType::Deleted, obj),
                             _ => continue, // Skips Init and InitDone
                         };
