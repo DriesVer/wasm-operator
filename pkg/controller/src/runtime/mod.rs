@@ -120,7 +120,9 @@ impl MainController {
 
     async fn delete_operator(&self, uid: &str) {
         if let Some((_, op)) = self.operators.remove(uid) {
-            op.stop_watching().await;
+            if let Err(e) = op.shutdown().await {
+                error!("Failed to shutdown operator '{}': {}", op.cr.name, e);
+            }
             drop(op);
         }
     }

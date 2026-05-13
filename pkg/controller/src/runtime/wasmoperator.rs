@@ -493,6 +493,16 @@ impl WasmOperatorRuntime {
         self.watchers.clear();
     }
 
+    pub async fn shutdown(&self) -> Result<()> {
+        info!("Shutting down operator '{}'...", self.cr.name);
+        self.stop_watching().await;
+        let cache_path = self.get_cache_path();
+        if cache_path.exists() {
+            std::fs::remove_dir_all(&cache_path)?;
+        }
+        Ok(())
+    }
+
     async fn reconcile(
         self: Arc<Self>,
         event_type: wit_types::EventType,
