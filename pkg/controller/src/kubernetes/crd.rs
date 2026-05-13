@@ -58,6 +58,7 @@ pub enum WasmOperatorState {
     Unclaimed,
     Running,
     Idle,
+    Paused,
     Error,
 }
 

@@ -13,6 +13,9 @@ use std::{env, path::PathBuf};
 
 use kubernetes::KubernetesService;
 use runtime::MainController;
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use tracing_subscriber::FmtSubscriber;
 
@@ -39,8 +42,14 @@ fn main() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     })?;
 
+    let shutdown_token = CancellationToken::new();
+    let shutdown_token_clone = shutdown_token.clone();
+    global_rt.spawn(async move {
+        wait_for_shutdown(shutdown_token_clone).await;
+    });
+
     local.block_on(&global_rt, async {
-        let main_controller = MainController::new();
+        let main_controller = MainController::new(shutdown_token);
         main_controller.start().await?;
         Ok::<(), anyhow::Error>(())
     })?;
@@ -49,6 +58,19 @@ fn main() -> anyhow::Result<()> {
     info!("Exiting...");
 
     Ok(())
+}
+
+async fn wait_for_shutdown(shutdown_token: CancellationToken) {
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT, initiating shutdown...");
+        },
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM from Kubernetes, initiating shutdown...");
+        }
+    }
+    shutdown_token.cancel();
 }
 
 fn setup_logging(debug: bool) {

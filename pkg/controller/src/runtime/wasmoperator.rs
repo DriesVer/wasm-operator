@@ -230,7 +230,7 @@ impl WasmOperatorRuntime {
     }
 
     async fn load(&self) -> Result<()> {
-        info!("Loading operator {}...", self.cr.name);
+        //info!("Loading operator {}...", self.cr.name);
 
         self.stats.record_loading_operation();
         let start_load = Instant::now();
@@ -286,6 +286,10 @@ impl WasmOperatorRuntime {
         let target_arch = Triple::host();
         let cache_path = self.get_cache_path().join(format!("{}.cwasm", target_arch));
         let component = if cache_path.exists() {
+            info!(
+                "Found cached component for operator '{}', loading from cache...",
+                self.cr.name
+            );
             let component_bytes = std::fs::read(&cache_path)?;
             (unsafe {
                 Component::deserialize(&wasmtime_engine, &component_bytes).map_err(|e| {
@@ -298,6 +302,10 @@ impl WasmOperatorRuntime {
                 })
             })?
         } else {
+            info!(
+                "No cached component found for operator '{}', compiling from wasm...",
+                self.cr.name
+            );
             let wasm_bytes = match self.load_wasm_file() {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -500,6 +508,14 @@ impl WasmOperatorRuntime {
         if cache_path.exists() {
             std::fs::remove_dir_all(&cache_path)?;
         }
+        Ok(())
+    }
+
+    pub async fn pause(&self) -> Result<()> {
+        info!("Pausing operator '{}'...", self.cr.name);
+        self.stop_watching().await;
+        self.patch_k8s_status_throttled(WasmOperatorState::Paused, true)
+            .await?;
         Ok(())
     }
 

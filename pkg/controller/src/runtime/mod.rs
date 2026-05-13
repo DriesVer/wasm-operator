@@ -14,7 +14,9 @@ use futures::StreamExt;
 use kube::runtime::watcher::{self, Event};
 use kube::ResourceExt;
 use tokio::sync::{OnceCell, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
 
 use crate::kubernetes::crd::WasmOperator as WasmOperatorCRD;
 use crate::kubernetes::KubernetesService;
@@ -38,14 +40,16 @@ pub static CONTROLLER_UUID: OnceCell<String> = OnceCell::const_new();
 pub struct MainController {
     operators: DashMap<OperatorUid, Arc<WasmOperatorRuntime>>,
     crashed_operators: DashMap<OperatorUid, Option<i64>>,
+    shutdown_token: CancellationToken,
 }
 
 impl MainController {
-    pub fn new() -> Arc<Self> {
+    pub fn new(shutdown_token: CancellationToken) -> Arc<Self> {
         let _ = CONTROLLER_UUID.set(uuid::Uuid::new_v4().to_string());
         Arc::new(Self {
             operators: DashMap::new(),
             crashed_operators: DashMap::new(),
+            shutdown_token,
         })
     }
 
@@ -144,19 +148,27 @@ impl MainController {
 
     async fn idle_check_loop(self: Arc<Self>) {
         loop {
-            tokio::time::sleep(IDLE_THRESHOLD / 2).await;
-            for entry in self.operators.iter() {
-                let op = entry.value();
-                if op.is_idle(IDLE_THRESHOLD).await {
-                    info!(
-                        "Operator '{}' is idle for more than {:?}, unloading it.",
-                        op.cr.name, IDLE_THRESHOLD
-                    );
-                    if let Err(e) = op.unload().await {
-                        error!("Failed to unload idle operator '{}', removing it from execution: {}", op.cr.name, e);
-                        self.crashed_operators
-                            .insert(entry.key().clone(), op.cr.generation);
-                        self.delete_operator(entry.key()).await;
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => {
+                    info!("Received shutdown signal, stopping idle check loop...");
+                    return;
+                }
+
+                _ = tokio::time::sleep(IDLE_THRESHOLD / 2) => {
+                    for entry in self.operators.iter() {
+                        let op = entry.value();
+                        if op.is_idle(IDLE_THRESHOLD).await {
+                            info!(
+                                "Operator '{}' is idle for more than {:?}, unloading it.",
+                                op.cr.name, IDLE_THRESHOLD
+                            );
+                            if let Err(e) = op.unload().await {
+                                error!("Failed to unload idle operator '{}', removing it from execution: {}", op.cr.name, e);
+                                self.crashed_operators
+                                    .insert(entry.key().clone(), op.cr.generation);
+                                self.delete_operator(entry.key()).await;
+                            }
+                        }
                     }
                 }
             }
@@ -177,60 +189,78 @@ impl MainController {
 
         // Watch for changes to WasmOperator CRs
         loop {
-            match wasmop_watcher.next().await {
-                Some(Ok(event)) => {
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => {
+                    info!("Received shutdown signal, stopping WasmOperator watcher loop and pausing all operators...");
+                    let shutdown_futures = self.operators.iter().map(|entry| {
+                        let op = entry.value().clone();
+                        async move {
+                            if let Err(e) = op.pause().await {
+                                error!("Failed to pause operator '{}': {}", op.cr.name, e);
+                            }
+                        }
+                    });
+                    futures::future::join_all(shutdown_futures).await;
+                    info!("All operators have been shut down, exiting.");
+                    return Ok(());
+                },
+                event = wasmop_watcher.next() => {
                     match event {
-                        Event::Apply(wasmop_cr) => {
-                            // TODO: handle the result if loading is unsuccessful
-                            self.apply_operator(&wasmop_cr, op_shutdown_tx.clone()).await?;
-                        }
-                        Event::Delete(obj) => {
-                            let op_uid = obj.uid().unwrap();
-                            self.delete_operator(&op_uid).await;
-                        }
-                        Event::Init => {
-                            // This event is emitted when the watcher stream is (re)started
-                            // We clear the control list to track which operators still need to be active after the restart
-                            control_restarted.clear();
-                        }
-                        Event::InitApply(obj) => {
-                            // This event is emitted for each existing object when the watcher stream is (re)started
-                            // We add the operator to the control list and ensure it's active, if not already restarted
-                            let op_uid = obj.uid().unwrap();
-                            control_restarted.push(op_uid.clone());
-                            self.apply_operator(&obj, op_shutdown_tx.clone()).await?;
-                        }
-                        Event::InitDone => {
-                            // This event is emitted when the initial list of existing objects has been processed after a watcher stream restart
-                            // We check which operators from the control list are not restarted and stop them, this ensures that deleted operators while the stream was down are properly stopped
-                            let active_op: Vec<OperatorUid> = self
-                                .operators
-                                .iter()
-                                .map(|entry| entry.key().clone())
-                                .collect();
-                            for op_uid in active_op {
-                                if !control_restarted.contains(&op_uid) {
+                        Some(Ok(event)) => {
+                            match event {
+                                Event::Apply(wasmop_cr) => {
+                                    // TODO: handle the result if loading is unsuccessful
+                                    self.apply_operator(&wasmop_cr, op_shutdown_tx.clone()).await?;
+                                }
+                                Event::Delete(obj) => {
+                                    let op_uid = obj.uid().unwrap();
                                     self.delete_operator(&op_uid).await;
                                 }
+                                Event::Init => {
+                                    // This event is emitted when the watcher stream is (re)started
+                                    // We clear the control list to track which operators still need to be active after the restart
+                                    control_restarted.clear();
+                                }
+                                Event::InitApply(obj) => {
+                                    // This event is emitted for each existing object when the watcher stream is (re)started
+                                    // We add the operator to the control list and ensure it's active, if not already restarted
+                                    let op_uid = obj.uid().unwrap();
+                                    control_restarted.push(op_uid.clone());
+                                    self.apply_operator(&obj, op_shutdown_tx.clone()).await?;
+                                }
+                                Event::InitDone => {
+                                    // This event is emitted when the initial list of existing objects has been processed after a watcher stream restart
+                                    // We check which operators from the control list are not restarted and stop them, this ensures that deleted operators while the stream was down are properly stopped
+                                    let active_op: Vec<OperatorUid> = self
+                                        .operators
+                                        .iter()
+                                        .map(|entry| entry.key().clone())
+                                        .collect();
+                                    for op_uid in active_op {
+                                        if !control_restarted.contains(&op_uid) {
+                                            self.delete_operator(&op_uid).await;
+                                        }
+                                    }
+                                    control_restarted.clear();
+                                }
                             }
-                            control_restarted.clear();
+                        }
+                        Some(Err(e)) => {
+                            warn!(
+                                "Watcher for 'WasmOperator' in namespace '{}' encountered an error: {}",
+                                namespace, e
+                            );
+                        }
+                        None => {
+                            info!(
+                                "Watcher for 'WasmOperator' in namespace '{}' stream ended.",
+                                namespace,
+                            );
+                            return Err(anyhow::anyhow!(
+                                "WasmOperator watcher stream ended unexpectedly."
+                            ));
                         }
                     }
-                }
-                Some(Err(e)) => {
-                    warn!(
-                        "Watcher for 'WasmOperator' in namespace '{}' encountered an error: {}",
-                        namespace, e
-                    );
-                }
-                None => {
-                    info!(
-                        "Watcher for 'WasmOperator' in namespace '{}' stream ended.",
-                        namespace,
-                    );
-                    return Err(anyhow::anyhow!(
-                        "WasmOperator watcher stream ended unexpectedly."
-                    ));
                 }
             }
         }
