@@ -69,8 +69,8 @@ pub enum WasmOperatorState {
 #[serde(rename_all = "camelCase")]
 pub struct WasmOperatorStatistics {
     pub reconcile_total_24h: u32,
-    #[schemars(range(min = 0, max = 100))]
-    pub reconcile_cold_start_ratio: u8,
+    #[schemars(range(min = 0, max = 255))]
+    pub reconcile_cold_start_ratio: u8, // If higher than 100, it means it loaded more (due to predicted loads) than it reconciled
     pub wasm_load_duration_msec_avg: u32,
     pub wasm_load_duration_msec_max: u32,
     pub reconcile_duration_msec_avg: u32,

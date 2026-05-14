@@ -4,6 +4,7 @@
 //! It manages the Wasmtime engine and orchestrates the execution of individual Wasm components,
 //! ensuring they can interact with the Kubernetes API and other host functionalities.
 
+use crate::prediction::{get_next_reconcile_prediction, PredictionModel};
 use crate::runtime::watcher::watcher;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +22,7 @@ use tracing::{error, info, warn};
 use crate::kubernetes::crd::WasmOperator as WasmOperatorCRD;
 use crate::kubernetes::KubernetesService;
 use crate::runtime::wasmengine::WasmEngineSingleton;
-use crate::runtime::wasmoperator::{OperatorUid, WasmOperatorReduced, WasmOperatorRuntime};
+use crate::runtime::wasmoperator::{OperatorUid, WORCommand, WasmOperatorReduced, WasmOperatorRuntime};
 
 mod stats;
 pub mod wasmengine;
@@ -168,6 +169,17 @@ impl MainController {
                                     .insert(entry.key().clone(), op.cr.generation);
                                 self.delete_operator(entry.key()).await;
                             }
+                            let history = op.get_reconcile_history().await;
+                            let wake_up_time = match get_next_reconcile_prediction(history, PredictionModel::SES).await {
+                                Ok(prediction) => prediction,
+                                Err(e) => {
+                                    error!("Failed to get reconcile prediction for operator '{}': {}", op.cr.name, e);
+                                    continue;
+                                }
+                            };
+                            op.cmd_tx.send(WORCommand::LoadAt(wake_up_time)).await.unwrap_or_else(|e| {
+                                error!("Failed to send LoadAt command to operator '{}': {}", op.cr.name, e);
+                            });
                         }
                     }
                 }

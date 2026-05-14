@@ -1,4 +1,4 @@
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -8,12 +8,12 @@ use crate::kubernetes::crd::WasmOperatorStatistics;
 
 // TODO: maybe use prometheus but prometheus can be more resource intensive
 
-struct AsyncFixedBuffer<T> {
+struct AsyncFixedFifoBuffer<T> {
     data: Mutex<VecDeque<T>>,
     limit: usize,
 }
 
-impl<T> AsyncFixedBuffer<T> {
+impl<T> AsyncFixedFifoBuffer<T> {
     fn new(limit: usize) -> Self {
         Self {
             data: Mutex::new(VecDeque::with_capacity(limit)),
@@ -29,6 +29,14 @@ impl<T> AsyncFixedBuffer<T> {
         data.push_front(item);
     }
 
+    async fn get_last_added(&self) -> Option<T>
+    where
+        T: Clone,
+    {
+        let data = self.data.lock().await;
+        data.front().cloned()
+    }
+
     async fn get_all(&self) -> Vec<T>
     where
         T: Clone,
@@ -39,7 +47,8 @@ impl<T> AsyncFixedBuffer<T> {
 }
 
 pub struct WasmOperatorStatisticsRecorder {
-    last_reconcile: AtomicI64,   // Unix timestamp in hours of last reconcile
+    //last_reconcile: AtomicI64,   // Unix timestamp in hours of last reconcile
+    recent_reconcile_history: AsyncFixedFifoBuffer<i64>, // Unix timestamps in milis of last reconciles
     reconciles: [AtomicU16; 24], // Number of reconciles per hour (0-23) (max ~65000 reconciles per hour)
 
     reconcile_total: AtomicU64,
@@ -59,7 +68,7 @@ pub struct WasmOperatorStatisticsRecorder {
 
     memory_usage_bytes: AtomicU32, // Max 4GB
 
-    error_log: AsyncFixedBuffer<String>,
+    error_log: AsyncFixedFifoBuffer<String>,
 }
 
 impl WasmOperatorStatisticsRecorder {
@@ -68,7 +77,7 @@ impl WasmOperatorStatisticsRecorder {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
         Self {
-            last_reconcile: AtomicI64::new(0),
+            recent_reconcile_history: AsyncFixedFifoBuffer::new(25),
             reconciles: Default::default(),
             reconcile_total: AtomicU64::new(0),
             reconcile_total_duration_ms: AtomicU64::new(0),
@@ -82,17 +91,21 @@ impl WasmOperatorStatisticsRecorder {
             active_total_duration_s: AtomicU64::new(0),
             active_max_duration_s: AtomicU64::new(0),
             memory_usage_bytes: AtomicU32::new(0),
-            error_log: AsyncFixedBuffer::new(err_buffer_size),
+            error_log: AsyncFixedFifoBuffer::new(err_buffer_size),
         }
     }
 
-    pub fn record_reconcile(&self, duration_ms: u32) {
-        let now = Utc::now().timestamp();
-        let last_reconcile = self.last_reconcile.load(Ordering::Relaxed);
-        self.last_reconcile.store(now, Ordering::Relaxed);
+    pub async fn record_reconcile(&self, duration_ms: u32) {
+        let now = Utc::now().timestamp_millis();
+        let last_reconcile = self
+            .recent_reconcile_history
+            .get_last_added()
+            .await
+            .unwrap_or(0);
+        self.recent_reconcile_history.push(now).await;
 
-        let now = now / 3600;
-        let last_reconcile = last_reconcile / 3600;
+        let now = (now / 1000) / 3600;
+        let last_reconcile = (last_reconcile / 1000) / 3600;
 
         // Clear old reconcile counts
         let diff = now - last_reconcile;
@@ -190,7 +203,9 @@ impl WasmOperatorStatisticsRecorder {
             return 0;
         }
         let cold_executions = self.get_load_total();
-        ((cold_executions * 100) / total_reconciles) as u8
+        let cold_start_ratio = (cold_executions * 100) / total_reconciles;
+        let cold_start_ratio = min(cold_start_ratio, 255);
+        cold_start_ratio as u8
     }
 
     fn get_wasm_load_duration_msec_avg(&self) -> u32 {
@@ -251,5 +266,16 @@ impl WasmOperatorStatisticsRecorder {
             active_duration_sec_max: self.active_max_duration_s.load(Ordering::Relaxed),
             recent_errors: self.error_log.get_all().await,
         }
+    }
+
+    pub async fn get_recent_reconcile_history(&self) -> Vec<DateTime<Utc>> {
+        self.recent_reconcile_history
+            .get_all()
+            .await
+            .into_iter()
+            .map(|ts| {
+                DateTime::from_timestamp_millis(ts).expect("Invalid timestamp in reconcile history")
+            })
+            .collect()
     }
 }

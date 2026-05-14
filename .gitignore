@@ -22,3 +22,5 @@ tested-operators/
 wasm_source_dir/
 
 wasmop_config.sh
+
+venv

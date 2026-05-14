@@ -7,6 +7,7 @@
 
 mod host;
 mod kubernetes;
+mod prediction;
 mod runtime;
 
 use std::{env, path::PathBuf};
@@ -30,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     // TODO: maybe go to a non local runtime
     // Create a tokio runtime to run the async code
     let global_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1) // 1 worker thread for checking idle + watching CRs, in case of heavier idling logic we can increase this to 2 or more
+        .worker_threads(3) // 3 threads: 2 global, one local
         .enable_all()
         .build()?;
     let local = tokio::task::LocalSet::new();

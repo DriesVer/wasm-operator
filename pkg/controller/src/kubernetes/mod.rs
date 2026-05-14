@@ -233,9 +233,9 @@ impl KubernetesService {
             .context("Failed to deserialize status from JSON for patching")?;
 
         let pp = PatchParams::default();
-        api.patch_status(name, &pp, &Patch::Merge(&status))
-            .await
-            .context("Failed to patch resource status")?;
+        if let Err(e) = api.patch_status(name, &pp, &Patch::Merge(&status)).await {
+            return Err(anyhow!("Failed to patch status: {}", e));
+        }
 
         Ok(())
     }

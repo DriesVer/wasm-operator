@@ -277,8 +277,13 @@ wasmop_load() {
     find ./build -maxdepth 1 -type f -exec cp {} ./build/docker-context/ \;
     cp ./wasm_config.yaml ./build/docker-context/wasm_config.yaml
 
+    # Build parent controller image and load it into kind cluster
     docker build ./build/docker-context -t $image_name -f "${PKG_FOLDER}/Dockerfile"
     kind load docker-image $image_name --name "${kind_cluster_name}"
+
+    # Build prediction server image and load it into kind cluster
+    docker build "${ROOT}/prediction/webserver" -t prediction_webserver:latest
+    kind load docker-image prediction_webserver:latest --name "${kind_cluster_name}"
 
     echo -e "\033[1m\nCreating kubernetes resources to run the wasm-operator\033[0m"
     # TODO: Maybe move these to the pkg folder?

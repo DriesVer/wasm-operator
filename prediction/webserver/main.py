@@ -1,5 +1,7 @@
 from datetime import datetime as dt
 from datetime import timedelta, timezone
+import signal
+import sys
 
 import numpy as np
 import pandas as pd
@@ -53,7 +55,7 @@ def predictWinter(diff):
 
 
 predictionFunctions = {
-    "autoReg": predictAutoReg,
+    "AutoReg": predictAutoReg,
     "ARIMA": predictARIMA,
     "SARIMA": predictSarima,
     "SES": predictSES,
@@ -69,7 +71,9 @@ def predict():
     history = request.json["history"]
     # history = ['2023-03-18T18:28:13.783525711Z', '2023-03-18T18:28:14.253025485Z', '2023-03-18T18:28:14.253166198Z', '2023-03-18T18:28:14.264608495Z']
 
-    dates = [dt.strptime(date[:26], "%Y-%m-%dT%H:%M:%S.%f") for date in history]
+    print(history, flush=True)
+
+    dates = [dt.fromisoformat(date) for date in history]
 
     ## not enough data just return 3 secs
     if len(dates) == 0:
@@ -116,5 +120,17 @@ def predict():
     return jsonify({"prediction": now})
 
 
+def graceful_shutdown(signum, _):
+    signal_name = signal.Signals(signum).name
+    print(
+        f"Received signal '{signal_name}', initiating graceful shutdown...",
+        flush=True,
+    )
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    signal.signal(signal.SIGINT, graceful_shutdown)
+
     app.run(host="0.0.0.0", port=5000, threaded=True)

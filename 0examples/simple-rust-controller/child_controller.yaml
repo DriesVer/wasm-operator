@@ -25,6 +25,12 @@ spec:
           name: wasm-source-pvc
         - mountPath: "/tmp/wasmop-cache"
           name: wasmop-cache-pvc
+    - name: prediction-sidecar
+      image: prediction_webserver:latest
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 5000
+          protocol: TCP
   volumes:
     - name: wasm-source-pvc
       persistentVolumeClaim:

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
 use kube::runtime::watcher::Event;
@@ -76,6 +76,10 @@ impl From<&WasmOperatorCRD> for WasmOperatorReduced {
     }
 }
 
+pub enum WORCommand {
+    LoadAt(DateTime<Utc>),
+}
+
 struct LoadedState {
     operator: bindings::KubeOperator,
     store: Mutex<Store<State>>,
@@ -97,25 +101,63 @@ pub struct WasmOperatorRuntime {
     pub cr: WasmOperatorReduced,
     state: RwLock<OperatorState>,
     watchers: DashMap<WatchRequestKey, CancellationToken>,
-    task_tracker: Mutex<TaskTracker>,
+    task_tracker: TaskTracker,
     shutdown_tx: mpsc::Sender<String>,
     stats: WasmOperatorStatisticsRecorder,
     last_patch_time: Mutex<Instant>,
+    pub cmd_tx: mpsc::Sender<WORCommand>,
+    shutdown_token: CancellationToken,
 }
 
 impl WasmOperatorRuntime {
     pub fn new(wasmop_cr: WasmOperatorReduced, shutdown_tx: mpsc::Sender<String>) -> Arc<Self> {
-        Arc::new(Self {
+        let (wasm_op_tx, wasm_op_rx) = mpsc::channel(10);
+
+        let runtime = Arc::new(Self {
             cr: wasmop_cr,
             state: RwLock::new(OperatorState::Unloaded(Arc::new(UnloadedState {
                 state_path: PathBuf::new(),
             }))),
             watchers: DashMap::new(),
-            task_tracker: Mutex::new(TaskTracker::new()),
+            task_tracker: TaskTracker::new(),
             shutdown_tx,
             stats: WasmOperatorStatisticsRecorder::new(),
             last_patch_time: Mutex::new(Instant::now() - STATUS_PATCH_THROTTLE_DURATION * 2),
-        })
+            cmd_tx: wasm_op_tx,
+            shutdown_token: CancellationToken::new(),
+        });
+
+        let runtime_clone = runtime.clone();
+
+        // TODO: change this, this is not pretty
+        runtime.task_tracker.spawn_local(async move {
+            runtime_clone.handle_commands(wasm_op_rx).await;
+        });
+
+        runtime
+    }
+
+    async fn handle_commands(self: Arc<Self>, mut rx: mpsc::Receiver<WORCommand>) {
+        loop {
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => {
+                    info!("Command handler for operator '{}' received shutdown signal, stopping command handling.", self.cr.name);
+                    return;
+                }
+
+                command = rx.recv() => {
+                    if let Some(command) = command {
+                        match command {
+                            WORCommand::LoadAt(timestamp) => {
+                                self.clone().load_at(timestamp).await;
+                            }
+                        }
+                    } else {
+                        info!("Command channel for operator '{}' was closed, shutting down command handler.", self.cr.name);
+                    }
+                }
+            }
+        }
     }
 
     async fn patch_k8s_status(&self, state: WasmOperatorState) -> Result<()> {
@@ -280,6 +322,34 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    pub async fn load_at(self: Arc<Self>, timestamp: DateTime<Utc>) {
+        let runtime = self.clone();
+
+        self.task_tracker.spawn_local(async move {
+            let now = Utc::now();
+            if timestamp > now {
+                if let Ok(std_duration) = (timestamp - now).to_std() {
+                    tokio::select! {
+                        _ = runtime.shutdown_token.cancelled() => {
+                            return;
+                        }
+                        _ = tokio::time::sleep(std_duration) => {},
+                    }
+                }
+                info!(
+                    "Loading operator '{}' at scheduled time {}...",
+                    runtime.cr.name, timestamp
+                );
+                if let Err(e) = runtime.load().await {
+                    error!(
+                        "Failed to load operator '{}' at scheduled time: {}",
+                        runtime.cr.name, e
+                    );
+                }
+            }
+        });
+    }
+
     async fn load_wasm_instance(&self) -> Result<(bindings::KubeOperator, Store<State>)> {
         let wasmtime_engine = wasmtime::Engine::global().await?;
 
@@ -403,16 +473,28 @@ impl WasmOperatorRuntime {
             })
             .await?;
 
-        if !self.watchers.is_empty() {
+        // if !self.watchers.is_empty() {
+        //     self.stop_watching().await;
+        // }
+        if self.watchers.len()
+            > (self.watchers.contains_key(&WatchRequestKey {
+                kind: "self".to_string(),
+                namespace: "self".to_string(),
+            }) as usize)
+        {
+            warn!(
+                "Operator '{}' already has active watchers, stopping existing watchers before starting new ones.",
+                self.cr.name
+            );
             self.stop_watching().await;
         }
 
         // If task tracker is closed, reopen it to allow spawning new tasks
-        {
-            let mut task_tracker = self.task_tracker.lock().await;
-            if task_tracker.is_closed() {
-                *task_tracker = TaskTracker::new();
-            }
+        if self.task_tracker.is_closed() {
+            return Err(anyhow::anyhow!(
+                "Cannot start watchers for operator '{}' because task tracker is closed.",
+                self.cr.name
+            ));
         }
 
         // Create a watcher for each requested watch
@@ -445,8 +527,7 @@ impl WasmOperatorRuntime {
             .insert(WatchRequestKey::from(&request), cancel_token.clone());
 
         let operator = self.clone();
-        let tracker = self.task_tracker.lock().await;
-        tracker.spawn_local(async move {
+        self.task_tracker.spawn_local(async move {
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
@@ -485,18 +566,16 @@ impl WasmOperatorRuntime {
     }
 
     pub async fn stop_watching(&self) {
+        self.shutdown_token.cancel();
+
         // Cancel all active watchers
         for watcher in self.watchers.iter() {
             watcher.value().cancel();
         }
 
         // Wait for all watcher tasks to finish
-        let task_tracker = {
-            let tracker_guard = self.task_tracker.lock().await;
-            tracker_guard.close();
-            tracker_guard.clone()
-        };
-        task_tracker.wait().await;
+        self.task_tracker.close();
+        self.task_tracker.wait().await;
 
         self.watchers.clear();
     }
@@ -575,8 +654,7 @@ impl WasmOperatorRuntime {
                 let event_type_clone = event_type.clone();
                 let k8s_object_clone = k8s_object.clone();
 
-                let tracker = self.task_tracker.lock().await;
-                tracker.spawn_local(async move {
+                self.task_tracker.spawn_local(async move {
                     tokio::time::sleep(Duration::from_millis(milis as u64)).await;
                     if let Err(e) = op_clone
                         .clone()
@@ -593,7 +671,7 @@ impl WasmOperatorRuntime {
         }
 
         let duration = start_reconcile.elapsed().as_millis();
-        self.stats.record_reconcile(duration as u32);
+        self.stats.record_reconcile(duration as u32).await;
 
         self.patch_k8s_status_throttled(WasmOperatorState::Running, false)
             .await
@@ -630,5 +708,9 @@ impl WasmOperatorRuntime {
         // Execute the function
         let mut store_guard = loaded_state.store.lock().await;
         f(&loaded_state.operator, &mut store_guard).await
+    }
+
+    pub async fn get_reconcile_history(&self) -> Vec<DateTime<Utc>> {
+        self.stats.get_recent_reconcile_history().await
     }
 }
