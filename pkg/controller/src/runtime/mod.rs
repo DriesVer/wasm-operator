@@ -171,7 +171,7 @@ impl MainController {
                                 continue;
                             }
                             let history = op.get_reconcile_history().await;
-                            let wake_up_time = match get_next_reconcile_prediction(history, PredictionModel::SES).await {
+                            let wake_up_time = match get_next_reconcile_prediction(history, PredictionModel::AutoReg).await {
                                 Ok(prediction) => prediction,
                                 Err(e) => {
                                     error!("Failed to get reconcile prediction for operator '{}': {}", op.cr.name, e);

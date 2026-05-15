@@ -71,7 +71,7 @@ def predict():
     dates = [dt.fromisoformat(date) for date in history]
 
     ## not enough data just return 3 secs
-    if len(dates) == 0 or len(dates) == 1 or True:
+    if len(dates) == 0 or len(dates) == 1:
         min_dt = dateToRust(dt.min)
         return jsonify({"prediction": min_dt})
 

@@ -554,7 +554,12 @@ impl WasmOperatorRuntime {
                     let (event_type, k8s_obj) = match event {
                         Event::Apply(obj) | Event::InitApply(obj) => (wit_types::EventType::Applied, obj),
                         Event::Delete(obj) => (wit_types::EventType::Deleted, obj),
-                        _ => continue, // Skips Init and InitDone
+                        Event::Init => continue,
+                        Event::InitDone => {
+                            // Clear the reconcile history to not polute the prediction models
+                            self.stats.clear_recent_reconcile_history().await;
+                            continue
+                        },
                     };
 
                     // Call reconcile for the event

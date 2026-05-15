@@ -24,9 +24,9 @@ impl<T> AsyncFixedFifoBuffer<T> {
     async fn push(&self, item: T) {
         let mut data = self.data.lock().await;
         if data.len() >= self.limit {
-            data.pop_back();
+            data.pop_front();
         }
-        data.push_front(item);
+        data.push_back(item);
     }
 
     async fn get_last_added(&self) -> Option<T>
@@ -34,15 +34,24 @@ impl<T> AsyncFixedFifoBuffer<T> {
         T: Clone,
     {
         let data = self.data.lock().await;
-        data.front().cloned()
+        data.back().cloned()
     }
 
-    async fn get_all(&self) -> Vec<T>
+    async fn get_all(&self, reverse: bool) -> Vec<T>
     where
         T: Clone,
     {
         let data = self.data.lock().await;
-        data.iter().cloned().collect()
+        if reverse {
+            data.iter().rev().cloned().collect()
+        } else {
+            data.iter().cloned().collect()
+        }
+    }
+
+    async fn clear(&self) {
+        let mut data = self.data.lock().await;
+        data.clear();
     }
 }
 
@@ -264,18 +273,22 @@ impl WasmOperatorStatisticsRecorder {
             idle_duration_sec_max: self.idle_max_duration_s.load(Ordering::Relaxed),
             active_duration_sec_avg: self.get_running_duration_s_avg(),
             active_duration_sec_max: self.active_max_duration_s.load(Ordering::Relaxed),
-            recent_errors: self.error_log.get_all().await,
+            recent_errors: self.error_log.get_all(true).await,
         }
     }
 
     pub async fn get_recent_reconcile_history(&self) -> Vec<DateTime<Utc>> {
         self.recent_reconcile_history
-            .get_all()
+            .get_all(false)
             .await
             .into_iter()
             .map(|ts| {
                 DateTime::from_timestamp_millis(ts).expect("Invalid timestamp in reconcile history")
             })
             .collect()
+    }
+
+    pub async fn clear_recent_reconcile_history(&self) {
+        self.recent_reconcile_history.clear().await;
     }
 }
