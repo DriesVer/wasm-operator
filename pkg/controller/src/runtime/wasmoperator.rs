@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use futures::StreamExt;
-use kube::runtime::watcher::Event;
+use futures::{stream, Stream};
+use kube::api::DynamicObject;
+use kube::runtime::watcher::{Error as WatcherError, Event};
 use kube::{Resource, ResourceExt};
 use serde_json;
 use target_lexicon::Triple;
@@ -29,29 +30,17 @@ use crate::kubernetes::crd::{
     WasmSource,
 };
 use crate::kubernetes::KubernetesService;
+use crate::runtime::stats::WasmOperatorStatisticsRecorder;
 use crate::runtime::CONTROLLER_UUID;
 use crate::runtime::{WasmEngineSingleton, WASMOP_CACHE_DIR};
 
-use super::stats::WasmOperatorStatisticsRecorder;
-
-const STATUS_PATCH_THROTTLE_DURATION: Duration = Duration::from_secs(1); // TODO: increase this and  make another process to update status periodically
-
-// This struct mirrors the WatchRequest from WIT bindgen but enables us to use it as a key in a DashMap for managing watchers.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct WatchRequestKey {
-    kind: String,
-    namespace: String,
-}
-impl From<&wit_types::WatchRequest> for WatchRequestKey {
-    fn from(request: &wit_types::WatchRequest) -> Self {
-        Self {
-            kind: request.kind.clone(),
-            namespace: request.namespace.clone(),
-        }
-    }
-}
+const STATUS_PATCH_THROTTLE_DURATION: Duration = Duration::from_secs(5);
 
 pub type OperatorUid = String;
+
+// Type wrappers to make the watcher stream more human readable
+type WatcherResult = Result<Event<DynamicObject>, WatcherError>;
+type BoxedWatcherStream = Pin<Box<dyn Stream<Item = WatcherResult> + Send>>;
 
 // This struct is a reduced version of the WasmOperator CRD that only contains the fields relevant for the runtime, this way we can reduce the memory usage of one WasmOperatorRuntime instance by not storing the entire CRD spec in memory.
 pub struct WasmOperatorReduced {
@@ -77,7 +66,11 @@ impl From<&WasmOperatorCRD> for WasmOperatorReduced {
 }
 
 pub enum WORCommand {
+    StartWatching,
     LoadAt(DateTime<Utc>),
+    Unload,
+    Pause,
+    Shutdown,
 }
 
 struct LoadedState {
@@ -99,47 +92,48 @@ enum OperatorState {
 
 pub struct WasmOperatorRuntime {
     pub cr: WasmOperatorReduced,
+    pub cmd_tx: mpsc::Sender<WORCommand>, // Channel for sending commands to the operator's command handler
+
     state: RwLock<OperatorState>,
-    watchers: DashMap<WatchRequestKey, CancellationToken>,
     task_tracker: TaskTracker,
-    shutdown_tx: mpsc::Sender<String>,
+    shutdown_token: CancellationToken,
+    shutdown_tx: mpsc::Sender<OperatorUid>, // Channel to signal the operator is shutting down
     stats: WasmOperatorStatisticsRecorder,
     last_patch_time: Mutex<Instant>,
-    pub cmd_tx: mpsc::Sender<WORCommand>,
-    shutdown_token: CancellationToken,
 }
 
 impl WasmOperatorRuntime {
-    pub fn new(wasmop_cr: WasmOperatorReduced, shutdown_tx: mpsc::Sender<String>) -> Arc<Self> {
+    pub fn new(
+        wasmop_cr: WasmOperatorReduced,
+        shutdown_tx: mpsc::Sender<OperatorUid>,
+    ) -> Arc<Self> {
         let (wasm_op_tx, wasm_op_rx) = mpsc::channel(10);
 
-        let runtime = Arc::new(Self {
+        let self_ = Arc::new(Self {
             cr: wasmop_cr,
+            cmd_tx: wasm_op_tx,
             state: RwLock::new(OperatorState::Unloaded(Arc::new(UnloadedState {
                 state_path: PathBuf::new(),
             }))),
-            watchers: DashMap::new(),
             task_tracker: TaskTracker::new(),
+            shutdown_token: CancellationToken::new(),
             shutdown_tx,
             stats: WasmOperatorStatisticsRecorder::new(),
             last_patch_time: Mutex::new(Instant::now() - STATUS_PATCH_THROTTLE_DURATION * 2),
-            cmd_tx: wasm_op_tx,
-            shutdown_token: CancellationToken::new(),
         });
 
-        let runtime_clone = runtime.clone();
-
-        // TODO: change this, this is not pretty
-        runtime.task_tracker.spawn_local(async move {
-            runtime_clone.handle_commands(wasm_op_rx).await;
+        let self_clone = self_.clone();
+        self_.task_tracker.spawn_local(async move {
+            self_clone.handle_commands_loop(wasm_op_rx).await;
         });
 
-        runtime
+        self_
     }
 
-    async fn handle_commands(self: Arc<Self>, mut rx: mpsc::Receiver<WORCommand>) {
+    async fn handle_commands_loop(self: Arc<Self>, mut rx: mpsc::Receiver<WORCommand>) {
         loop {
             tokio::select! {
+                biased;
                 _ = self.shutdown_token.cancelled() => {
                     info!("Command handler for operator '{}' received shutdown signal, stopping command handling.", self.cr.name);
                     return;
@@ -148,9 +142,39 @@ impl WasmOperatorRuntime {
                 command = rx.recv() => {
                     if let Some(command) = command {
                         match command {
+                            WORCommand::StartWatching => {
+                                if let Err(e) = self.clone().start_watching().await {
+                                    let error = format!("Failed to start watching: {}", e);
+                                    let _ = self.throw_fatal_error::<()>(&error);
+                                    error!("Operator '{}' failed to start watching: {}", self.cr.name, error);
+                                    return;
+                                }
+                            },
                             WORCommand::LoadAt(timestamp) => {
                                 self.clone().load_at(timestamp).await;
-                            }
+                            },
+                            WORCommand::Unload => {
+                                if let Err(e) = self.unload().await {
+                                    let error = format!("Failed to unload: {}", e);
+                                    let _ = self.throw_fatal_error::<()>(&error);
+                                    error!("Operator '{}' failed to unload: {}", self.cr.name, e);
+                                    return;
+                                }
+                            },
+                            WORCommand::Pause => {
+                                if let Err(e) = self.pause().await {
+                                    let error = format!("Failed to pause: {}", e);
+                                    let _ = self.throw_fatal_error::<()>(&error);
+                                    error!("Operator '{}' failed to pause: {}", self.cr.name, e);
+                                    return;
+                                }
+                            },
+                            WORCommand::Shutdown => {
+                                if let Err(e) = self.shutdown().await {
+                                    error!("Operator '{}' failed to shutdown properly: {}", self.cr.name, e);
+                                    return;
+                                }
+                            },
                         }
                     } else {
                         info!("Command channel for operator '{}' was closed, shutting down command handler.", self.cr.name);
@@ -221,7 +245,7 @@ impl WasmOperatorRuntime {
         ))
     }
 
-    pub async fn unload(&self) -> Result<()> {
+    async fn unload(&self) -> Result<()> {
         // Acquire write lock and extract the loaded state
         let mut state_guard = self.state.write().await;
         let loaded_state = if let OperatorState::Loaded(ref state) = *state_guard {
@@ -322,15 +346,16 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
-    pub async fn load_at(self: Arc<Self>, timestamp: DateTime<Utc>) {
-        let runtime = self.clone();
+    async fn load_at(self: Arc<Self>, timestamp: DateTime<Utc>) {
+        let self_clone = self.clone();
 
         self.task_tracker.spawn_local(async move {
             let now = Utc::now();
             if timestamp > now {
                 if let Ok(std_duration) = (timestamp - now).to_std() {
                     tokio::select! {
-                        _ = runtime.shutdown_token.cancelled() => {
+                        biased;
+                        _ = self_clone.shutdown_token.cancelled() => {
                             return;
                         }
                         _ = tokio::time::sleep(std_duration) => {},
@@ -338,12 +363,12 @@ impl WasmOperatorRuntime {
                 }
                 info!(
                     "Loading operator '{}' at scheduled time {}...",
-                    runtime.cr.name, timestamp
+                    self_clone.cr.name, timestamp
                 );
-                if let Err(e) = runtime.load().await {
+                if let Err(e) = self_clone.load().await {
                     error!(
                         "Failed to load operator '{}' at scheduled time: {}",
-                        runtime.cr.name, e
+                        self_clone.cr.name, e
                     );
                 }
             }
@@ -456,40 +481,8 @@ impl WasmOperatorRuntime {
         }
     }
 
-    pub async fn is_idle(&self, threshold: Duration) -> bool {
-        if let OperatorState::Loaded(state) = &*self.state.read().await {
-            let last_active_guard = state.last_active.lock().await;
-            last_active_guard.elapsed() > threshold
-        } else {
-            false
-        }
-    }
-
-    pub async fn start_watching(self: Arc<Self>) -> Result<()> {
-        // Get the watch requests for the operator
-        let watch_requests = self
-            .execute_via_wit(|operator, store| {
-                Box::pin(async move { operator.call_get_watch_requests(store).await })
-            })
-            .await?;
-
-        // if !self.watchers.is_empty() {
-        //     self.stop_watching().await;
-        // }
-        if self.watchers.len()
-            > (self.watchers.contains_key(&WatchRequestKey {
-                kind: "self".to_string(),
-                namespace: "self".to_string(),
-            }) as usize)
-        {
-            warn!(
-                "Operator '{}' already has active watchers, stopping existing watchers before starting new ones.",
-                self.cr.name
-            );
-            self.stop_watching().await;
-        }
-
-        // If task tracker is closed, reopen it to allow spawning new tasks
+    async fn start_watching(self: Arc<Self>) -> Result<()> {
+        // If task tracker is closed, we cannot start new tasks, the operator is dead.
         if self.task_tracker.is_closed() {
             return Err(anyhow::anyhow!(
                 "Cannot start watchers for operator '{}' because task tracker is closed.",
@@ -497,92 +490,94 @@ impl WasmOperatorRuntime {
             ));
         }
 
+        // Get the watch requests for the operator
+        let watch_requests = self
+            .execute_via_wit(|operator, store| {
+                Box::pin(async move { operator.call_get_watch_requests(store).await })
+            })
+            .await?;
+
         // Create a watcher for each requested watch
-        for request in &watch_requests {
-            self.clone().start_watcher(request.clone()).await;
+        // for request in &watch_requests {
+        //     self.clone().start_watcher(request.clone()).await;
+        // }
+
+        let client = KubernetesService::global().await.unwrap();
+        let mut watcher_streams = Vec::new();
+        for request in watch_requests {
+            let ar = client.find_api_resource(&request.kind).await.unwrap();
+            let k8s_watcher = watcher(
+                client.dynamic_api(ar, &request.namespace),
+                Default::default(),
+            )
+            .boxed();
+            watcher_streams.push(k8s_watcher);
         }
+
+        let watcher_stream = stream::select_all(watcher_streams);
+
+        let self_clone = self.clone();
+        self.task_tracker.spawn_local(async move {
+            self_clone.watcher_loop(watcher_stream).await;
+        });
+
         Ok(())
     }
 
-    async fn start_watcher(self: Arc<Self>, request: wit_types::WatchRequest) {
-        // Get the API resource for the requested k8s kind
-        let client = KubernetesService::global().await.unwrap();
-        let ar = client.find_api_resource(&request.kind).await.unwrap();
+    async fn watcher_loop(
+        self: Arc<Self>,
+        mut watcher_stream: stream::SelectAll<BoxedWatcherStream>,
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.shutdown_token.cancelled() => {
+                    info!("Watcher loop for operator '{}' received shutdown signal, stopping watcher.", self.cr.name);
+                    return;
+                }
 
-        // Create a watcher stream for the requested resource and namespace
-        let mut k8s_watcher = watcher(
-            client.dynamic_api(ar, &request.namespace),
-            Default::default(),
-        )
-        .boxed();
-
-        info!(
-            "Watcher started for kind '{}' in namespace '{}'",
-            request.kind, request.namespace
-        );
-
-        // Watch for events and dispatch reconcile calls in a seperate async thread
-        let cancel_token = CancellationToken::new();
-        self.watchers
-            .insert(WatchRequestKey::from(&request), cancel_token.clone());
-
-        let operator = self.clone();
-        self.task_tracker.spawn_local(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        info!("Stoppin watcher for kind '{}' in namespace '{}' for operator '{}'.", request.kind, request.namespace, operator.cr.name.clone());
-                        break;
-                    }
-
-                    watcher_event = k8s_watcher.next() => {
-                        // Extract the event itself
-                        let event = match watcher_event {
-                            Some(Ok(e)) => e,
-                            Some(Err(e)) => {
-                                warn!("Watcher for '{}' in '{}' error: {}", request.kind, request.namespace, e);
-                                break;
-                            },
-                            None => {
-                                info!("Watcher for kind '{}' in namespace '{}' stream ended.", request.kind, request.namespace);
-                                break;
-                            }
-                        };
-
-                        // Map the event on WIT event types and extract the K8S object
-                        let (event_type, k8s_obj) = match event {
-                            Event::Apply(obj) | Event::InitApply(obj) => (wit_types::EventType::Applied, obj),
-                            Event::Delete(obj) => (wit_types::EventType::Deleted, obj),
-                            _ => continue, // Skips Init and InitDone
-                        };
-
-                        if let Err(e) = operator.clone().reconcile(event_type, &k8s_obj).await {
-                            error!("Failed to reconcile '{:?}' event for operator '{}': {}", event_type, operator.cr.name, e);
+                watcher_event = watcher_stream.next() => {
+                    // Extract the event itself
+                    let event = match watcher_event {
+                        Some(Ok(e)) => e,
+                        Some(Err(e)) => {
+                            warn!("Watcher for operator '{}' had a fatal error: {}", self.cr.name, e);
+                            return;
+                        },
+                        None => {
+                            warn!("Watcher stream for operator '{}' ended unexpectedly.", self.cr.name);
+                            return;
                         }
+                    };
+
+                    // Map the event on WIT event types and extract the K8S object
+                    let (event_type, k8s_obj) = match event {
+                        Event::Apply(obj) | Event::InitApply(obj) => (wit_types::EventType::Applied, obj),
+                        Event::Delete(obj) => (wit_types::EventType::Deleted, obj),
+                        _ => continue, // Skips Init and InitDone
+                    };
+
+                    // Call reconcile for the event
+                    if let Err(e) = self.clone().reconcile(event_type, &k8s_obj).await {
+                        error!("Failed to reconcile '{:?}' event for operator '{}': {}", event_type, self.cr.name, e);
                     }
                 }
             }
-        });
+        }
     }
 
-    pub async fn stop_watching(&self) {
+    async fn stop_execution(&self) {
+        // Cancel all active loops including watchers
         self.shutdown_token.cancel();
 
-        // Cancel all active watchers
-        for watcher in self.watchers.iter() {
-            watcher.value().cancel();
-        }
-
-        // Wait for all watcher tasks to finish
+        // Wait for all spawned tasks to finish
         self.task_tracker.close();
         self.task_tracker.wait().await;
-
-        self.watchers.clear();
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         info!("Shutting down operator '{}'...", self.cr.name);
-        self.stop_watching().await;
+        self.stop_execution().await;
         let cache_path = self.get_cache_path();
         if cache_path.exists() {
             std::fs::remove_dir_all(&cache_path)?;
@@ -590,9 +585,9 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
-    pub async fn pause(&self) -> Result<()> {
+    async fn pause(&self) -> Result<()> {
         info!("Pausing operator '{}'...", self.cr.name);
-        self.stop_watching().await;
+        self.stop_execution().await;
         self.patch_k8s_status_throttled(WasmOperatorState::Paused, true)
             .await?;
         Ok(())
@@ -650,20 +645,26 @@ impl WasmOperatorRuntime {
                 error!("Operator '{}' threw error: {}", self.cr.name, error);
             }
             wit_types::ReconcileResult::Requeue(milis) => {
-                let op_clone = self.clone();
+                let self_clone = self.clone();
                 let event_type_clone = event_type.clone();
                 let k8s_object_clone = k8s_object.clone();
 
                 self.task_tracker.spawn_local(async move {
-                    tokio::time::sleep(Duration::from_millis(milis as u64)).await;
-                    if let Err(e) = op_clone
+                    tokio::select! {
+                        biased;
+                        _ = self_clone.shutdown_token.cancelled() => {
+                            return;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(milis as u64)) => {},
+                    }
+                    if let Err(e) = self_clone
                         .clone()
                         .reconcile(event_type_clone, &k8s_object_clone)
                         .await
                     {
                         error!(
                             "Failed to reconcile '{:?}' requeued event for operator '{}': {}",
-                            event_type, op_clone.cr.name, e
+                            event_type, self_clone.cr.name, e
                         );
                     }
                 });
@@ -679,7 +680,7 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
-    pub async fn execute_via_wit<F, T>(&self, f: F) -> Result<T>
+    async fn execute_via_wit<F, T>(&self, f: F) -> Result<T>
     where
         for<'a> F: FnOnce(
             &'a bindings::KubeOperator,
@@ -708,6 +709,15 @@ impl WasmOperatorRuntime {
         // Execute the function
         let mut store_guard = loaded_state.store.lock().await;
         f(&loaded_state.operator, &mut store_guard).await
+    }
+
+    pub async fn is_idle(&self, threshold: Duration) -> bool {
+        if let OperatorState::Loaded(state) = &*self.state.read().await {
+            let last_active_guard = state.last_active.lock().await;
+            last_active_guard.elapsed() > threshold
+        } else {
+            false
+        }
     }
 
     pub async fn get_reconcile_history(&self) -> Vec<DateTime<Utc>> {

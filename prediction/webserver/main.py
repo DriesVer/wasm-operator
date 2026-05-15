@@ -66,32 +66,17 @@ predictionFunctions = {
 
 @app.route("/prediction", methods=["post"])
 def predict():
-    # print("post request made")
-    # print(request.json, flush=True)
     history = request.json["history"]
-    # history = ['2023-03-18T18:28:13.783525711Z', '2023-03-18T18:28:14.253025485Z', '2023-03-18T18:28:14.253166198Z', '2023-03-18T18:28:14.264608495Z']
-
-    print(history, flush=True)
 
     dates = [dt.fromisoformat(date) for date in history]
 
     ## not enough data just return 3 secs
-    if len(dates) == 0:
-        now = dt.now(timezone.utc)
-        now += timedelta(seconds=3)
-        now = dateToRust(now)
-        return jsonify({"prediction": now})
-
-        ## not enough data just return 3 secs
-    if len(dates) == 1:
-        now = dates[0]
-        now += timedelta(seconds=3)
-        now = dateToRust(now)
-        return jsonify({"prediction": now})
+    if len(dates) == 0 or len(dates) == 1 or True:
+        min_dt = dateToRust(dt.min)
+        return jsonify({"prediction": min_dt})
 
     lastEvent = dates[-1]
     diff = [(dates[i] - dates[i - 1]).total_seconds() for i in range(1, len(dates))]
-    # print(history,flush=True)
     prediction = 0
 
     f = predictAutoReg

@@ -108,11 +108,11 @@ impl MainController {
         let red_cr = WasmOperatorReduced::from(wasmop_cr);
         let op = WasmOperatorRuntime::new(red_cr, op_shutdown_tx.clone());
 
-        if let Err(e) = op.clone().start_watching().await {
+        if let Err(e) = op.cmd_tx.send(WORCommand::StartWatching).await {
             self.crashed_operators
                 .insert(op_uid.clone(), op.cr.generation);
             error!(
-                "Failed to start operator '{}' with generation '{}': {}",
+                "Failed to send starting command for operator '{}' with generation '{}': {}",
                 op.cr.name, op.cr.generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string()), e
             );
             return Ok(());
@@ -125,8 +125,11 @@ impl MainController {
 
     async fn delete_operator(&self, uid: &str) {
         if let Some((_, op)) = self.operators.remove(uid) {
-            if let Err(e) = op.shutdown().await {
-                error!("Failed to shutdown operator '{}': {}", op.cr.name, e);
+            if let Err(e) = op.cmd_tx.send(WORCommand::Shutdown).await {
+                error!(
+                    "Failed to send shutdown command to operator '{}' with generation '{}': {}",
+                    op.cr.name, op.cr.generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string()), e
+                );
             }
             drop(op);
         }
@@ -163,11 +166,9 @@ impl MainController {
                                 "Operator '{}' is idle for more than {:?}, unloading it.",
                                 op.cr.name, IDLE_THRESHOLD
                             );
-                            if let Err(e) = op.unload().await {
-                                error!("Failed to unload idle operator '{}', removing it from execution: {}", op.cr.name, e);
-                                self.crashed_operators
-                                    .insert(entry.key().clone(), op.cr.generation);
-                                self.delete_operator(entry.key()).await;
+                            if let Err(e) = op.cmd_tx.send(WORCommand::Unload).await {
+                                error!("Failed to send unload command to operator '{}': {}", op.cr.name, e);
+                                continue;
                             }
                             let history = op.get_reconcile_history().await;
                             let wake_up_time = match get_next_reconcile_prediction(history, PredictionModel::SES).await {
@@ -177,6 +178,7 @@ impl MainController {
                                     continue;
                                 }
                             };
+                            info!("Next reconcile prediction for operator '{}' is in {:?}, sending LoadAt command.", op.cr.name, wake_up_time);
                             op.cmd_tx.send(WORCommand::LoadAt(wake_up_time)).await.unwrap_or_else(|e| {
                                 error!("Failed to send LoadAt command to operator '{}': {}", op.cr.name, e);
                             });
@@ -207,8 +209,8 @@ impl MainController {
                     let shutdown_futures = self.operators.iter().map(|entry| {
                         let op = entry.value().clone();
                         async move {
-                            if let Err(e) = op.pause().await {
-                                error!("Failed to pause operator '{}': {}", op.cr.name, e);
+                            if let Err(e) = op.cmd_tx.send(WORCommand::Pause).await {
+                                error!("Failed to send pause command to operator '{}': {}", op.cr.name, e);
                             }
                         }
                     });
