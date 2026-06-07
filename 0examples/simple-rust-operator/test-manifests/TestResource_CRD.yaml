@@ -1,0 +1,63 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: testresources.test.dev
+spec:
+  group: test.dev
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Factor
+          type: integer
+          jsonPath: .spec.factor
+        - name: Outcome
+          type: integer
+          jsonPath: .status.outcome
+        - name: Last Updated
+          type: date
+          jsonPath: .status.lastUpdated
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: A custom resource that is used for testing in the wasmoperator framework.
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              properties:
+                factor:
+                  type: integer
+                  format: int64
+            status:
+              type: object
+              properties:
+                outcome:
+                  type: integer
+                  format: int64
+                observedGeneration:
+                  type: integer
+                  format: int64
+                lastUpdated:
+                  type: string
+                  format: date-time
+              required:
+                - outcome
+                - lastUpdated
+          required:
+            - spec
+  scope: Namespaced
+  names:
+    plural: testresources
+    singular: testresource
+    kind: TestResource
+    shortNames:
+      - testres

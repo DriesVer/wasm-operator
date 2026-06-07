@@ -1,0 +1,7 @@
+apiVersion: test.dev/v1
+kind: TestResource
+metadata:
+  name: function1
+  namespace: default
+spec:
+  factor: 10

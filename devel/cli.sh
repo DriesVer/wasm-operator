@@ -27,6 +27,9 @@ else
 fi
 OS=$(uname -s)
 
+DEFAULT_CLUSTER_NAME="wasm-operator"
+DEFAULT_PARENT_IMAGE_NAME="wasmoperator-controller:latest"
+
 executable_exist() {
   local cmd="$1"
   if command -v "$cmd" &>/dev/null; then
@@ -54,21 +57,24 @@ wasmop() (
 
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
-    else
-        wasmop_createconfig
     fi
 
     CMD_ROOT=$(pwd)
 
     local cmd="$1"
     local sub_cmd="$2"
+    local sub_sub_cmd="$3"
 
-    shift
-    if executable_exist "wasmop_${cmd}_${sub_cmd}"; then
-        shift
+    if executable_exist "wasmop_${cmd}_${sub_cmd}_${sub_sub_cmd}"; then
+        shift 3
+        "wasmop_${cmd}_${sub_cmd}_${sub_sub_cmd}" "$@"
+        exit 0
+    elif executable_exist "wasmop_${cmd}_${sub_cmd}"; then
+        shift 2
         "wasmop_${cmd}_${sub_cmd}" "$@"
         exit 0
     elif executable_exist "wasmop_${cmd}"; then
+        shift 1
         "wasmop_${cmd}" "$@"
     else
         echo "ERROR: tool '${cmd}' not found for wasm-operator"
@@ -80,11 +86,37 @@ wasmop_test() {
     echo "This works!"
 }
 
-wasmop_createconfig() {
-    content="
-    HOST_FOLDER=
-    "
-    printf "%s\n" "$content" > "$CONFIG_FILE"
+wasmop_config_list() {
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "Current configuration variables in $CONFIG_FILE:"
+        grep -E '^[A-Z_]+=' "$CONFIG_FILE" | while read -r line; do
+            var_name=$(echo "$line" | cut -d= -f1)
+            var_value=$(echo "$line" | cut -d= -f2- | tr -d '"')
+            echo -e "\t$var_name: \033[32m$var_value\033[0m"
+        done
+    else
+        echo "No configuration file found at $CONFIG_FILE."
+    fi
+}
+
+wasmop_config_savevar() {
+    local var_name="$1"
+    local var_value="$2"
+
+    if [ -z "$var_name" ] || [ -z "$var_value" ]; then
+        echo "ERROR: Variable name and value are required"
+        return 1
+    fi
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        touch "$CONFIG_FILE"
+    fi
+
+    if grep -q "${var_name}" "$CONFIG_FILE"; then
+        perl -i -pe "s|^\s*${var_name}=.*|${var_name}=\"${var_value}\"|" "$CONFIG_FILE"
+    else
+        printf "%s=\"%s\"\n" "$var_name" "$var_value" >> "$CONFIG_FILE"
+    fi
 }
 
 wasmop_check_install() {
@@ -145,8 +177,8 @@ wasmop_setup_kind() {
     echo -n "Kind cluster name: " 
     read cluster_name
     if [ -z "$cluster_name" ]; then
-        echo "No cluster name provided. Using default name \033[1m'wasm-operator'\033[0m."
-        cluster_name="wasm-operator"
+        echo -e "No cluster name provided. Using default name \033[1m'wasm-operator'\033[0m."
+        cluster_name=$DEFAULT_CLUSTER_NAME
     fi
 
     echo "Using kind config from './devel/kind-config.yaml'."
@@ -179,29 +211,29 @@ wasmop_setup_kind() {
             config_file="$temp_config"
 
             # Save the host folder path to the config file for later use
-            perl -i -pe "s|^\s*HOST_FOLDER=.*|HOST_FOLDER=\"$host_folder\"|" "$CONFIG_FILE"
+            wasmop config savevar "WASMOP_HOST_FOLDER" "$host_folder"
         fi
     fi
 
     kind create cluster --name "${cluster_name}" --config "${config_file}"
 }
 
-wasmop_setup_predictionserver() {
-    local cname=1
-    if [ -n "$cname" ]; then
-        cluser_name="$cname"
-    else
-        if [ -z "$cluster_name" ]; then
-            echo "No cluster name provided."
-            exit 1
-        fi
-    fi
+# wasmop_setup_predictionserver() {
+#     local cname=$1
+#     if [ -n "$cname" ]; then
+#         cluster_name="$cname"
+#     else
+#         if [ -z "$cluster_name" ]; then
+#             echo "No cluster name provided."
+#             exit 1
+#         fi
+#     fi
 
-    echo -e "\033[1m\nSetting up the prediction server in the cluster\033[0m"
-    docker build -t prediction_webserver:webserver "${ROOT}/prediction/webserver"
-    kind load docker-image --name $cluster_name prediction_webserver:webserver
-    kubectl apply -f "${ROOT}/tests/yaml/deploymentFlask.yaml"
-}
+#     echo -e "\033[1m\nSetting up the prediction server in the cluster\033[0m"
+#     docker build -t prediction_webserver:webserver "${ROOT}/prediction/webserver"
+#     kind load docker-image --name $cluster_name prediction_webserver:webserver
+#     kubectl apply -f "${ROOT}/tests/yaml/deploymentFlask.yaml"
+# }
 
 wasmop_setup_crd() {
     echo -e "\033[1m\nSetting up the CRD for the wasm-operator\033[0m"
@@ -221,103 +253,98 @@ wasmop_setup() {
         wasmop setup kind
     fi
 
-    if confirm "\nDo you want to install the prediction server in the cluster?"; then
-        wamop setup predictionserver
-    fi
-
     wasmop setup crd
 }
 
-wasmop_build() {
-    local operator_name=$1
+# This will create a docker image for the parent controller that can be used in the Kubernetes cluster.
+wasmop_build_parent() {
+    local parent_image_name=$1
+    if [ -z "$parent_image_name" ]; then
+        parent_image_name=$DEFAULT_PARENT_IMAGE_NAME
+    fi
 
-    export RUST_BACKTRACE=1
-    export COMPILE_WITH_UNINSTANTIATE="TRUE"
-    export RUSTFLAGS="-A warnings"
+    echo -e "\033[1m\nBuilding the parent controller image \033[32m'$parent_image_name'\033[0m"
 
-    mkdir -p "./build"
-
-    echo -e "\033[1m\nBuilding the parent operator\033[0m"
-    cd "${PKG_FOLDER}"
     parent_target="${ARCH}-unknown-linux-musl"
+    echo ">> Building the parent controller for target '${parent_target}'"
+    cd "${PKG_FOLDER}"
     if [ "$OS" = "Darwin" ]; then
         # Use zigbuild for macOS to build for Linux
-        cargo zigbuild --release --target=${parent_target} --target-dir "${CMD_ROOT}/build/parent-target"
+        cargo zigbuild --release --target=${parent_target}
     else
-        cargo build --release --target=${parent_target} --target-dir "${CMD_ROOT}/build/parent-target"
+        cargo build --release --target=${parent_target}
     fi
-    
-    cd "${CMD_ROOT}"
-    echo -e "\033[1m\nBuilding the child operator\033[0m"
-    #cargo component build --release --target wasm32-wasip2 --target-dir "./build/child-target"
-    cargo build --release --target wasm32-wasip2 --target-dir "./build/child-target"
+    cp "./target/${parent_target}/release/controller" ./target/parent_controller.bin
 
-    cp ./build/parent-target/${parent_target}/release/controller ./build/parent_controller.bin
-    cp ./build/child-target/wasm32-wasip2/release/${operator_name}.wasm ./build/${operator_name}.wasm  
-    cp ./build/${operator_name}.wasm ${ROOT}/tests/wasm_source_dir/${operator_name}.wasm
+    echo ">> Building and the docker image for the parent controller"
+    docker build . -t ${parent_image_name}
+}
+
+# Build and load the parent controller image into the kind cluster
+# This container/pod is then started with the parent_controller.yaml manifest provided in the tests/yaml folder.
+wasmop_load_parent() {
+    local kind_cluster_name=$1
+    if [ -z "$kind_cluster_name" ]; then
+        kind_cluster_name=$DEFAULT_CLUSTER_NAME
+    fi
+
+    local parent_image_name=$2
+    if [ -z "$parent_image_name" ]; then
+        parent_image_name=$DEFAULT_PARENT_IMAGE_NAME
+    fi
+
+    echo -e "\033[1m\nBuilding and loading the parent controller image into cluster \033[32m'$kind_cluster_name'\033[0m"
+    wasmop build parent $parent_image_name
+    kind load --name "${kind_cluster_name}" docker-image "${parent_image_name}"
+
+    echo -e "\033[1m\nSetting up the prediction server in the cluster\033[0m"
+    prediction_image_name="prediction-webserver:latest"
+    docker build "${ROOT}/prediction/webserver" -t ${prediction_image_name}
+    kind load --name "${kind_cluster_name}" docker-image "${prediction_image_name}"
+
+    echo ">> Creating the right RBAC permissions for the parent controller"
+    kubectl apply -f ${ROOT}/tests/yaml/parent_controller/rbac.yaml
+
+    echo ">> Creating the right volumes for the parent controller"
+    kubectl apply -f ${ROOT}/tests/yaml/parent_controller/volumes.yaml
+
+    echo ">> Starting the parent controller in the cluster"
+    kubectl delete -f ${ROOT}/tests/yaml/parent_controller/pod.yaml --ignore-not-found
+    kubectl apply -f ${ROOT}/tests/yaml/parent_controller/pod.yaml
+}
+
+# Build the child controller wasm file and copy it to the host folder that is mounted into the kind cluster, so that the parent controller can load it from there.
+wasmop_build_child() {
+    local operator_name=$1
+    if [ -z "$operator_name" ]; then
+        echo -e "\033[1;31mERROR: No operator wasm file name provided. Use the same file name used in the WasmOperator CR and Rust package name (hyphens become underscores).\033[1;0m"
+        return 1
+    fi
+
+    echo -e "\033[1m\n>> Building the child controller\033[0m"
+    cd "${CMD_ROOT}"
+    cargo build --release --target wasm32-wasip2
+
+    echo -e "\033[1m\n>> Copying the built wasm file to the host folder for the kind cluster\033[0m"
+    cp "./target/wasm32-wasip2/release/${operator_name}.wasm" "${WASMOP_HOST_FOLDER}/${operator_name}.wasm"
+}
+
+# Build the child operator and start the operator by applying the wasm_operator.yaml
+wasmop_load_child() {
+    wasmop build child $1
+
+    cd "${CMD_ROOT}"
+    kubectl delete -f ./wasm_operator.yaml --ignore-not-found
+    kubectl apply -f ./wasm_operator.yaml
+}
+
+
+wasmop_build() {
+    wasmop build parent $1
+    wasmop build child $2
 }
 
 wasmop_load() {
-    local namespace=$1
-    local image_name=$2
-    local kind_cluster_name="kind"
-    local get_flask_server=1
-    # TODO: make that if dockerfile present take that one
-
-    if [ -z "$namespace" ] || [ -z "$image_name" ]; then
-        echo "ERROR: namespace and image_name parameters are required"
-        exit 1
-    fi
-
-    echo -e "\033[1m\nBuilding and loading docker image for wasm-operator (parent + child controllers)\033[0m"
-
-    mkdir -p ./build/docker-context
-
-    # Copy built files to docker build context
-    find ./build -maxdepth 1 -type f -exec cp {} ./build/docker-context/ \;
-    cp ./wasm_config.yaml ./build/docker-context/wasm_config.yaml
-
-    # Build parent controller image and load it into kind cluster
-    docker build ./build/docker-context -t $image_name -f "${PKG_FOLDER}/Dockerfile"
-    kind load docker-image $image_name --name "${kind_cluster_name}"
-
-    # Build prediction server image and load it into kind cluster
-    docker build "${ROOT}/prediction/webserver" -t prediction_webserver:latest
-    kind load docker-image prediction_webserver:latest --name "${kind_cluster_name}"
-
-    echo -e "\033[1m\nCreating kubernetes resources to run the wasm-operator\033[0m"
-    # TODO: Maybe move these to the pkg folder?
-    kubectl apply -f "${ROOT}/tests/yaml/metricsServer.yaml"
-    kubectl apply -f "${ROOT}/tests/yaml/crd.yaml"
-    kubectl apply -f "${ROOT}/tests/yaml/namespace.yaml"
-    kubectl apply -f "${ROOT}/tests/yaml/rbac.yaml"
-
-    echo -e "\033[34mCreate namespace and controller resource\033[0m"
-    kubectl apply -f ./namespaces.yaml
-    kubectl delete -f ./wasm_operator.yaml --ignore-not-found
-
-    # Replace prediction server URL in child_controller.yaml
-    if [ "$get_flask_server" -eq 1 ]; then
-        echo -e "\033[34mGetting URL of prediction server\033[0m"
-        SERVER="http://"
-        SERVER+=$(kubectl get service/flask-service -o jsonpath='{.spec.clusterIP}')
-        SERVER+=":5000/"
-        echo "Server URL: $SERVER"
-        sed "s|{{REPLACE.PREDICTION_SERVER_URL}}|$SERVER|" "./child_controller.yaml" > ./build/child_controller_parsed.yaml
-        # kubectl apply -f ./build/child_controller_parsed.yaml
-        kubectl replace --force -f ./build/child_controller_parsed.yaml
-    else
-        # kubectl apply -f ./child_controller.yaml
-        kubectl replace --force -f ./child_controller.yaml
-    fi
-
-    kubectl apply -f ./wasm_operator.yaml
-
-    # Wait for the controller pod to be running
-    echo -e "\033[1m\nWaiting for the controller pod to be running\033[0m"
-    kubectl wait --namespace $namespace \
-        --for=condition=Ready pods --all \
-        --field-selector=status.phase!=Succeeded,status.phase!=Failed \
-        --timeout=3000s
-
+    wasmop load parent $1
+    wasmop load child $2
 }

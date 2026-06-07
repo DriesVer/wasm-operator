@@ -183,6 +183,7 @@ impl KubernetesService {
         Ok(())
     }
 
+    // TODO: Split up into separate update and patch methods to avoid double applies when only patching status.
     pub async fn update_resource(
         &self,
         kind: &str,
@@ -207,6 +208,13 @@ impl KubernetesService {
             .patch(name, &pp, &Patch::Apply(&resource))
             .await
             .context("Failed to update resource")?;
+
+        if resource.get("status").is_some() {
+            let _ = api
+                .patch_status(name, &pp, &Patch::Apply(&resource))
+                .await
+                .context("Failed to update resource status")?;
+        }
         Ok(())
     }
 

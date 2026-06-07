@@ -1,0 +1,36 @@
+# This manifest defines the Pod for the parent controller, which is responsible for managing the lifecycle of the WasmOperators
+apiVersion: v1
+kind: Pod
+metadata:
+  name: controller
+  namespace: default
+spec:
+  serviceAccountName: wasmoperator-controller
+  containers:
+    - name: controller
+      image: "wasmoperator-controller:latest"
+      #command: ["sh", "-c", "sleep 3600"]
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          memory: "640Mi"
+        limits:
+          memory: "1280Mi"
+      volumeMounts:
+        - mountPath: "/wasm-source-pvc"
+          name: wasm-source-pvc
+        - mountPath: "/tmp/wasmop-cache"
+          name: wasmop-cache-pvc
+    - name: prediction-sidecar
+      image: prediction-webserver:latest
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 5000
+          protocol: TCP
+  volumes:
+    - name: wasm-source-pvc
+      persistentVolumeClaim:
+        claimName: wasm-source-pvc
+    - name: wasmop-cache-pvc
+      persistentVolumeClaim:
+        claimName: wasmop-cache-pvc

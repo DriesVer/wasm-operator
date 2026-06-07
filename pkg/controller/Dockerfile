@@ -3,10 +3,8 @@
 FROM gcr.io/distroless/cc:debug-nonroot
 WORKDIR /
 
-COPY ./parent_controller.bin .
+COPY ./target/parent_controller.bin .
 
-#COPY ./*.wasm ./
-COPY ./wasm_config.yaml .
 ENV  RUST_BACKTRACE=1
 USER 65532:65532
 

@@ -137,14 +137,23 @@ impl MainController {
 
     async fn handle_operator_shutdown(&self, mut rx: mpsc::Receiver<String>) {
         while let Some(op_uid) = rx.recv().await {
-            if let Some(op) = self.operators.get(&op_uid) {
-                let op = op.value();
-                self.crashed_operators
-                    .insert(op_uid.clone(), op.cr.generation);
+
+            // Extract the operator info from the dashmap to avoind holding the lock
+            let op_info = if let Some(op_ref) = self.operators.get(&op_uid) {
+                let op = op_ref.value();
+                Some((op.cr.name.clone(), op.cr.generation))
+            } else {
+                None
+            };
+
+            if let Some((name, generation)) = op_info {
                 warn!(
                     "Operator '{}' with generation '{}' has shut down unexpectedly, removing it from execution",
-                    op.cr.name, op.cr.generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string())
+                    name, 
+                    generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string())
                 );
+
+                self.crashed_operators.insert(op_uid.clone(), generation);
                 self.delete_operator(&op_uid).await;
             }
         }
@@ -260,10 +269,8 @@ impl MainController {
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(
-                                "Watcher for 'WasmOperator' in namespace '{}' encountered an error: {}",
-                                namespace, e
-                            );
+                            error!("WasmOperator controller's watcher for 'WasmOperator' in namespace '{}' encountered a fatal error, exiting execution: {}", namespace, e);
+                            self.shutdown_token.cancel();
                         }
                         None => {
                             info!(

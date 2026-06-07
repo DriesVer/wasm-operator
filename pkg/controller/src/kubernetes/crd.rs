@@ -3,6 +3,7 @@
 //! This module defines the Rust structs for Kubernetes Custom Resources (CRDs)
 //! used by the operator to represent Wasm components and their configuration.
 
+use chrono::{DateTime, Utc};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,7 @@ pub enum WasmSource {
 #[serde(rename_all = "camelCase")]
 pub struct WasmOperatorStatus {
     pub state: WasmOperatorState,
-    pub last_updated: String,
+    pub last_updated: DateTime<Utc>,
     pub observed_generation: Option<i64>,
     pub owner: Option<String>,
 

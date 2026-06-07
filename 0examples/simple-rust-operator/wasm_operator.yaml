@@ -1,0 +1,13 @@
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: simple-rust-operator
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "simple_rust_operator.wasm"
+  env:
+    - name: TESTRESOURCE_NAMESPACE
+      value: "default"

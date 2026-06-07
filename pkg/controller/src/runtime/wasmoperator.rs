@@ -26,7 +26,7 @@ use crate::host::api::bindings;
 use crate::host::api::bindings::local::operator::types as wit_types;
 use crate::host::state::State;
 use crate::kubernetes::crd::{
-    EnvironmentVariable, WasmOperator as WasmOperatorCRD, WasmOperatorState, WasmOperatorStatus,
+    EnvironmentVariable, WasmOperator as WasmOperatorCR, WasmOperatorState, WasmOperatorStatus,
     WasmSource,
 };
 use crate::kubernetes::KubernetesService;
@@ -52,15 +52,15 @@ pub struct WasmOperatorReduced {
     pub env: Vec<EnvironmentVariable>,
     pub args: Vec<String>,
 }
-impl From<&WasmOperatorCRD> for WasmOperatorReduced {
-    fn from(crd: &WasmOperatorCRD) -> Self {
+impl From<&WasmOperatorCR> for WasmOperatorReduced {
+    fn from(cr: &WasmOperatorCR) -> Self {
         Self {
-            name: crd.name_any(),
-            generation: crd.metadata.generation,
-            uid: crd.uid().unwrap(),
-            wasm: crd.spec.wasm.clone(),
-            env: crd.spec.env.clone(),
-            args: crd.spec.args.clone(),
+            name: cr.name_any(),
+            generation: cr.metadata.generation,
+            uid: cr.uid().unwrap(),
+            wasm: cr.spec.wasm.clone(),
+            env: cr.spec.env.clone(),
+            args: cr.spec.args.clone(),
         }
     }
 }
@@ -146,7 +146,7 @@ impl WasmOperatorRuntime {
                                 if let Err(e) = self.clone().start_watching().await {
                                     let error = format!("Failed to start watching: {}", e);
                                     let _ = self.throw_fatal_error::<()>(&error);
-                                    error!("Operator '{}' failed to start watching: {}", self.cr.name, error);
+                                    error!("Operator '{}' failed to start watching: {}", self.cr.name, e);
                                     return;
                                 }
                             },
@@ -191,7 +191,7 @@ impl WasmOperatorRuntime {
 
         let status = WasmOperatorStatus {
             state,
-            last_updated: Utc::now().to_rfc3339(),
+            last_updated: Utc::now(),
             observed_generation: self.cr.generation,
             owner: CONTROLLER_UUID.get().cloned(),
             statistics: Some(self.stats.get_statistics().await),
@@ -202,7 +202,7 @@ impl WasmOperatorRuntime {
         });
 
         // Update the Kubernetes resource status
-        let kind = WasmOperatorCRD::kind(&());
+        let kind = WasmOperatorCR::kind(&());
         let namespace = std::env::var("WASMOP_NAMESPACE").unwrap_or_else(|_| "default".to_string());
         k8s_service
             .patch_status(&kind, &self.cr.name, &namespace, &patch.to_string())
@@ -497,15 +497,10 @@ impl WasmOperatorRuntime {
             })
             .await?;
 
-        // Create a watcher for each requested watch
-        // for request in &watch_requests {
-        //     self.clone().start_watcher(request.clone()).await;
-        // }
-
         let client = KubernetesService::global().await.unwrap();
         let mut watcher_streams = Vec::new();
         for request in watch_requests {
-            let ar = client.find_api_resource(&request.kind).await.unwrap();
+            let ar = client.find_api_resource(&request.kind).await?;
             let k8s_watcher = watcher(
                 client.dynamic_api(ar, &request.namespace),
                 Default::default(),
@@ -541,11 +536,13 @@ impl WasmOperatorRuntime {
                     let event = match watcher_event {
                         Some(Ok(e)) => e,
                         Some(Err(e)) => {
-                            warn!("Watcher for operator '{}' had a fatal error: {}", self.cr.name, e);
+                            self.throw_fatal_error::<()>(&format!("Watcher stream error: {}", e)).await.ok();
+                            error!("Operator '{}' had watch stream error: {}", self.cr.name, e);
                             return;
                         },
                         None => {
                             warn!("Watcher stream for operator '{}' ended unexpectedly.", self.cr.name);
+                            // TODO: we might want to restart the watcher here instead of exiting the loop, but we need to be careful to not end in a restart loop if the watcher keeps failing immediately
                             return;
                         }
                     };
