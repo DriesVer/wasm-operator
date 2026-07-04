@@ -1,3 +1,6 @@
 [submodule "pkg/kube-rs"]
 	path = pkg/kube-rs
 	url = https://github.com/IBCNServices/kube-rs/
+[submodule "pkg/wasmtime"]
+	path = pkg/wasmtime
+	url = https://github.com/bytecodealliance/wasmtime.git
