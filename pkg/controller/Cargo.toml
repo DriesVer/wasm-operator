@@ -14,14 +14,22 @@ log = "^0.4.16"
 hyper-timeout = {version = "0.4.1"}
 tracing = { version = "0.1.24", features = ["log"] }
 
-wasmtime = { version = "46.0.1", default-features = false, features = [
+# wasmtime = { version = "46.0.1", default-features = false, features = [
+#     "parallel-compilation",
+#     "cranelift",
+#     "pooling-allocator",
+#     "component-model-async",
+#     "anyhow",
+# ] }
+wasmtime = { path = "../wasmtime/crates/wasmtime", version = "46.0.1", default-features = false, features = [
     "parallel-compilation",
     "cranelift",
     "pooling-allocator",
     "component-model-async",
     "anyhow",
 ] }
-wasmtime-wasi = { version = "46.0.1" }
+# wasmtime-wasi = { version = "46.0.1" }
+wasmtime-wasi = { path = "../wasmtime/crates/wasi", version = "46.0.1" }
 
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
