@@ -1,7 +1,7 @@
 package local:operator@0.2.0;
 
 interface kubernetes {
-  use types.{log-level};
+  use types.{log-level, event-type};
   log: func(level: log-level, message: string);
   get-resource: func(kind: string, name: string, namespace: string) -> result<string, string>;
   list-resources: func(kind: string, namespace: string) -> result<list<string>, string>;

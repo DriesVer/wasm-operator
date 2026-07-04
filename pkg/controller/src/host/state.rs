@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::kubernetes::KubernetesService;
 use wasmtime::component::ResourceTable;
-use wasmtime_wasi::p2::{IoView, WasiCtx, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 pub struct State {
     pub wasi_ctx: WasiCtx,
@@ -18,14 +18,11 @@ pub struct State {
     pub resources: ResourceTable,
 }
 
-impl IoView for State {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resources
-    }
-}
-
 impl WasiView for State {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.resources,
+        }
     }
 }

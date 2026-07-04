@@ -20,7 +20,8 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::Store;
-use wasmtime_wasi::p2::{add_to_linker_async, WasiCtxBuilder};
+use wasmtime_wasi::p2::add_to_linker_async;
+use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::host::api::bindings;
 use crate::host::api::bindings::local::operator::types as wit_types;
@@ -493,7 +494,12 @@ impl WasmOperatorRuntime {
         // Get the watch requests for the operator
         let watch_requests = self
             .execute_via_wit(|operator, store| {
-                Box::pin(async move { operator.call_get_watch_requests(store).await })
+                Box::pin(async move {
+                    operator
+                        .call_get_watch_requests(store)
+                        .await
+                        .map_err(anyhow::Error::from)
+                })
             })
             .await?;
 
@@ -625,7 +631,12 @@ impl WasmOperatorRuntime {
 
         let reconcile_result = match self
             .execute_via_wit(|operator, store| {
-                Box::pin(async move { operator.call_reconcile(store, &reconcile_request).await })
+                Box::pin(async move {
+                    operator
+                        .call_reconcile(store, &reconcile_request)
+                        .await
+                        .map_err(anyhow::Error::from)
+                })
             })
             .await
         {

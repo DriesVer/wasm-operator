@@ -13,7 +13,6 @@ impl WasmEngineSingleton for wasmtime::Engine {
         WASM_ENGINE
             .get_or_try_init(|| async {
                 let mut config = wasmtime::Config::new();
-                config.async_support(true);
                 config.cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize);
                 Engine::new(&config)
                     .map_err(|e| anyhow::anyhow!("Failed to create Wasm engine: {}", e))

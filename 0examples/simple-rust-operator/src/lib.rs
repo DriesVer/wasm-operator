@@ -2,6 +2,7 @@
 // Packages to interact with the Kubernetes API via the parent controller.
 use crate::local::operator::kubernetes;
 use crate::local::operator::kubernetes::LogLevel;
+use crate::local::operator::types::EventType;
 
 // Pacakge to handle serialization and deserialization of memory.
 use bincode;
@@ -126,6 +127,11 @@ impl Guest for SimpleOperator {
             }
         };
 
+        // Check if the event type is "Deleted", if so, we can return early as there is nothing to reconcile.
+        if request.event_type == EventType::Deleted {
+            return ReconcileResult::Ok;
+        }
+
         // Check if the observed generation matches the current generation, if so, it means there are no changes to reconcile and we can return early.
         if resource.status.is_some() {
             let status = resource.status.as_ref().unwrap();
@@ -136,10 +142,10 @@ impl Guest for SimpleOperator {
         }
 
         // Log the updated resource for demo purposes
-        kubernetes::log(
-            LogLevel::Info,
-            &format!("Reconciling resource: {:?}", resource),
-        );
+        // kubernetes::log(
+        //     LogLevel::Info,
+        //     &format!("Reconciling resource: {:?}", resource),
+        // );
 
         // Increment the counter and update the resource's status with outcome of the base_number times the counter
         let mut counter = get_counter().lock().unwrap();
@@ -157,14 +163,6 @@ impl Guest for SimpleOperator {
         match serde_json::to_string(&resource) {
             Ok(updated_json) => {
                 let namespace = resource.metadata.namespace.as_deref().unwrap_or("default");
-
-                kubernetes::log(
-                    LogLevel::Warn,
-                    &format!(
-                        "Updating resource {} in namespace {} as: {:?}",
-                        resource.metadata.name, namespace, updated_json
-                    ),
-                );
 
                 let result = kubernetes::update_resource(
                     "TestResource",

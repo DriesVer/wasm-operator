@@ -10,9 +10,14 @@ use std::future::Future;
 
 pub mod bindings {
     wasmtime::component::bindgen!({
-            async: true,
             path: "wit/",
-            world: "kube-operator"
+            world: "kube-operator",
+            imports: {
+                default: async,
+            },
+            exports: {
+                default: async,
+            },
     });
 }
 
@@ -23,7 +28,7 @@ impl bindings::local::operator::kubernetes::Host for State {
         &mut self,
         level: bindings::local::operator::types::LogLevel,
         message: String,
-    ) -> impl Future<Output=()> + Send {
+    ) -> impl Future<Output = ()> + Send {
         async move {
             match level {
                 bindings::local::operator::types::LogLevel::Trace => tracing::trace!(message),
@@ -40,7 +45,7 @@ impl bindings::local::operator::kubernetes::Host for State {
         kind: String,
         name: String,
         namespace: String,
-    ) -> impl Future<Output=Result<String, String>> + Send {
+    ) -> impl Future<Output = Result<String, String>> + Send {
         async move {
             self.kubernetes_service
                 .get_resource(&kind, &name, &namespace)
@@ -53,7 +58,7 @@ impl bindings::local::operator::kubernetes::Host for State {
         &mut self,
         kind: String,
         namespace: String,
-    ) -> impl Future<Output=Result<Vec<String>, String>> + Send {
+    ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
         async move {
             self.kubernetes_service
                 .list_resources(&kind, &namespace)
@@ -67,7 +72,7 @@ impl bindings::local::operator::kubernetes::Host for State {
         kind: String,
         namespace: String,
         resource_json: String,
-    ) -> impl Future<Output=Result<(), String>> + Send {
+    ) -> impl Future<Output = Result<(), String>> + Send {
         async move {
             self.kubernetes_service
                 .create_resource(&kind, &namespace, &resource_json)
@@ -83,7 +88,7 @@ impl bindings::local::operator::kubernetes::Host for State {
         namespace: String,
         resource_json: String,
         sanitize: bool,
-    ) -> impl Future<Output=Result<(), String>> + Send {
+    ) -> impl Future<Output = Result<(), String>> + Send {
         async move {
             self.kubernetes_service
                 .update_resource(&kind, &name, &namespace, &resource_json, sanitize)
@@ -97,7 +102,7 @@ impl bindings::local::operator::kubernetes::Host for State {
         kind: String,
         name: String,
         namespace: String,
-    ) -> impl Future<Output=Result<(), String>> + Send {
+    ) -> impl Future<Output = Result<(), String>> + Send {
         async move {
             self.kubernetes_service
                 .delete_resource(&kind, &name, &namespace)
