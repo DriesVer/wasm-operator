@@ -3,4 +3,4 @@
 	url = https://github.com/IBCNServices/kube-rs/
 [submodule "pkg/wasmtime"]
 	path = pkg/wasmtime
-	url = https://github.com/bytecodealliance/wasmtime.git
+	url = git@github.com:DriesVer/wasmtime-wasmoperator.git
