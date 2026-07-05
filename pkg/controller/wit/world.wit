@@ -6,8 +6,6 @@ world kube-operator {
     import kubernetes;
 
     export get-watch-requests: func() -> list<watch-request>;
-    export serialize: func() -> list<u8>;
-    export deserialize: func(state: list<u8>);
     export reconcile: func(req: reconcile-request) -> reconcile-result;
 }
 

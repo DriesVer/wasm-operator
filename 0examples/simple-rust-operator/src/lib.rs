@@ -4,9 +4,6 @@ use crate::local::operator::kubernetes;
 use crate::local::operator::kubernetes::LogLevel;
 use crate::local::operator::types::EventType;
 
-// Pacakge to handle serialization and deserialization of memory.
-use bincode;
-
 // Packages for CR handling
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -82,41 +79,6 @@ impl Guest for SimpleOperator {
         }]
     }
 
-    // Serializes the operator's internal state into a byte vector that can be stored by the parent controller.
-    fn serialize() -> Vec<u8> {
-        // The data to serialize can be anything that is serializable.
-        let data = get_counter().lock().unwrap();
-        let data = *data;
-
-        // Logging for demo purposes
-        kubernetes::log(LogLevel::Info, &format!("Serializing data: {}", &data));
-
-        bincode::serialize(&data).unwrap_or_else(|e| {
-            kubernetes::log(LogLevel::Error, &format!("Failed to serialize data: {}", e));
-            Vec::new()
-        })
-    }
-
-    // Deserializes the byte vector back into the operator's internal state.
-    fn deserialize(bytes: Vec<u8>) {
-        let decoded = bincode::deserialize::<i64>(&bytes);
-        match decoded {
-            Ok(data) => {
-                // Logging for demo purposes
-                kubernetes::log(LogLevel::Info, &format!("Deserialized data: {}", data));
-
-                let mut counter = get_counter().lock().unwrap();
-                *counter = data;
-            }
-            Err(e) => {
-                kubernetes::log(
-                    LogLevel::Error,
-                    &format!("Failed to deserialize data: {}", e),
-                );
-            }
-        }
-    }
-
     // The reconcile function is called by the parent controller whenever a watched resource changes. It contains the main logic of the operator.
     fn reconcile(request: ReconcileRequest) -> ReconcileResult {
         // Get the resource from the request
@@ -142,10 +104,10 @@ impl Guest for SimpleOperator {
         }
 
         // Log the updated resource for demo purposes
-        // kubernetes::log(
-        //     LogLevel::Info,
-        //     &format!("Reconciling resource: {:?}", resource),
-        // );
+        kubernetes::log(
+            LogLevel::Info,
+            &format!("Reconciling resource: {:?}", resource.metadata.name),
+        );
 
         // Increment the counter and update the resource's status with outcome of the base_number times the counter
         let mut counter = get_counter().lock().unwrap();

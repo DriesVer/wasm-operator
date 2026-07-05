@@ -257,18 +257,8 @@ impl WasmOperatorRuntime {
 
         let mut store_guard = loaded_state.store.lock().await;
 
-        // Ask the component to serialize its own state
-        let memory_data = match loaded_state
-            .operator
-            .call_serialize(&mut *store_guard)
-            .await
-        {
-            Ok(data) => data,
-            Err(e) => {
-                let error = format!("Failed to serialize state: {}", e);
-                return self.throw_fatal_error(&error).await;
-            }
-        };
+        // Serialize the linear memory of the WASM component
+        let memory_data = store_guard.get_linear_memory()?;
 
         self.stats.record_memory_usage(memory_data.len() as u32);
 
@@ -312,16 +302,10 @@ impl WasmOperatorRuntime {
 
         let (operator, mut store) = self.load_wasm_instance().await?;
 
-        // If no state was saved this means it is the first time loading the component, otherwise we try to restore the previous state
+        // Restore the memory of the operator if a save file exists
         if unloaded_state.state_path.exists() {
             let saved_state = tokio::fs::read(&unloaded_state.state_path).await?;
-
-            // Ask the new component instance to deserialize the state
-            //operator.call_deserialize(&mut store, &saved_state).await?;
-            if let Err(e) = operator.call_deserialize(&mut store, &saved_state).await {
-                let error = format!("Failed to deserialize state: {}", e);
-                return self.throw_fatal_error(&error).await;
-            }
+            store.set_linear_memory(&saved_state)?;
 
             info!(
                 "Successfully restored memory state for operator {}",
