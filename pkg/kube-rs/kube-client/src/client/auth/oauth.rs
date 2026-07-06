@@ -1,8 +1,12 @@
+use http_body_util::BodyExt;
+use hyper_util::rt::TokioExecutor;
 use tame_oauth::{
-    gcp::{TokenOrRequest, TokenProvider, TokenProviderWrapper},
     Token,
+    gcp::{TokenOrRequest, TokenProvider, TokenProviderWrapper},
 };
 use thiserror::Error;
+
+use crate::client::Body;
 
 #[derive(Error, Debug)]
 /// Possible errors when requesting token with OAuth
@@ -33,7 +37,7 @@ pub enum Error {
 
     /// Failed to request token
     #[error("failed to request token: {0}")]
-    RequestToken(#[source] hyper::Error),
+    RequestToken(#[source] hyper_util::client::legacy::Error),
 
     /// Failed to retrieve new credential
     #[error("failed to retrieve new credential {0:?}")]
@@ -50,6 +54,10 @@ pub enum Error {
     /// Failed to build a request
     #[error("failed to build request: {0}")]
     BuildRequest(#[source] http::Error),
+
+    /// No valid native root CA certificates found
+    #[error("No valid native root CA certificates found")]
+    NoValidNativeRootCA(#[source] std::io::Error),
 
     /// OAuth failed with unknown reason
     #[error("unknown OAuth error: {0}")]
@@ -103,39 +111,40 @@ impl Gcp {
             Ok(TokenOrRequest::Request {
                 request, scope_hash, ..
             }) => {
-                #[cfg(not(any(feature = "native-tls", feature = "rustls-tls", feature = "openssl-tls")))]
+                #[cfg(not(any(feature = "rustls-tls", feature = "openssl-tls")))]
                 compile_error!(
-                    "At least one of native-tls or rustls-tls or openssl-tls feature must be enabled to use oauth feature"
+                    "At least one of rustls-tls or openssl-tls feature must be enabled to use oauth feature"
                 );
                 // Current TLS feature precedence when more than one are set:
-                // 1. openssl-tls
-                // 2. native-tls
-                // 3. rustls-tls
-                #[cfg(feature = "openssl-tls")]
-                let https =
-                    hyper_openssl::HttpsConnector::new().map_err(Error::CreateOpensslHttpsConnector)?;
-                #[cfg(all(not(feature = "openssl-tls"), feature = "native-tls"))]
-                let https = hyper_tls::HttpsConnector::new();
-                #[cfg(all(
-                    not(any(feature = "openssl-tls", feature = "native-tls")),
-                    feature = "rustls-tls"
-                ))]
+                // 1. rustls-tls
+                // 2. openssl-tls
+                #[cfg(all(feature = "rustls-tls", not(feature = "webpki-roots")))]
                 let https = hyper_rustls::HttpsConnectorBuilder::new()
                     .with_native_roots()
+                    .map_err(Error::NoValidNativeRootCA)?
                     .https_only()
                     .enable_http1()
                     .build();
+                #[cfg(all(feature = "rustls-tls", feature = "webpki-roots"))]
+                let https = hyper_rustls::HttpsConnectorBuilder::new()
+                    .with_webpki_roots()
+                    .https_only()
+                    .enable_http1()
+                    .build();
+                #[cfg(all(not(feature = "rustls-tls"), feature = "openssl-tls"))]
+                let https =
+                    hyper_openssl::HttpsConnector::new().map_err(Error::CreateOpensslHttpsConnector)?;
 
-                let client = hyper::Client::builder().build::<_, hyper::Body>(https);
+                let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(https);
 
                 let res = client
-                    .request(request.map(hyper::Body::from))
+                    .request(request.map(Body::from))
                     .await
                     .map_err(Error::RequestToken)?;
                 // Convert response body to `Vec<u8>` for parsing.
                 let (parts, body) = res.into_parts();
-                let bytes = hyper::body::to_bytes(body).await.map_err(Error::ConcatBuffers)?;
-                let response = http::Response::from_parts(parts, bytes.to_vec());
+                let bytes = body.collect().await.map_err(Error::ConcatBuffers)?.to_bytes();
+                let response = http::Response::from_parts(parts, bytes);
                 match self.provider.parse_token_response(scope_hash, response) {
                     Ok(token) => Ok(token),
 

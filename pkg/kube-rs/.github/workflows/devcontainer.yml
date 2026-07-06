@@ -1,4 +1,4 @@
-name: Devcontainer
+name: devcontainer
 
 # When a pull request is opened that changes the Devcontainer configuration,
 # ensure that the container continues to build properly.
@@ -14,5 +14,5 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - run: docker build .devcontainer

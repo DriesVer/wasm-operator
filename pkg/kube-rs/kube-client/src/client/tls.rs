@@ -1,90 +1,19 @@
-#[cfg(feature = "native-tls")]
-pub mod native_tls {
-    use thiserror::Error;
-    use tokio_native_tls::native_tls::{Certificate, Identity, TlsConnector};
-
-    const IDENTITY_PASSWORD: &str = " ";
-
-    /// Errors from native TLS
-    #[derive(Debug, Error)]
-    pub enum Error {
-        /// Failed to deserialize PEM-encoded X509 certificate
-        #[error("failed to deserialize PEM-encoded X509 certificate: {0}")]
-        DeserializeCertificate(#[source] openssl::error::ErrorStack),
-
-        /// Failed to deserialize PEM-encoded private key
-        #[error("failed to deserialize PEM-encoded private key: {0}")]
-        DeserializePrivateKey(#[source] openssl::error::ErrorStack),
-
-        /// Failed to create PKCS #12 archive
-        #[error("failed to create PKCS #12 archive: {0}")]
-        CreatePkcs12(#[source] openssl::error::ErrorStack),
-
-        /// Failed to serialize PKCS #12 archive to DER
-        #[error("failed to serialize PKCS #12 archive to DER encoding: {0}")]
-        SerializePkcs12(#[source] openssl::error::ErrorStack),
-
-        /// Failed to deserialize DER-encoded PKCS #12 archive
-        #[error("failed to deserialize DER-encoded PKCS #12 archive: {0}")]
-        DeserializePkcs12(#[source] tokio_native_tls::native_tls::Error),
-
-        /// Failed to deserialize DER-encoded X509 certificate
-        #[error("failed to deserialize DER-encoded X509 certificate: {0}")]
-        DeserializeRootCertificate(#[source] tokio_native_tls::native_tls::Error),
-
-        /// Failed to create `TlsConnector`
-        #[error("failed to create `TlsConnector`: {0}")]
-        CreateTlsConnector(#[source] tokio_native_tls::native_tls::Error),
-    }
-
-    /// Create `native_tls::TlsConnector`.
-    pub fn native_tls_connector(
-        identity_pem: Option<&Vec<u8>>,
-        root_cert: Option<&Vec<Vec<u8>>>,
-        accept_invalid: bool,
-    ) -> Result<TlsConnector, Error> {
-        let mut builder = TlsConnector::builder();
-        if let Some(pem) = identity_pem {
-            let identity = pkcs12_from_pem(pem, IDENTITY_PASSWORD)?;
-            builder.identity(
-                Identity::from_pkcs12(&identity, IDENTITY_PASSWORD).map_err(Error::DeserializePkcs12)?,
-            );
-        }
-
-        if let Some(ders) = root_cert {
-            for der in ders {
-                builder.add_root_certificate(
-                    Certificate::from_der(der).map_err(Error::DeserializeRootCertificate)?,
-                );
-            }
-        }
-
-        if accept_invalid {
-            builder.danger_accept_invalid_certs(true);
-        }
-
-        builder.build().map_err(Error::CreateTlsConnector)
-    }
-
-    // TODO Switch to PKCS8 support when https://github.com/sfackler/rust-native-tls/pull/209 is merged
-    fn pkcs12_from_pem(pem: &[u8], password: &str) -> Result<Vec<u8>, Error> {
-        use openssl::{pkcs12::Pkcs12, pkey::PKey, x509::X509};
-        let x509 = X509::from_pem(pem).map_err(Error::DeserializeCertificate)?;
-        let pkey = PKey::private_key_from_pem(pem).map_err(Error::DeserializePrivateKey)?;
-        let p12 = Pkcs12::builder()
-            .build(password, "kubeconfig", &pkey, &x509)
-            .map_err(Error::CreatePkcs12)?;
-        p12.to_der().map_err(Error::SerializePkcs12)
-    }
-}
-
 #[cfg(feature = "rustls-tls")]
 pub mod rustls_tls {
+    use std::{
+        path::PathBuf,
+        sync::{Arc, RwLock},
+        time::{Duration, Instant},
+    };
+
     use hyper_rustls::ConfigBuilderExt;
     use rustls::{
-        self,
-        client::{ServerCertVerified, ServerCertVerifier},
-        Certificate, ClientConfig, PrivateKey,
+        self, ClientConfig, DigitallySignedStruct, RootCertStore,
+        client::{
+            WebPkiServerVerifier,
+            danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        },
+        pki_types::{CertificateDer, InvalidDnsNameError, PrivateKeyDer, ServerName},
     };
     use thiserror::Error;
 
@@ -93,7 +22,7 @@ pub mod rustls_tls {
     pub enum Error {
         /// Identity PEM is invalid
         #[error("identity PEM is invalid: {0}")]
-        InvalidIdentityPem(#[source] std::io::Error),
+        InvalidIdentityPem(#[source] rustls::pki_types::pem::Error),
 
         /// Identity PEM is missing a private key: the key must be PKCS8 or RSA/PKCS1
         #[error("identity PEM is missing a private key: the key must be PKCS8 or RSA/PKCS1")]
@@ -115,6 +44,14 @@ pub mod rustls_tls {
         /// Failed to add a root certificate
         #[error("failed to add a root certificate: {0}")]
         AddRootCertificate(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+        /// No valid native root CA certificates found
+        #[error("no valid native root CA certificates found")]
+        NoValidNativeRootCA(#[source] std::io::Error),
+
+        /// Invalid server name
+        #[error("invalid server name: {0}")]
+        InvalidServerName(#[source] InvalidDnsNameError),
     }
 
     /// Create `rustls::ClientConfig`.
@@ -124,16 +61,25 @@ pub mod rustls_tls {
         accept_invalid: bool,
     ) -> Result<ClientConfig, Error> {
         let config_builder = if let Some(certs) = root_certs {
-            ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_store(certs)?)
+            ClientConfig::builder().with_root_certificates(root_store(certs)?)
         } else {
-            ClientConfig::builder().with_safe_defaults().with_native_roots()
+            #[cfg(feature = "webpki-roots")]
+            {
+                // Use WebPKI roots.
+                ClientConfig::builder().with_webpki_roots()
+            }
+            #[cfg(not(feature = "webpki-roots"))]
+            {
+                // Use native roots. This will panic on Android and iOS.
+                ClientConfig::builder()
+                    .with_native_roots()
+                    .map_err(Error::NoValidNativeRootCA)?
+            }
         };
 
         let mut client_config = if let Some((chain, pkey)) = identity_pem.map(client_auth).transpose()? {
             config_builder
-                .with_single_cert(chain, pkey)
+                .with_client_auth_cert(chain, pkey)
                 .map_err(Error::InvalidPrivateKey)?
         } else {
             config_builder.with_no_client_auth()
@@ -151,50 +97,256 @@ pub mod rustls_tls {
         let mut root_store = rustls::RootCertStore::empty();
         for der in root_certs {
             root_store
-                .add(&Certificate(der.clone()))
+                .add(CertificateDer::from(der.to_owned()))
                 .map_err(|e| Error::AddRootCertificate(Box::new(e)))?;
         }
         Ok(root_store)
     }
 
-    fn client_auth(data: &[u8]) -> Result<(Vec<Certificate>, PrivateKey), Error> {
-        use rustls_pemfile::Item;
+    /// A [`ServerCertVerifier`] that re-reads the CA bundle file roughly once
+    /// per minute to pick up CA rotation.
+    ///
+    /// This mirrors the token-file reload behaviour in
+    /// [`crate::client::auth::TokenFile`]: the service-account `ca.crt` lives
+    /// in the same projected volume and rotates under the same mechanism.
+    /// Existing TLS connections are unaffected (they already handshook); new
+    /// connections use the freshly loaded roots.
+    ///
+    /// If a reload fails (file missing, parse error), the last successfully
+    /// loaded verifier is retained — same policy as `TokenFile`, per
+    /// <https://github.com/kubernetes/kubernetes/issues/68164>.
+    #[derive(Debug)]
+    pub(crate) struct ReloadingVerifier {
+        path: PathBuf,
+        inner: RwLock<(Arc<WebPkiServerVerifier>, Instant)>,
+    }
+
+    impl ReloadingVerifier {
+        const RELOAD_INTERVAL: Duration = Duration::from_secs(60);
+
+        pub(crate) fn new(path: PathBuf) -> Result<Self, Error> {
+            let verifier = Self::load(&path)?;
+            Ok(Self {
+                path,
+                inner: RwLock::new((verifier, Instant::now())),
+            })
+        }
+
+        fn load(path: &PathBuf) -> Result<Arc<WebPkiServerVerifier>, Error> {
+            let pem = std::fs::read(path).map_err(|e| Error::AddRootCertificate(Box::new(e)))?;
+            let ders = crate::config::certs(&pem).map_err(|e| Error::AddRootCertificate(Box::new(e)))?;
+            let mut store = RootCertStore::empty();
+            for der in ders {
+                store
+                    .add(CertificateDer::from(der))
+                    .map_err(|e| Error::AddRootCertificate(Box::new(e)))?;
+            }
+            WebPkiServerVerifier::builder(Arc::new(store))
+                .build()
+                .map_err(|e| Error::AddRootCertificate(Box::new(e)))
+        }
+
+        fn current(&self) -> Arc<WebPkiServerVerifier> {
+            {
+                let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+                if guard.1.elapsed() < Self::RELOAD_INTERVAL {
+                    return guard.0.clone();
+                }
+            }
+            let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            if guard.1.elapsed() < Self::RELOAD_INTERVAL {
+                return guard.0.clone();
+            }
+            if let Ok(fresh) = Self::load(&self.path) {
+                guard.0 = fresh;
+            } else {
+                tracing::warn!(path = ?self.path, "failed to reload CA bundle; keeping stale roots");
+            }
+            guard.1 = Instant::now();
+            guard.0.clone()
+        }
+    }
+
+    impl ServerCertVerifier for ReloadingVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer,
+            intermediates: &[CertificateDer],
+            server_name: &ServerName,
+            ocsp_response: &[u8],
+            now: rustls::pki_types::UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            self.current()
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            self.current().verify_tls12_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            self.current().verify_tls13_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.current().supported_verify_schemes()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // EC P-256 self-signed CAs, valid until 2126. Regenerate with:
+        //   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        //     -keyout /dev/null -out ca.pem -days 36500 -subj "/CN=test-ca-N"
+        const CA1: &str = "-----BEGIN CERTIFICATE-----
+MIIBgDCCASWgAwIBAgIUVrQf5d//S01a0fbXxYRIx9wc0VQwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJdGVzdC1jYS0xMCAXDTI2MDMwNDEzMDk1MFoYDzIxMjYwMjA4
+MTMwOTUwWjAUMRIwEAYDVQQDDAl0ZXN0LWNhLTEwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAARg57mWJPDsAIEQAgXqMOOfjMQP+PE9HqcZobycO8z94r/uRuV0wKx/
+0SvMsKFtnreut0bjgFtmZaWY+6d87Is9o1MwUTAdBgNVHQ4EFgQUjtGuhkM7LtHB
+gMPCJIxMwbY69OQwHwYDVR0jBBgwFoAUjtGuhkM7LtHBgMPCJIxMwbY69OQwDwYD
+VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEAj/WzNVJDg/cBtLqQVM77
+tkB+QyIXLG3Vi9Xj1YfW9QECIQDDFW8yFtgLeCg2Zhr4xQNq3/24r/01kI2rjFPO
+xBkDMw==
+-----END CERTIFICATE-----
+";
+        const CA2: &str = "-----BEGIN CERTIFICATE-----
+MIIBfjCCASWgAwIBAgIUZ7Qsiwan2joRz01p25/cy1XNNiwwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJdGVzdC1jYS0yMCAXDTI2MDMwNDEzMDk1MFoYDzIxMjYwMjA4
+MTMwOTUwWjAUMRIwEAYDVQQDDAl0ZXN0LWNhLTIwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAARJle2/yiOD5zp0UkjZg9Yy6ZHBItTLrqv/uzB2YMQg03frnqEUMzSV
+mFinosBcGpX/dPGfHNPhBMOpHmlocZu9o1MwUTAdBgNVHQ4EFgQUsqG0hSGDYsz2
+eGIsLIwJnCR5SFIwHwYDVR0jBBgwFoAUsqG0hSGDYsz2eGIsLIwJnCR5SFIwDwYD
+VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiApvLu9DIC3/K/+G9ooOm75
+a72Cjw62aM8NfPe7ILs8SgIgL0VHe6ksTyB176RECCm3MJVnlhOop6b1tNvxjrru
+FRU=
+-----END CERTIFICATE-----
+";
+
+        fn expire(v: &ReloadingVerifier) {
+            // Can't move Instant backwards; instead, reach past the guard.
+            // The test pokes private state the same way auth::tests::token_file does.
+            v.inner.write().unwrap().1 = Instant::now().checked_sub(Duration::from_secs(120)).unwrap();
+        }
+
+        #[test]
+        fn reloading_verifier() {
+            #[cfg(feature = "aws-lc-rs")]
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), CA1).unwrap();
+
+            let verifier = ReloadingVerifier::new(file.path().to_path_buf()).unwrap();
+            let first = verifier.current();
+
+            // File changed but we're still within the reload interval: no reload.
+            std::fs::write(file.path(), CA2).unwrap();
+            assert!(Arc::ptr_eq(&verifier.current(), &first));
+
+            // Force expiry: reload picks up CA2.
+            expire(&verifier);
+            let second = verifier.current();
+            assert!(!Arc::ptr_eq(&second, &first));
+
+            // File gone, expired again: keep stale verifier.
+            drop(file);
+            expire(&verifier);
+            assert!(Arc::ptr_eq(&verifier.current(), &second));
+        }
+    }
+
+    fn client_auth(data: &[u8]) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Error> {
+        use rustls::pki_types::pem::{self, SectionKind};
 
         let mut cert_chain = Vec::new();
         let mut pkcs8_key = None;
-        let mut rsa_key = None;
-        let mut ec_key = None;
+        let mut pkcs1_key = None;
+        let mut sec1_key = None;
         let mut reader = std::io::Cursor::new(data);
-        for item in rustls_pemfile::read_all(&mut reader).map_err(Error::InvalidIdentityPem)? {
-            match item {
-                Item::X509Certificate(cert) => cert_chain.push(Certificate(cert)),
-                Item::PKCS8Key(key) => pkcs8_key = Some(PrivateKey(key)),
-                Item::RSAKey(key) => rsa_key = Some(PrivateKey(key)),
-                Item::ECKey(key) => ec_key = Some(PrivateKey(key)),
+        while let Some((kind, der)) = pem::from_buf(&mut reader).map_err(Error::InvalidIdentityPem)? {
+            match kind {
+                SectionKind::Certificate => cert_chain.push(der.into()),
+                SectionKind::PrivateKey => pkcs8_key = Some(PrivateKeyDer::Pkcs8(der.into())),
+                SectionKind::RsaPrivateKey => pkcs1_key = Some(PrivateKeyDer::Pkcs1(der.into())),
+                SectionKind::EcPrivateKey => sec1_key = Some(PrivateKeyDer::Sec1(der.into())),
                 _ => return Err(Error::UnknownPrivateKeyFormat),
             }
         }
 
-        let private_key = pkcs8_key.or(rsa_key).or(ec_key).ok_or(Error::MissingPrivateKey)?;
+        let private_key = pkcs8_key
+            .or(pkcs1_key)
+            .or(sec1_key)
+            .ok_or(Error::MissingPrivateKey)?;
         if cert_chain.is_empty() {
             return Err(Error::MissingCertificate);
         }
         Ok((cert_chain, private_key))
     }
 
+    #[derive(Debug)]
     struct NoCertificateVerification {}
 
     impl ServerCertVerifier for NoCertificateVerification {
         fn verify_server_cert(
             &self,
-            _end_entity: &Certificate,
-            _intermediates: &[Certificate],
-            _server_name: &rustls::client::ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _end_entity: &CertificateDer,
+            _intermediates: &[CertificateDer],
+            _server_name: &ServerName,
             _ocsp_response: &[u8],
-            _now: std::time::SystemTime,
+            _now: rustls::pki_types::UnixTime,
         ) -> Result<ServerCertVerified, rustls::Error> {
+            tracing::warn!("Server cert bypassed");
             Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            use rustls::SignatureScheme;
+            vec![
+                SignatureScheme::RSA_PKCS1_SHA1,
+                SignatureScheme::ECDSA_SHA1_Legacy,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+                SignatureScheme::ECDSA_NISTP521_SHA512,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::ED25519,
+                SignatureScheme::ED448,
+            ]
         }
     }
 }

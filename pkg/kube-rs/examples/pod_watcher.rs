@@ -1,24 +1,32 @@
 use futures::prelude::*;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
-    api::{Api, ListParams, ResourceExt},
-    runtime::{utils::try_flatten_applied, watcher},
     Client,
+    api::{Api, ResourceExt},
+    runtime::{WatchStreamExt, watcher},
 };
+use tracing::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    std::env::set_var("RUST_LOG", "info,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
-    let namespace = std::env::var("NAMESPACE").unwrap_or_else(|_| "default".into());
-    let api = Api::<Pod>::namespaced(client, &namespace);
+    let api = Api::<Pod>::default_namespaced(client);
+    let use_watchlist = std::env::var("WATCHLIST").map(|s| s == "1").unwrap_or(false);
+    let wc = if use_watchlist {
+        // requires WatchList feature gate on 1.27 or later
+        watcher::Config::default().streaming_lists()
+    } else {
+        watcher::Config::default()
+    };
 
-    try_flatten_applied(watcher(api, ListParams::default()))
+    watcher(api, wc)
+        .applied_objects()
+        .default_backoff()
         .try_for_each(|p| async move {
-            log::debug!("Applied: {}", p.name());
+            info!("saw {}", p.name_any());
             if let Some(unready_reason) = pod_unready(&p) {
-                log::warn!("{}", unready_reason);
+                warn!("{}", unready_reason);
             }
             Ok(())
         })
@@ -39,7 +47,7 @@ fn pod_unready(p: &Pod) -> Option<String> {
             if p.metadata.labels.as_ref().unwrap().contains_key("job-name") {
                 return None; // ignore job based pods, they are meant to exit 0
             }
-            return Some(format!("Unready pod {}: {}", p.name(), failed));
+            return Some(format!("Unready pod {}: {}", p.name_any(), failed));
         }
     }
     None

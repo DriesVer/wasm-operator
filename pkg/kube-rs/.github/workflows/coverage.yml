@@ -1,34 +1,47 @@
-name: Coverage
+name: coverage
 
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
+    paths:
+      - "**.rs"
+      - "**.toml"
+      - "**.yml"
 
 jobs:
-  rust:
+  tarpaulin-codecov:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tarpaulin
+        uses: taiki-e/install-action@v2
         with:
-          toolchain: stable
-          override: true
-      - uses: Swatinem/rust-cache@v1
-      - uses: AbsaOSS/k3d-action@v2
-        name: "Create Single Cluster"
+          tool: cargo-tarpaulin@0.32.8
+      - uses: nolar/setup-k3d-k3s@v1
         with:
-          cluster-name: "test-cluster-1"
-          args: >-
-            --agents 1
-            --image docker.io/rancher/k3s:v1.22.4-k3s1
-            --k3s-arg "--no-deploy=traefik,servicelb,metrics-server@server:*"
+          version: "v1.32" # MK8SV
+          # k3d-kube
+          k3d-name: kube
+          # Used to avoid rate limits when fetching the releases from k3s repo.
+          # Anonymous access is limited to 60 requests / hour / worker
+          # github-token: ${{ secrets.GITHUB_TOKEN }}
+          k3d-args: "-p 10250:10250 --no-rollback --k3s-arg --disable=traefik,servicelb,metrics-server@server:*"
+
+      - name: Import test images into k3d
+        run: |
+          docker pull busybox:stable
+          k3d image import busybox:stable -c kube
+
       - name: Run cargo-tarpaulin
-        uses: actions-rs/tarpaulin@v0.1
+        run: |
+          rustup run stable cargo tarpaulin -o xml --skip-clean
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v7
         with:
-          version: '0.18.5'
-          out-type: Xml
-      - uses: codecov/codecov-action@v3
+          token: ${{ secrets.CODECOV_TOKEN }}

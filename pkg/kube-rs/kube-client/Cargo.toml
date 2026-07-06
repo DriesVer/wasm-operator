@@ -1,93 +1,89 @@
 [package]
 name = "kube-client"
-version = "0.71.0"
 description = "Kubernetes client"
-authors = [
-  "clux <sszynrae@gmail.com>",
-  "Teo Klestrup Röijezon <teo@nullable.se>",
-  "kazk <kazk.dev@gmail.com>",
-]
-license = "Apache-2.0"
-repository = "https://github.com/kube-rs/kube-rs"
-readme = "../README.md"
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 keywords = ["kubernetes", "client",]
-categories = ["web-programming::http-client"]
-rust-version = "1.56"
-edition = "2021"
+categories = ["web-programming::http-client", "network-programming", "api-bindings"]
 
 [features]
-default = ["client", "openssl-tls"]
-native-tls = ["openssl", "hyper-tls", "tokio-native-tls"]
-rustls-tls = ["rustls", "rustls-pemfile", "hyper-rustls"]
+default = ["client", "ring"]
+rustls-tls = ["rustls", "hyper-rustls"]
+webpki-roots = ["hyper-rustls/webpki-roots"]
+aws-lc-rs = ["hyper-rustls?/aws-lc-rs"]
+ring = ["hyper-rustls?/ring"]
 openssl-tls = ["openssl", "hyper-openssl"]
-ws = ["client", "tokio-tungstenite", "rand", "kube-core/ws"]
+hyper-util-tracing = ["hyper-util/tracing"]
+ws = ["client", "tokio-tungstenite", "kube-core/ws", "tokio/macros"]
+kubelet-debug = ["ws", "kube-core/kubelet-debug"]
 oauth = ["client", "tame-oauth"]
+oidc = ["client", "form_urlencoded"]
 gzip = ["client", "tower-http/decompression-gzip"]
-client = ["__client_base", "hyper", "tower", "tower-http", "hyper-timeout", "tokio", "tokio-util"]
-client-wasi = ["__client_base", "kube-runtime-abi"]
-
+client = ["config", "__non_core", "hyper", "hyper-util", "http-body", "http-body-util", "tower", "tower-http", "hyper-timeout", "jiff", "jsonpath-rust", "bytes", "futures", "tokio", "tokio-util", "either"]
 jsonpatch = ["kube-core/jsonpatch"]
 admission = ["kube-core/admission"]
-config = ["__non_core", "pem", "dirs"]
-deprecated-crd-v1beta1 = ["kube-core/deprecated-crd-v1beta1"]
+config = ["__non_core", "pem"]
+socks5 = ["hyper-util/client-proxy"]
+http-proxy = ["hyper-util/client-proxy"]
+unstable-client = []
 
 # private feature sets; do not use
-__non_core = ["tracing", "serde_yaml", "base64"]
-__client_base = ["__non_core", "config", "http-body", "pin-project", "chrono", "jsonpath_lib", "bytes", "futures", "either"]
+__non_core = ["tracing", "serde-saphyr", "base64"]
 
 [package.metadata.docs.rs]
-features = ["client", "native-tls", "rustls-tls", "openssl-tls", "ws", "oauth", "jsonpatch", "admission", "k8s-openapi/v1_22"]
+features = ["client", "rustls-tls", "openssl-tls", "ws", "oauth", "oidc", "jsonpatch", "admission", "k8s-openapi/latest", "socks5", "unstable-client", "http-proxy"]
 # Define the configuration attribute `docsrs`. Used to enable `doc_cfg` feature.
 rustdoc-args = ["--cfg", "docsrs"]
 
-[dependencies]
-base64 = { version = "0.13.0", optional = true }
-chrono = { version = "0.4.19", optional = true, default-features = false }
-dirs = { package = "dirs-next", optional = true, version = "2.0.0" }
-serde = { version = "1.0.130", features = ["derive"] }
-serde_json = "1.0.68"
-serde_yaml = { version = "0.8.21", optional = true }
-http = "0.2.5"
-http-body = { version = "0.4.2", optional = true }
-either = { version = "1.6.1", optional = true }
-thiserror = "1.0.29"
-futures = { version = "0.3.17", optional = true }
-pem = { version = "1.0.1", optional = true }
-openssl = { version = "0.10.36", optional = true }
-tokio-native-tls = { version = "0.3.0", optional = true }
-rustls = { version = "0.20.3", features = ["dangerous_configuration"], optional = true }
-rustls-pemfile = { version = "1.0.0", optional = true }
-bytes = { version = "1.1.0", optional = true }
-tokio = { version = "1.14.0", features = ["time", "signal", "sync"], optional = true }
-kube-core = { path = "../kube-core", version = "=0.71.0" }
-jsonpath_lib = { version = "0.3.0", optional = true }
-tokio-util = { version = "0.7.0", optional = true, features = ["io", "codec"] }
-hyper = { version = "0.14.13", optional = true, features = ["client", "http1", "stream", "tcp"] }
-hyper-tls = { version = "0.5.0", optional = true }
-hyper-rustls = { version = "0.23.0", optional = true }
-tokio-tungstenite = { version = "0.17.1", optional = true }
-tower = { version = "0.4.6", optional = true, features = ["buffer", "filter", "util"] }
-tower-http = { version = "0.2.0", optional = true, features = ["auth", "map-response-body", "trace"] }
-hyper-timeout = {version = "0.4.1", optional = true }
-tame-oauth = { version = "0.7.0", features = ["gcp"], optional = true }
-pin-project = { version = "1.0.4", optional = true }
-rand = { version = "0.8.3", optional = true }
-secrecy = { version = "0.8.0", features = ["alloc", "serde"] }
-tracing = { version = "0.1.29", features = ["log"], optional = true }
-hyper-openssl = { version = "0.9.2", optional = true }
-kube-runtime-abi = { path = "../../kube-runtime-abi", optional = true, version = "^0.0.1" }
+[lints]
+workspace = true
 
-[dependencies.k8s-openapi]
-version = "0.14.0"
-default-features = false
-features = []
+[dependencies]
+base64 = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde-saphyr = { workspace = true, optional = true }
+http.workspace = true
+http-body = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+either = { workspace = true, optional = true }
+thiserror.workspace = true
+futures = { workspace = true, optional = true, features = ["std"] }
+jiff = { workspace = true, optional = true, features = ["std", "serde"] }
+pem = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["time", "signal", "sync", "rt"], optional = true }
+kube-core = { path = "../kube-core", version = "=4.0.0" }
+jsonpath-rust = { workspace = true, optional = true }
+tokio-util = { workspace = true, features = ["io", "codec"], optional = true }
+hyper = { workspace = true, features = ["client", "http1"], optional = true }
+hyper-util = { workspace = true, features = ["client", "client-legacy", "http1", "tokio"], optional = true }
+hyper-rustls = { workspace = true, features = ["http1", "logging", "native-tokio", "tls12"], optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+tower = { workspace = true, features = ["buffer", "filter", "util", "retry"], optional = true }
+tower-http = { workspace = true, features = ["auth", "map-response-body", "trace", "util"], optional = true }
+hyper-timeout = { workspace = true, optional = true }
+tame-oauth = { workspace = true, features = ["gcp"], optional = true }
+secrecy = { workspace = true }
+tracing = { workspace = true, features = ["log"], optional = true }
+hyper-openssl = { workspace = true, features = ["client-legacy", "tokio"], optional = true }
+form_urlencoded = { workspace = true, optional = true }
+k8s-openapi= { workspace = true, features = [] }
 
 [dev-dependencies]
-tempfile = "3.1.0"
-schemars = "0.8.6"
-tower-test = "0.4.0"
-
-[dev-dependencies.k8s-openapi]
-version = "0.14.0"
-default-features = false
-features = ["v1_22"]
+hyper = { workspace = true, features = ["server"] }
+kube = { path = "../kube", features = ["derive", "client", "ws"], version = ">=4" }
+tempfile.workspace = true
+futures = { workspace = true, features = ["async-await"] }
+tokio = { workspace = true, features = ["full"] }
+schemars.workspace = true
+tokio-test.workspace = true
+tower-test.workspace = true
+k8s-openapi= { workspace = true, features = ["latest"] }

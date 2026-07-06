@@ -1,37 +1,86 @@
-#[macro_use] extern crate log;
-use futures::{pin_mut, TryStreamExt};
-use k8s_openapi::api::core::v1::Event;
-use kube::{
-    api::{Api, ListParams},
-    runtime::{utils::try_flatten_applied, watcher},
-    Client,
+use std::pin::pin;
+
+use futures::StreamExt;
+use k8s_openapi::{
+    api::{core::v1::ObjectReference, events::v1::Event},
+    apimachinery::pkg::apis::meta::v1::Time,
+    jiff,
+    jiff::{SpanRound, Timestamp, Unit},
 };
+use kube::{
+    Api, Client, ResourceExt,
+    runtime::{WatchStreamExt, watcher},
+};
+
+/// limited variant of `kubectl events` that works on current context's namespace
+///
+/// requires a new enough cluster that apis/events.k8s.io/v1 work (kubectl uses corev1::Event)
+/// for old style usage of core::v1::Event see node_watcher
+#[derive(clap::Parser)]
+struct App {
+    /// Filter by object and kind
+    ///
+    /// Using --for=Pod/blog-xxxxx
+    /// Note that kind name is case sensitive
+    #[arg(long)]
+    r#for: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    std::env::set_var("RUST_LOG", "info,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
+    let app: App = clap::Parser::parse();
 
-    let events: Api<Event> = Api::all(client);
-    let lp = ListParams::default();
+    let events: Api<Event> = Api::default_namespaced(client);
+    let mut conf = watcher::Config::default();
+    if let Some(forval) = app.r#for {
+        if let Some((kind, name)) = forval.split_once('/') {
+            conf = conf.fields(&format!("regarding.kind={kind},regarding.name={name}"));
+        } else {
+            return Err(anyhow::Error::msg("Usage: --for=<KIND>/<NAME>"));
+        }
+    }
+    let event_stream = watcher(events, conf).default_backoff().applied_objects();
+    let mut event_stream = pin!(event_stream);
 
-    let ew = try_flatten_applied(watcher(events, lp));
-
-    pin_mut!(ew);
-    while let Some(event) = ew.try_next().await? {
-        handle_event(event)?;
+    fn print_event(age: &str, reason: &str, obj: &str, note: &str) {
+        println!("{age:<6} {reason:<15} {obj:<55} {note}");
+    }
+    print_event("AGE", "REASON", "OBJECT", "MESSAGE");
+    while let Some(ev) = event_stream.next().await {
+        match ev {
+            Ok(ev) => {
+                let age = ev
+                    .creation_timestamp()
+                    .map(format_creation)
+                    .transpose()?
+                    .unwrap_or_default();
+                let reason = ev.reason.unwrap_or_default();
+                let obj = ev.regarding.and_then(format_objref).unwrap_or_default();
+                let note = ev.note.unwrap_or_default();
+                print_event(&age, &reason, &obj, &note);
+            }
+            Err(err) => eprintln!("{:?}", anyhow::Error::new(err)),
+        }
     }
     Ok(())
 }
 
-// This function lets the app handle an added/modified event from k8s
-fn handle_event(ev: Event) -> anyhow::Result<()> {
-    info!(
-        "New Event: {} (via {} {})",
-        ev.message.unwrap(),
-        ev.involved_object.kind.unwrap(),
-        ev.involved_object.name.unwrap()
-    );
-    Ok(())
+fn format_objref(oref: ObjectReference) -> Option<String> {
+    Some(format!("{}/{}", oref.kind?, oref.name?))
+}
+
+fn format_creation(time: Time) -> Result<String, jiff::Error> {
+    let dur = Timestamp::now().since(time.0)?.round(
+        SpanRound::new()
+            .largest(Unit::Day)
+            .days_are_24_hours()
+            .smallest(Unit::Minute),
+    )?;
+    Ok(match (dur.get_days(), dur.get_hours(), dur.get_minutes()) {
+        (days, _, _) if days > 0 => format!("{days}d"),
+        (_, hours, _) if hours > 0 => format!("{hours}h"),
+        (_, _, mins) => format!("{mins}m"),
+    })
 }

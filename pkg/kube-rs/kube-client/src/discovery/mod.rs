@@ -1,7 +1,7 @@
 //! High-level utilities for runtime API discovery.
 
 use crate::{Client, Result};
-pub use kube_core::discovery::{verbs, ApiCapabilities, ApiResource, Scope};
+pub use kube_core::discovery::{ApiCapabilities, ApiResource, Scope, verbs};
 use kube_core::gvk::GroupVersionKind;
 use std::collections::HashMap;
 mod apigroup;
@@ -21,7 +21,6 @@ enum DiscoveryMode {
 }
 
 impl DiscoveryMode {
-    #[allow(clippy::ptr_arg)] // hashmap complains on &str here
     fn is_queryable(&self, group: &String) -> bool {
         match &self {
             Self::Allow(allowed) => allowed.contains(group),
@@ -49,7 +48,7 @@ impl DiscoveryMode {
 /// If caching of results is __not required__, then a simpler [`oneshot`](crate::discovery::oneshot) discovery system can be used.
 ///
 /// [`ApiGroup`]: crate::discovery::ApiGroup
-#[cfg_attr(docsrs, doc(cfg(any(feature = "client", feature = "client-wasi"))))]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
 pub struct Discovery {
     client: Client,
     groups: HashMap<String, ApiGroup>,
@@ -87,6 +86,9 @@ impl Discovery {
     /// The cache is empty cleared when this is started. By default, every api group found is checked,
     /// causing `N+2` queries to the api server (where `N` is number of api groups).
     ///
+    /// **Note**: Consider using [`Discovery::run_aggregated`] instead, which only requires
+    /// 2 API calls regardless of the number of groups (requires Kubernetes 1.26+).
+    ///
     /// ```no_run
     /// use kube::{Client, api::{Api, DynamicObject}, discovery::{Discovery, verbs, Scope}, ResourceExt};
     /// #[tokio::main]
@@ -101,14 +103,14 @@ impl Discovery {
     ///             let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
     ///             // can now api.list() to emulate kubectl get all --all
     ///             for obj in api.list(&Default::default()).await? {
-    ///                 println!("{} {}: {}", ar.api_version, ar.kind, obj.name());
+    ///                 println!("{} {}: {}", ar.api_version, ar.kind, obj.name_any());
     ///             }
     ///         }
     ///     }
     ///     Ok(())
     /// }
     /// ```
-    /// See a bigger example in [examples/dynamic.api](https://github.com/kube-rs/kube-rs/blob/master/examples/dynamic_api.rs)
+    /// See a bigger example in [examples/dynamic.api](https://github.com/kube-rs/kube/blob/main/examples/dynamic_api.rs)
     pub async fn run(mut self) -> Result<Self> {
         self.groups.clear();
         let api_groups = self.client.list_api_groups().await?;
@@ -129,6 +131,73 @@ impl Discovery {
         }
         Ok(self)
     }
+
+    /// Runs discovery using the Aggregated Discovery API
+    ///
+    /// This method uses the Aggregated Discovery API (available since Kubernetes 1.26, stable in 1.30)
+    /// to fetch all API resources in just 2 requests instead of N+2 requests.
+    ///
+    /// The Aggregated Discovery API provides all resource information in the response to `/api` and `/apis`
+    /// when the appropriate Accept header is set, eliminating the need to query each group individually.
+    ///
+    /// ```no_run
+    /// use kube::{Client, api::{Api, DynamicObject}, discovery::{Discovery, verbs, Scope}, ResourceExt};
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let client = Client::try_default().await?;
+    ///     // Uses only 2 API calls instead of N+2
+    ///     let discovery = Discovery::new(client.clone()).run_aggregated().await?;
+    ///     for group in discovery.groups() {
+    ///         for (ar, caps) in group.recommended_resources() {
+    ///             if !caps.supports_operation(verbs::LIST) {
+    ///                 continue;
+    ///             }
+    ///             let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+    ///             for obj in api.list(&Default::default()).await? {
+    ///                 println!("{} {}: {}", ar.api_version, ar.kind, obj.name_any());
+    ///             }
+    ///         }
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Requirements
+    /// - Kubernetes 1.26+ (beta) or 1.30+ (stable)
+    ///
+    /// # Note
+    /// If the server does not support Aggregated Discovery, this will return an error.
+    /// Consider falling back to [`Discovery::run`] in that case.
+    pub async fn run_aggregated(mut self) -> Result<Self> {
+        self.groups.clear();
+
+        // Query /apis for all non-core groups (single request)
+        let apis_discovery = self.client.list_api_groups_aggregated().await?;
+        for ag in apis_discovery.items {
+            let key = ag
+                .metadata
+                .as_ref()
+                .and_then(|m| m.name.clone())
+                .unwrap_or_default();
+            if self.mode.is_queryable(&key) {
+                let apigroup = ApiGroup::from_v2(ag)?;
+                self.groups.insert(key, apigroup);
+            }
+        }
+
+        // Query /api for core group (single request)
+        let corekey = ApiGroup::CORE_GROUP.to_string();
+        if self.mode.is_queryable(&corekey) {
+            let core_discovery = self.client.list_core_api_versions_aggregated().await?;
+            // Core group is the first (and usually only) item
+            if let Some(core_ag) = core_discovery.items.into_iter().next() {
+                let apigroup = ApiGroup::from_v2(core_ag)?;
+                self.groups.insert(corekey, apigroup);
+            }
+        }
+
+        Ok(self)
+    }
 }
 
 /// Interface to the Discovery cache
@@ -136,6 +205,16 @@ impl Discovery {
     /// Returns iterator over all served groups
     pub fn groups(&self) -> impl Iterator<Item = &ApiGroup> {
         self.groups.values()
+    }
+
+    /// Returns a sorted vector of all served groups
+    ///
+    /// This vector is in kubectl's normal alphabetical group order
+    pub fn groups_alphabetical(&self) -> Vec<&ApiGroup> {
+        let mut values: Vec<_> = self.groups().collect();
+        // collect to maintain kubectl order of groups
+        values.sort_by_key(|g| g.name());
+        values
     }
 
     /// Returns the [`ApiGroup`] for a given group if served

@@ -1,20 +1,19 @@
-#[macro_use] extern crate log;
+//! Generated types support documentation
+#![deny(missing_docs)]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::*;
 
 use apiexts::CustomResourceDefinition;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiexts;
 
 use kube::{
+    Client, CustomResource, CustomResourceExt,
     api::{Api, Patch, PatchParams, ResourceExt},
     runtime::wait::{await_condition, conditions},
-    Client, CustomResource, CustomResourceExt,
 };
 
-// NB: This example uses server side apply and beta1 customresources
-// Please test against Kubernetes 1.16.X!
-
-// Own custom resource
+/// Spec object for Foo
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[kube(group = "clux.dev", version = "v1", kind = "Foo", namespaced)]
 #[kube(status = "FooStatus")]
@@ -25,6 +24,7 @@ pub struct FooSpec {
     replicas: isize,
 }
 
+/// Status object for Foo
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 pub struct FooStatus {
     is_bad: bool,
@@ -33,17 +33,15 @@ pub struct FooStatus {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    std::env::set_var("RUST_LOG", "info,kube=info");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
-    let namespace = std::env::var("NAMESPACE").unwrap_or_else(|_| "default".into());
 
     let ssapply = PatchParams::apply("crd_apply_example").force();
 
     // 0. Ensure the CRD is installed (you probably just want to do this on CI)
     // (crd file can be created by piping `Foo::crd`'s yaml ser to kubectl apply)
     let crds: Api<CustomResourceDefinition> = Api::all(client.clone());
-    info!("Creating crd: {}", serde_yaml::to_string(&Foo::crd())?);
+    info!("Creating crd: {}", serde_saphyr::to_string(&Foo::crd())?);
     crds.patch("foos.clux.dev", &ssapply, &Patch::Apply(Foo::crd()))
         .await?;
 
@@ -52,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), establish).await?;
 
     // Start applying foos
-    let foos: Api<Foo> = Api::namespaced(client.clone(), &namespace);
+    let foos: Api<Foo> = Api::default_namespaced(client.clone());
 
     // 1. Apply from a full struct (e.g. equivalent to replace w/o resource_version)
     let foo = Foo::new("baz", FooSpec {
@@ -60,10 +58,10 @@ async fn main() -> anyhow::Result<()> {
         info: Some("old baz".into()),
         replicas: 3,
     });
-    info!("Applying 1: \n{}", serde_yaml::to_string(&foo)?);
+    info!("Applying 1: \n{}", serde_saphyr::to_string(&foo)?);
     let o = foos.patch("baz", &ssapply, &Patch::Apply(&foo)).await?;
     // NB: kubernetes < 1.20 will fail to admit scale subresources - see #387
-    info!("Applied 1 {}: {:?}", o.name(), o.spec);
+    info!("Applied 1 {}: {:?}", o.name_any(), o.spec);
 
     // 2. Apply from partial json!
     let patch = serde_json::json!({
@@ -75,9 +73,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!("Applying 2: \n{}", serde_yaml::to_string(&patch)?);
+    info!("Applying 2: \n{}", serde_saphyr::to_string(&patch)?);
     let o2 = foos.patch("baz", &ssapply, &Patch::Apply(patch)).await?;
-    info!("Applied 2 {}: {:?}", o2.name(), o2.spec);
+    info!("Applied 2 {}: {:?}", o2.name_any(), o2.spec);
 
     Ok(())
 }

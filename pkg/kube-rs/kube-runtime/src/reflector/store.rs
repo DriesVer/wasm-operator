@@ -1,10 +1,20 @@
-use super::ObjectRef;
-use crate::watcher;
+//! A reader/writer split store for reflectors
+use super::{Lookup, ObjectRef, dispatcher::Dispatcher};
+#[cfg(feature = "unstable-runtime-subscribe")]
+use crate::reflector::ReflectHandle;
+use crate::{
+    utils::delayed_init::{self, DelayedInit},
+    watcher,
+};
 use ahash::AHashMap;
-use derivative::Derivative;
-use kube_client::Resource;
+use educe::Educe;
+use kube_client::{
+    ResourceExt,
+    core::{Selector, SelectorExt},
+};
 use parking_lot::RwLock;
 use std::{fmt::Debug, hash::Hash, sync::Arc};
+use thiserror::Error;
 
 type Cache<K> = Arc<RwLock<AHashMap<ObjectRef<K>, Arc<K>>>>;
 
@@ -12,17 +22,20 @@ type Cache<K> = Arc<RwLock<AHashMap<ObjectRef<K>, Arc<K>>>>;
 ///
 /// This is exclusive since it's not safe to share a single `Store` between multiple reflectors.
 /// In particular, `Restarted` events will clobber the state of other connected reflectors.
-#[derive(Debug, Derivative)]
-#[derivative(Default(bound = "K::DynamicType: Default"))]
-pub struct Writer<K: 'static + Resource>
+#[derive(Debug)]
+pub struct Writer<K: 'static + Lookup + Clone>
 where
-    K::DynamicType: Eq + Hash,
+    K::DynamicType: Eq + Hash + Clone,
 {
     store: Cache<K>,
+    buffer: AHashMap<ObjectRef<K>, Arc<K>>,
     dyntype: K::DynamicType,
+    ready_tx: Option<delayed_init::Initializer<()>>,
+    ready_rx: Arc<DelayedInit<()>>,
+    dispatcher: Option<Dispatcher<K>>,
 }
 
-impl<K: 'static + Resource + Clone> Writer<K>
+impl<K: 'static + Lookup + Clone> Writer<K>
 where
     K::DynamicType: Eq + Hash + Clone,
 {
@@ -31,9 +44,36 @@ where
     /// If the dynamic type is default-able (for example when writer is used with
     /// `k8s_openapi` types) you can use `Default` instead.
     pub fn new(dyntype: K::DynamicType) -> Self {
+        let (ready_tx, ready_rx) = DelayedInit::new();
         Writer {
             store: Default::default(),
+            buffer: Default::default(),
             dyntype,
+            ready_tx: Some(ready_tx),
+            ready_rx: Arc::new(ready_rx),
+            dispatcher: None,
+        }
+    }
+
+    /// Creates a new Writer with the specified dynamic type and buffer size.
+    ///
+    /// When the Writer is created through `new_shared`, it will be able to
+    /// be subscribed. Stored objects will be propagated to all subscribers. The
+    /// buffer size is used for the underlying channel. An object is cleared
+    /// from the buffer only when all subscribers have seen it.
+    ///
+    /// If the dynamic type is default-able (for example when writer is used with
+    /// `k8s_openapi` types) you can use `Default` instead.
+    #[cfg(feature = "unstable-runtime-subscribe")]
+    pub fn new_shared(buf_size: usize, dyntype: K::DynamicType) -> Self {
+        let (ready_tx, ready_rx) = DelayedInit::new();
+        Writer {
+            store: Default::default(),
+            buffer: Default::default(),
+            dyntype,
+            ready_tx: Some(ready_tx),
+            ready_rx: Arc::new(ready_rx),
+            dispatcher: Some(Dispatcher::new(buf_size)),
         }
     }
 
@@ -45,34 +85,98 @@ where
     pub fn as_reader(&self) -> Store<K> {
         Store {
             store: self.store.clone(),
+            ready_rx: self.ready_rx.clone(),
         }
+    }
+
+    /// Return a handle to a subscriber
+    ///
+    /// Multiple subscribe handles may be obtained, by either calling
+    /// `subscribe` multiple times, or by calling `clone()`
+    ///
+    /// This function returns a `Some` when the [`Writer`] is constructed through
+    /// [`Writer::new_shared`] or [`store_shared`], and a `None` otherwise.
+    #[cfg(feature = "unstable-runtime-subscribe")]
+    pub fn subscribe(&self) -> Option<ReflectHandle<K>> {
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.subscribe(self.as_reader()))
     }
 
     /// Applies a single watcher event to the store
     pub fn apply_watcher_event(&mut self, event: &watcher::Event<K>) {
         match event {
-            watcher::Event::Applied(obj) => {
-                let key = ObjectRef::from_obj_with(obj, self.dyntype.clone());
+            watcher::Event::Apply(obj) => {
+                let key = obj.to_object_ref(self.dyntype.clone());
                 let obj = Arc::new(obj.clone());
                 self.store.write().insert(key, obj);
             }
-            watcher::Event::Deleted(obj) => {
-                let key = ObjectRef::from_obj_with(obj, self.dyntype.clone());
+            watcher::Event::Delete(obj) => {
+                let key = obj.to_object_ref(self.dyntype.clone());
                 self.store.write().remove(&key);
             }
-            watcher::Event::Restarted(new_objs) => {
-                let new_objs = new_objs
-                    .iter()
-                    .map(|obj| {
-                        (
-                            ObjectRef::from_obj_with(obj, self.dyntype.clone()),
-                            Arc::new(obj.clone()),
-                        )
-                    })
-                    .collect::<AHashMap<_, _>>();
-                *self.store.write() = new_objs;
+            watcher::Event::Init => {
+                self.buffer = AHashMap::new();
+            }
+            watcher::Event::InitApply(obj) => {
+                let key = obj.to_object_ref(self.dyntype.clone());
+                let obj = Arc::new(obj.clone());
+                self.buffer.insert(key, obj);
+            }
+            watcher::Event::InitDone => {
+                let mut store = self.store.write();
+
+                // Swap the buffer into the store
+                std::mem::swap(&mut *store, &mut self.buffer);
+
+                // Clear the buffer
+                // This is preferred over self.buffer.clear(), as clear() will keep the allocated memory for reuse.
+                // This way, the old buffer is dropped.
+                self.buffer = AHashMap::new();
+
+                // Mark as ready after the Restart, "releasing" any calls to Store::wait_until_ready()
+                if let Some(ready_tx) = self.ready_tx.take() {
+                    ready_tx.init(())
+                }
             }
         }
+    }
+
+    /// Broadcast an event to any downstream listeners subscribed on the store
+    pub(crate) async fn dispatch_event(&mut self, event: &watcher::Event<K>) {
+        if let Some(ref mut dispatcher) = self.dispatcher {
+            match event {
+                watcher::Event::Apply(obj) => {
+                    let obj_ref = obj.to_object_ref(self.dyntype.clone());
+                    // TODO (matei): should this take a timeout to log when backpressure has
+                    // been applied for too long, e.g. 10s
+                    dispatcher.broadcast(obj_ref).await;
+                }
+
+                watcher::Event::InitDone => {
+                    let obj_refs: Vec<_> = {
+                        let store = self.store.read();
+                        store.keys().cloned().collect()
+                    };
+
+                    for obj_ref in obj_refs {
+                        dispatcher.broadcast(obj_ref).await;
+                    }
+                }
+
+                _ => {}
+            }
+        }
+    }
+}
+
+impl<K> Default for Writer<K>
+where
+    K: Lookup + Clone + 'static,
+    K::DynamicType: Default + Eq + Hash + Clone,
+{
+    fn default() -> Self {
+        Self::new(K::DynamicType::default())
     }
 }
 
@@ -82,19 +186,36 @@ where
 ///
 /// Cannot be constructed directly since one writer handle is required,
 /// use `Writer::as_reader()` instead.
-#[derive(Derivative)]
-#[derivative(Debug(bound = "K: Debug, K::DynamicType: Debug"), Clone)]
-pub struct Store<K: 'static + Resource>
+#[derive(Educe)]
+#[educe(Debug(bound("K: Debug, K::DynamicType: Debug")), Clone)]
+pub struct Store<K: 'static + Lookup>
 where
     K::DynamicType: Hash + Eq,
 {
     store: Cache<K>,
+    ready_rx: Arc<DelayedInit<()>>,
 }
 
-impl<K: 'static + Clone + Resource> Store<K>
+/// The error returned by `Store::wait_until_ready`
+#[derive(Debug, Error)]
+#[error("writer was dropped before store became ready")]
+pub struct WriterDropped(delayed_init::InitDropped);
+
+impl<K: 'static + Clone + Lookup> Store<K>
 where
     K::DynamicType: Eq + Hash + Clone,
 {
+    /// Wait for the store to be populated by Kubernetes.
+    ///
+    /// Note that polling this will _not_ await the source of the stream that populates the [`Writer`].
+    /// The [`reflector`](crate::reflector()) stream must be awaited separately.
+    ///
+    /// # Errors
+    /// Returns an error if the [`Writer`] was dropped before any value was written.
+    pub async fn wait_until_ready(&self) -> Result<(), WriterDropped> {
+        self.ready_rx.get().await.map_err(WriterDropped)
+    }
+
     /// Retrieve a `clone()` of the entry referred to by `key`, if it is in the cache.
     ///
     /// `key.namespace` is ignored for cluster-scoped resources.
@@ -127,11 +248,107 @@ where
         let s = self.store.read();
         s.values().cloned().collect()
     }
+
+    /// Retrieve a `clone()` of the entry found by the given predicate
+    #[must_use]
+    pub fn find<P>(&self, predicate: P) -> Option<Arc<K>>
+    where
+        P: Fn(&K) -> bool,
+    {
+        self.store
+            .read()
+            .values()
+            .find(|k| predicate(k.as_ref()))
+            .cloned()
+    }
+
+    /// Return a filtered snapshot of the current values, retaining only objects matching `predicate`
+    ///
+    /// Note: the store read lock is held for the entire duration of predicate evaluation.
+    /// Avoid blocking or expensive operations inside the predicate.
+    #[must_use]
+    pub fn state_filter<P>(&self, predicate: P) -> Vec<Arc<K>>
+    where
+        P: Fn(&K) -> bool,
+    {
+        self.store
+            .read()
+            .values()
+            .filter(|k| predicate(k.as_ref()))
+            .cloned()
+            .collect()
+    }
+
+    /// Return a filtered snapshot of the current values, retaining only objects whose labels match `selector`
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use k8s_openapi::api::core::v1::ConfigMap;
+    /// # use kube_client::core::{Expression, Selector};
+    /// # let (reader, _writer) = kube_runtime::reflector::store::<ConfigMap>();
+    /// let selector: Selector = Expression::Equal("app".into(), "nginx".into()).into();
+    /// let result = reader.state_filter_selector(&selector);
+    /// ```
+    #[must_use]
+    pub fn state_filter_selector(&self, selector: &Selector) -> Vec<Arc<K>>
+    where
+        K: ResourceExt,
+    {
+        self.state_filter(|k| selector.matches(k.labels()))
+    }
+
+    /// Return the number of elements in the store
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.store.read().len()
+    }
+
+    /// Return whether the store is empty
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.store.read().is_empty()
+    }
+}
+
+/// Create a (Reader, Writer) for a `Store<K>` for a typed resource `K`
+///
+/// The `Writer` should be passed to a [`reflector`](crate::reflector()),
+/// and the [`Store`] is a read-only handle.
+#[must_use]
+pub fn store<K>() -> (Store<K>, Writer<K>)
+where
+    K: Lookup + Clone + 'static,
+    K::DynamicType: Eq + Hash + Clone + Default,
+{
+    let w = Writer::<K>::default();
+    let r = w.as_reader();
+    (r, w)
+}
+
+/// Create a (Reader, Writer) for a `Store<K>` for a typed resource `K`
+///
+/// The resulting `Writer` can be subscribed on in order to fan out events from
+/// a watcher. The `Writer` should be passed to a [`reflector`](crate::reflector()),
+/// and the [`Store`] is a read-only handle.
+///
+/// A buffer size is used for the underlying message channel. When the buffer is
+/// full, backpressure will be applied by waiting for capacity.
+#[must_use]
+#[cfg(feature = "unstable-runtime-subscribe")]
+pub fn store_shared<K>(buf_size: usize) -> (Store<K>, Writer<K>)
+where
+    K: Lookup + Clone + 'static,
+    K::DynamicType: Eq + Hash + Clone + Default,
+{
+    let w = Writer::<K>::new_shared(buf_size, Default::default());
+    let r = w.as_reader();
+    (r, w)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Writer;
+    use super::{Writer, store};
     use crate::{reflector::ObjectRef, watcher};
     use k8s_openapi::api::core::v1::ConfigMap;
     use kube_client::api::ObjectMeta;
@@ -147,7 +364,7 @@ mod tests {
             ..ConfigMap::default()
         };
         let mut store_w = Writer::default();
-        store_w.apply_watcher_event(&watcher::Event::Applied(cm.clone()));
+        store_w.apply_watcher_event(&watcher::Event::Apply(cm.clone()));
         let store = store_w.as_reader();
         assert_eq!(store.get(&ObjectRef::from_obj(&cm)).as_deref(), Some(&cm));
     }
@@ -165,7 +382,7 @@ mod tests {
         let mut cluster_cm = cm.clone();
         cluster_cm.metadata.namespace = None;
         let mut store_w = Writer::default();
-        store_w.apply_watcher_event(&watcher::Event::Applied(cm));
+        store_w.apply_watcher_event(&watcher::Event::Apply(cm));
         let store = store_w.as_reader();
         assert_eq!(store.get(&ObjectRef::from_obj(&cluster_cm)), None);
     }
@@ -180,9 +397,8 @@ mod tests {
             },
             ..ConfigMap::default()
         };
-        let mut store_w = Writer::default();
-        store_w.apply_watcher_event(&watcher::Event::Applied(cm.clone()));
-        let store = store_w.as_reader();
+        let (store, mut writer) = store();
+        writer.apply_watcher_event(&watcher::Event::Apply(cm.clone()));
         assert_eq!(store.get(&ObjectRef::from_obj(&cm)).as_deref(), Some(&cm));
     }
 
@@ -199,8 +415,107 @@ mod tests {
         let mut nsed_cm = cm.clone();
         nsed_cm.metadata.namespace = Some("ns".to_string());
         let mut store_w = Writer::default();
-        store_w.apply_watcher_event(&watcher::Event::Applied(cm.clone()));
+        store_w.apply_watcher_event(&watcher::Event::Apply(cm.clone()));
         let store = store_w.as_reader();
         assert_eq!(store.get(&ObjectRef::from_obj(&nsed_cm)).as_deref(), Some(&cm));
+    }
+
+    #[test]
+    fn state_filter_filters_by_predicate() {
+        let (reader, mut writer) = store::<ConfigMap>();
+
+        let cm1 = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("cm1".to_string()),
+                namespace: Some("ns".to_string()),
+                labels: Some([("app".to_string(), "nginx".to_string())].into()),
+                ..ObjectMeta::default()
+            },
+            ..ConfigMap::default()
+        };
+        let cm2 = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("cm2".to_string()),
+                namespace: Some("ns".to_string()),
+                labels: Some([("app".to_string(), "postgres".to_string())].into()),
+                ..ObjectMeta::default()
+            },
+            ..ConfigMap::default()
+        };
+
+        writer.apply_watcher_event(&watcher::Event::Apply(cm1.clone()));
+        writer.apply_watcher_event(&watcher::Event::Apply(cm2));
+
+        let result = reader.state_filter(|k| {
+            k.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("app"))
+                .is_some_and(|v| v == "nginx")
+        });
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_ref(), &cm1);
+    }
+
+    #[test]
+    fn state_filter_selector_filters_by_label_selector() {
+        use kube_client::core::{Expression, Selector};
+
+        let (reader, mut writer) = store::<ConfigMap>();
+
+        let cm1 = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("cm1".to_string()),
+                namespace: Some("ns".to_string()),
+                labels: Some([("app".to_string(), "nginx".to_string())].into()),
+                ..ObjectMeta::default()
+            },
+            ..ConfigMap::default()
+        };
+        let cm2 = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("cm2".to_string()),
+                namespace: Some("ns".to_string()),
+                labels: Some([("app".to_string(), "postgres".to_string())].into()),
+                ..ObjectMeta::default()
+            },
+            ..ConfigMap::default()
+        };
+
+        writer.apply_watcher_event(&watcher::Event::Apply(cm1.clone()));
+        writer.apply_watcher_event(&watcher::Event::Apply(cm2));
+
+        let selector: Selector = Expression::Equal("app".into(), "nginx".into()).into();
+        let result = reader.state_filter_selector(&selector);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_ref(), &cm1);
+    }
+
+    #[test]
+    fn find_element_in_store() {
+        let cm = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("obj".to_string()),
+                namespace: None,
+                ..ObjectMeta::default()
+            },
+            ..ConfigMap::default()
+        };
+        let mut target_cm = cm.clone();
+
+        let (reader, mut writer) = store::<ConfigMap>();
+        assert!(reader.is_empty());
+        writer.apply_watcher_event(&watcher::Event::Apply(cm));
+
+        assert_eq!(reader.len(), 1);
+        assert!(reader.find(|k| k.metadata.generation == Some(1234)).is_none());
+
+        target_cm.metadata.name = Some("obj1".to_string());
+        target_cm.metadata.generation = Some(1234);
+        writer.apply_watcher_event(&watcher::Event::Apply(target_cm.clone()));
+        assert!(!reader.is_empty());
+        assert_eq!(reader.len(), 2);
+        let found = reader.find(|k| k.metadata.generation == Some(1234));
+        assert_eq!(found.as_deref(), Some(&target_cm));
     }
 }

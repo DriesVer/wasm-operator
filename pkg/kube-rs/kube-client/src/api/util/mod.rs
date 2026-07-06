@@ -1,14 +1,15 @@
 use crate::{
-    api::{Api, Resource},
     Error, Result,
+    api::{Api, Resource},
 };
-use k8s_openapi::api::core::v1::Node;
-use kube_core::util::Restart;
+use k8s_openapi::api::{
+    authentication::v1::TokenRequest,
+    core::v1::{Node, ServiceAccount},
+};
+use kube_core::{params::PostParams, util::Restart};
 use serde::de::DeserializeOwned;
 
-k8s_openapi::k8s_if_ge_1_19! {
-    mod csr;
-}
+mod csr;
 
 impl<K> Api<K>
 where
@@ -38,29 +39,50 @@ impl Api<Node> {
     }
 }
 
+impl Api<ServiceAccount> {
+    /// Create a TokenRequest of a ServiceAccount
+    pub async fn create_token_request(
+        &self,
+        name: &str,
+        pp: &PostParams,
+        token_request: &TokenRequest,
+    ) -> Result<TokenRequest> {
+        let bytes = serde_json::to_vec(token_request).map_err(Error::SerdeError)?;
+        let mut req = self
+            .request
+            .create_subresource("token", name, pp, bytes)
+            .map_err(Error::BuildRequest)?;
+        req.extensions_mut().insert("create_token_request");
+        self.client.request::<TokenRequest>(req).await
+    }
+}
+
 // Tests that require a cluster and the complete feature set
 // Can be run with `cargo test -p kube-client --lib -- --ignored`
 #[cfg(test)]
-#[cfg(all(feature = "client"))]
+#[cfg(feature = "client")]
 mod test {
     use crate::{
-        api::{Api, DeleteParams, ListParams, PostParams},
         Client,
+        api::{Api, DeleteParams, ListParams, PostParams},
     };
-    use k8s_openapi::api::core::v1::Node;
+    use k8s_openapi::api::{
+        authentication::v1::{TokenRequest, TokenRequestSpec, TokenReview, TokenReviewSpec},
+        core::v1::{Node, ServiceAccount},
+    };
     use serde_json::json;
 
     #[tokio::test]
-    #[ignore] // needs kubeconfig
+    #[ignore = "needs kubeconfig"]
     async fn node_cordon_and_uncordon_works() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::try_default().await?;
 
         let node_name = "fakenode";
         let fake_node = serde_json::from_value(json!({
-        "apiVersion": "v1",
-        "kind": "Node",
-        "metadata": {
-            "name": node_name,
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": node_name,
             },
         }))?;
 
@@ -79,6 +101,80 @@ mod test {
         let nodes_after_uncordon = nodes.list(&schedulables).await?;
         assert_eq!(nodes_after_uncordon.items.len(), num_nodes_before_cordon);
         nodes.delete(node_name, &DeleteParams::default()).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a cluster"]
+    async fn create_token_request() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::try_default().await?;
+
+        let serviceaccount_name = "fakesa";
+        let serviceaccount_namespace = "default";
+        let audiences = vec!["api".to_string()];
+
+        let serviceaccounts: Api<ServiceAccount> = Api::namespaced(client.clone(), serviceaccount_namespace);
+        let tokenreviews: Api<TokenReview> = Api::all(client);
+
+        // Create ServiceAccount
+        let fake_sa = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {
+                "name": serviceaccount_name,
+            },
+        }))?;
+        serviceaccounts.create(&PostParams::default(), &fake_sa).await?;
+
+        // Create TokenRequest
+        let tokenrequest = serviceaccounts
+            .create_token_request(
+                serviceaccount_name,
+                &PostParams::default(),
+                &TokenRequest {
+                    metadata: Default::default(),
+                    spec: Some(TokenRequestSpec {
+                        audiences: Some(audiences.clone()),
+                        bound_object_ref: None,
+                        expiration_seconds: None,
+                    }),
+                    status: None,
+                },
+            )
+            .await?;
+        let token = tokenrequest.status.unwrap().token.unwrap();
+        assert!(!token.is_empty());
+
+        // Check created token is valid with TokenReview
+        let tokenreview = tokenreviews
+            .create(
+                &PostParams::default(),
+                &TokenReview {
+                    metadata: Default::default(),
+                    spec: TokenReviewSpec {
+                        audiences: Some(audiences.clone()),
+                        token,
+                    },
+                    status: None,
+                },
+            )
+            .await?;
+        let tokenreviewstatus = tokenreview.status.unwrap();
+        assert_eq!(tokenreviewstatus.audiences, Some(audiences));
+        assert_eq!(tokenreviewstatus.authenticated, Some(true));
+        assert_eq!(tokenreviewstatus.error, None);
+        assert_eq!(
+            tokenreviewstatus.user.unwrap().username,
+            Some(format!(
+                "system:serviceaccount:{serviceaccount_namespace}:{serviceaccount_name}"
+            ))
+        );
+
+        // Cleanup ServiceAccount
+        serviceaccounts
+            .delete(serviceaccount_name, &DeleteParams::default())
+            .await?;
+
         Ok(())
     }
 }

@@ -1,70 +1,96 @@
 [package]
 name = "kube-examples"
-version = "0.1.0"
-authors = [
-  "clux <sszynrae@gmail.com>",
-  "Teo Klestrup Röijezon <teo@nullable.se>",
-  "kazk <kazk.dev@gmail.com>",
-]
 publish = false
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [package.metadata.release]
 release = false
 
 [features]
-default = ["openssl-tls", "kubederive", "ws", "latest", "runtime"]
+default = [
+    "rustls-tls",
+    "kubederive",
+    "ws",
+    "latest",
+    "socks5",
+    "runtime",
+    "refresh",
+]
 kubederive = ["kube/derive"]
-openssl-tls = ["kube/client", "kube/openssl-tls"]
-rustls-tls = ["kube/client", "kube/rustls-tls"]
-runtime = ["kube/runtime"]
+openssl-tls = ["kube/client", "kube/openssl-tls", "kube/unstable-client"]
+rustls-tls = [
+    "kube/client",
+    "kube/rustls-tls",
+    "kube/ring",
+    "kube/unstable-client",
+]
+runtime = ["kube/runtime", "kube/unstable-runtime"]
+schemars-preserve-order = ["schemars/preserve_order"]
+socks5 = ["kube/socks5"]
+refresh = ["kube/oauth", "kube/oidc"]
+kubelet-debug = ["kube/kubelet-debug"]
 ws = ["kube/ws"]
-latest = ["k8s-openapi/v1_22"]
-deprecated = ["kube/deprecated-crd-v1beta1", "k8s-openapi/v1_21"]
+latest = ["k8s-openapi/latest"]
+cel = ["kube/cel"]
 
 [dev-dependencies]
-tokio-util = "0.7.0"
-assert-json-diff = "2.0.1"
-validator = { version = "0.14.0", features = ["derive"] }
-anyhow = "1.0.44"
-env_logger = "0.9.0"
-futures = "0.3.17"
-jsonpath_lib = "0.3.0"
-kube = { path = "../kube", version = "^0.71.0", default-features = false, features = ["admission"] }
-kube-derive = { path = "../kube-derive", version = "^0.71.0", default-features = false } # only needed to opt out of schema
-k8s-openapi = { version = "0.14.0", default-features = false }
-log = "0.4.11"
-serde = { version = "1.0.130", features = ["derive"] }
-serde_json = "1.0.68"
-serde_yaml = "0.8.21"
-tokio = { version = "1.14.0", features = ["full"] }
-either = "1.6.1"
-schemars = "0.8.6"
+tokio-util.workspace = true
+assert-json-diff.workspace = true
+garde = { version = "0.23.0", default-features = false, features = ["derive"] }
+anyhow.workspace = true
+futures = { workspace = true, features = ["async-await"] }
+jsonpath-rust.workspace = true
+kube = { path = "../kube", version = "^4.0.0", default-features = false, features = [
+    "admission",
+] }
+kube-derive = { path = "../kube-derive", version = "^4.0.0", default-features = false } # only needed to opt out of schema
+k8s-openapi.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde-saphyr.workspace = true
+tokio = { workspace = true, features = ["full"] }
+either.workspace = true
+schemars.workspace = true
 static_assertions = "1.1.0"
 tar = "0.4.37"
-tracing = "0.1.29"
-tracing-subscriber = "0.3.3"
-warp = { version = "0.3", default-features = false, features = ["tls"] }
-http = "0.2.5"
-json-patch = "0.2.6"
-tower = { version = "0.4.6", features = ["limit"] }
-tower-http = { version = "0.2.0", features = ["trace", "decompression-gzip"] }
-hyper = { version = "0.14.13", features = ["client", "http1", "stream", "tcp"] }
-thiserror = "1.0.29"
-backoff = "0.4.0"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = "0.8.7"
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+json-patch.workspace = true
+tower = { workspace = true, features = ["limit", "retry", "buffer"] }
+tower-http = { workspace = true, features = ["trace", "decompression-gzip"] }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = [
+    "client-legacy",
+    "http1",
+    "tokio",
+    "tracing",
+] }
+thiserror.workspace = true
+backon.workspace = true
+clap = { version = "4.0", default-features = false, features = [
+    "std",
+    "cargo",
+    "derive",
+] }
+edit = "0.1.3"
+tokio-stream = { version = "0.1.9", features = ["net"] }
+crossterm = "0.29.0"
 
 [[example]]
 name = "configmapgen_controller"
 path = "configmapgen_controller.rs"
 
 [[example]]
-name = "configmap_watcher"
-path = "configmap_watcher.rs"
-
-[[example]]
-name = "configmap_reflector"
-path = "configmap_reflector.rs"
+name = "shared_stream_controllers"
+path = "shared_stream_controllers.rs"
 
 [[example]]
 name = "crd_api"
@@ -79,6 +105,11 @@ name = "crd_derive"
 path = "crd_derive.rs"
 
 [[example]]
+name = "crd_derive_cel"
+path = "crd_derive_cel.rs"
+required-features = ["cel"]
+
+[[example]]
 name = "crd_derive_schema"
 path = "crd_derive_schema.rs"
 
@@ -87,16 +118,16 @@ name = "crd_derive_custom_schema"
 path = "crd_derive_custom_schema.rs"
 
 [[example]]
+name = "crd_derive_multi"
+path = "crd_derive_multi.rs"
+
+[[example]]
 name = "crd_derive_no_schema"
 path = "crd_derive_no_schema.rs"
 
 [[example]]
 name = "crd_reflector"
 path = "crd_reflector.rs"
-
-[[example]]
-name = "deployment_reflector"
-path = "deployment_reflector.rs"
 
 [[example]]
 name = "dynamic_api"
@@ -117,6 +148,10 @@ path = "event_watcher.rs"
 [[example]]
 name = "job_api"
 path = "job_api.rs"
+
+[[example]]
+name = "kubectl"
+path = "kubectl.rs"
 
 [[example]]
 name = "log_stream"
@@ -143,6 +178,15 @@ name = "pod_exec"
 path = "pod_exec.rs"
 
 [[example]]
+name = "pod_log_kubelet_debug"
+path = "pod_log_kubelet_debug.rs"
+required-features = ["kubelet-debug"]
+
+[[example]]
+name = "pod_paged"
+path = "pod_paged.rs"
+
+[[example]]
 name = "pod_evict"
 path = "pod_evict.rs"
 
@@ -163,12 +207,24 @@ name = "pod_portforward_bind"
 path = "pod_portforward_bind.rs"
 
 [[example]]
+name = "pod_resize"
+path = "pod_resize.rs"
+
+[[example]]
 name = "pod_reflector"
 path = "pod_reflector.rs"
 
 [[example]]
 name = "pod_watcher"
 path = "pod_watcher.rs"
+
+[[example]]
+name = "errorbounded_configmap_watcher"
+path = "errorbounded_configmap_watcher.rs"
+
+[[example]]
+name = "request_raw"
+path = "request_raw.rs"
 
 [[example]]
 name = "node_reflector"
@@ -204,5 +260,18 @@ name = "custom_client_trace"
 path = "custom_client_trace.rs"
 
 [[example]]
+name = "custom_client_retry"
+path = "custom_client_retry.rs"
+
+[[example]]
+name = "cert_check"
+path = "cert_check.rs"
+
+[[example]]
 name = "secret_syncer"
 path = "secret_syncer.rs"
+
+[[example]]
+name = "pod_shell_crossterm"
+path = "pod_shell_crossterm.rs"
+required-features = ["ws"]

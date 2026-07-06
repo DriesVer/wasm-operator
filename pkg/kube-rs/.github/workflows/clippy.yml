@@ -1,17 +1,19 @@
 name: clippy
 on:
   pull_request:
+    paths:
+      - '**.rs'
+      - '**.toml'
+      - '**.yml'
+
 jobs:
   clippy_nightly:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
           components: clippy
-          override: true
-      - uses: actions-rs/clippy-check@v1
+      - uses: clechasseur/rs-clippy-check@v5
         with:
-          args: "--workspace"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --workspace

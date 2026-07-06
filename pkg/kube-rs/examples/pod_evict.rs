@@ -1,19 +1,17 @@
-#[macro_use] extern crate log;
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use serde_json::json;
+use tracing::*;
 
 use kube::{
-    api::{Api, EvictParams, ListParams, PostParams, ResourceExt, WatchEvent},
     Client,
+    api::{Api, EvictParams, PostParams, ResourceExt, WatchEvent, WatchParams},
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    std::env::set_var("RUST_LOG", "info,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
-    let namespace = std::env::var("NAMESPACE").unwrap_or_else(|_| "default".into());
 
     // Create a Job
     let pod_name = "empty-pod";
@@ -32,24 +30,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }))?;
 
-    let pods: Api<Pod> = Api::namespaced(client, &namespace);
+    let pods: Api<Pod> = Api::default_namespaced(client);
     let pp = PostParams::default();
     pods.create(&pp, &empty_pod).await?;
 
     // Wait until the pod is running, although it's not necessary
-    let lp = ListParams::default()
+    let wp = WatchParams::default()
         .fields("metadata.name=empty-pod")
         .timeout(10);
-    let mut stream = pods.watch(&lp, "0").await?.boxed();
+    let mut stream = pods.watch(&wp, "0").await?.boxed();
     while let Some(status) = stream.try_next().await? {
         match status {
             WatchEvent::Added(o) => {
-                info!("Added {}", o.name());
+                info!("Added {}", o.name_any());
             }
             WatchEvent::Modified(o) => {
                 let s = o.status.as_ref().expect("status exists on pod");
                 if s.phase.clone().unwrap_or_default() == "Running" {
-                    info!("Ready to evict to {}", o.name());
+                    info!("Ready to evict to {}", o.name_any());
                     break;
                 }
             }
@@ -60,6 +58,6 @@ async fn main() -> anyhow::Result<()> {
     // Evict the pod
     let ep = EvictParams::default();
     let eres = pods.evict(pod_name, &ep).await?;
-    println!("{:?}", eres);
+    info!("{:?}", eres);
     Ok(())
 }

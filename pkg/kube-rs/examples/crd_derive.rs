@@ -1,28 +1,40 @@
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{
-    core::object::{HasSpec, HasStatus},
     CustomResource, CustomResourceExt, Resource,
+    core::object::{HasSpec, HasStatus},
 };
-use schemars::JsonSchema;
+use schemars::{JsonSchema, json_schema};
 use serde::{Deserialize, Serialize};
 
 /// Our spec for Foo
 ///
 /// A struct with our chosen Kind will be created for us, using the following kube attrs
-#[derive(CustomResource, Serialize, Deserialize, Default, Debug, PartialEq, Clone, JsonSchema)]
+#[derive(CustomResource, Serialize, Deserialize, Default, Debug, PartialEq, Eq, Clone, JsonSchema)]
 #[kube(
     group = "clux.dev",
     version = "v1",
     kind = "Foo",
     plural = "fooz",
-    struct = "FooCrd",
+    root = "FooCrd",
     namespaced,
+    doc = "Custom resource representing a Foo",
     status = "FooStatus",
     derive = "PartialEq",
     derive = "Default",
+    attr = "allow(deprecated)",
+    attr = "cfg_attr(docsrs,doc(cfg(feature = \"latest\")))",
     shortname = "f",
-    scale = r#"{"specReplicasPath":".spec.replicas", "statusReplicasPath":".status.replicas"}"#,
-    printcolumn = r#"{"name":"Spec", "type":"string", "description":"name of foo", "jsonPath":".spec.name"}"#
+    scale(
+        spec_replicas_path = ".spec.replicas",
+        status_replicas_path = ".status.replicas"
+    ),
+    printcolumn(
+        name = "Spec",
+        type_ = "string",
+        description = "name of foo",
+        json_path = ".spec.name",
+    ),
+    selectable = "spec.name"
 )]
 pub struct MyFoo {
     name: String,
@@ -39,6 +51,7 @@ pub struct FooStatus {
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
     println!("Kind {}", FooCrd::kind(&()));
     let mut foo = FooCrd::new("hi", MyFoo {
         name: "hi".into(),
@@ -50,14 +63,14 @@ fn main() {
     });
     println!("Spec: {:?}", foo.spec);
     let crd = serde_json::to_string_pretty(&FooCrd::crd()).unwrap();
-    println!("Foo CRD: \n{}", crd);
+    println!("Foo CRD: \n{crd}");
 
     println!("Spec (via HasSpec): {:?}", foo.spec());
     println!("Status (via HasStatus): {:?}", foo.status());
 }
 
-fn conditions(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-    serde_json::from_value(serde_json::json!({
+fn conditions(_: &mut schemars::generate::SchemaGenerator) -> schemars::Schema {
+    json_schema!({
         "type": "array",
         "x-kubernetes-list-type": "map",
         "x-kubernetes-list-map-keys": ["type"],
@@ -79,8 +92,7 @@ fn conditions(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schem
                 "type"
             ],
         },
-    }))
-    .unwrap()
+    })
 }
 
 // some tests
@@ -116,9 +128,12 @@ fn verify_crd() {
                 "type": "string"
               }
             ],
+            "selectableFields": [{
+              "jsonPath": "spec.name",
+            }],
             "schema": {
               "openAPIV3Schema": {
-                "description": "Auto-generated derived type for MyFoo via `CustomResource`",
+                "description": "Custom resource representing a Foo",
                 "properties": {
                   "spec": {
                     "description": "Our spec for Foo\n\nA struct with our chosen Kind will be created for us, using the following kube attrs",
@@ -191,7 +206,7 @@ fn verify_crd() {
       }
     });
     let crd = serde_json::to_value(FooCrd::crd()).unwrap();
-    println!("got crd: {}", serde_yaml::to_string(&FooCrd::crd()).unwrap());
+    println!("got crd: {}", serde_saphyr::to_string(&FooCrd::crd()).unwrap());
     use assert_json_diff::assert_json_include;
     assert_json_include!(actual: output, expected: crd);
 }
@@ -216,13 +231,13 @@ async fn verify_url_gen() {
 #[test]
 fn verify_default() {
     let fdef = FooCrd::default();
-    let ser = serde_yaml::to_string(&fdef).unwrap();
-    let exp = r#"---
+    let ser = serde_saphyr::to_string(&fdef).unwrap();
+    let exp = r#"
 apiVersion: clux.dev/v1
 kind: Foo
 metadata: {}
 spec:
   name: ""
 "#;
-    assert_eq!(exp, ser);
+    assert_eq!(exp.trim(), ser.trim());
 }

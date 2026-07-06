@@ -1,44 +1,41 @@
 //! Helpers for manipulating built-in streams
 
 mod backoff_reset_timer;
+pub(crate) mod delayed_init;
+mod event_decode;
+mod event_modify;
+mod predicate;
+mod reflect;
 mod stream_backoff;
+mod watch_ext;
 
-pub use backoff_reset_timer::ResetTimerBackoff;
+/// Deprecated type alias for `EventDecode`
+#[deprecated(
+    since = "0.96.0",
+    note = "renamed to by `EventDecode`. This alias will be removed in 0.100.0."
+)]
+pub use EventDecode as EventFlatten;
+pub use backoff_reset_timer::{Backoff, ResetTimerBackoff};
+pub use event_decode::EventDecode;
+pub use event_modify::EventModify;
+pub use predicate::{Config as PredicateConfig, Predicate, PredicateFilter, predicates};
+pub use reflect::Reflect;
 pub use stream_backoff::StreamBackoff;
+pub use watch_ext::WatchStreamExt;
 
-use crate::watcher;
 use futures::{
-    pin_mut,
+    FutureExt, Stream, StreamExt, TryStream, TryStreamExt,
     stream::{self, Peekable},
-    Future, Stream, StreamExt, TryStream, TryStreamExt,
 };
 use pin_project::pin_project;
 use std::{
     fmt::Debug,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::{Arc, Mutex},
     task::Poll,
 };
 use stream::IntoStream;
-// use tokio::{runtime::Handle, task::JoinHandle};
-
-/// Flattens each item in the list following the rules of [`watcher::Event::into_iter_applied`].
-pub fn try_flatten_applied<K, S: TryStream<Ok = watcher::Event<K>>>(
-    stream: S,
-) -> impl Stream<Item = Result<K, S::Error>> {
-    stream
-        .map_ok(|event| stream::iter(event.into_iter_applied().map(Ok)))
-        .try_flatten()
-}
-
-/// Flattens each item in the list following the rules of [`watcher::Event::into_iter_touched`].
-pub fn try_flatten_touched<K, S: TryStream<Ok = watcher::Event<K>>>(
-    stream: S,
-) -> impl Stream<Item = Result<K, S::Error>> {
-    stream
-        .map_ok(|event| stream::iter(event.into_iter_touched().map(Ok)))
-        .try_flatten()
-}
+use tokio::{runtime::Handle, task::JoinHandle};
 
 /// Allows splitting a `Stream` into several streams that each emit a disjoint subset of the input stream's items,
 /// like a streaming variant of pattern matching.
@@ -77,18 +74,17 @@ where
         let this = self.project();
         let inner = this.inner.lock().unwrap();
         let mut inner = Pin::new(inner);
-        let inner_peek = inner.as_mut().peek();
-        pin_mut!(inner_peek);
+        let inner_peek = pin!(inner.as_mut().peek());
         match inner_peek.poll(cx) {
             Poll::Ready(Some(x_ref)) => {
                 if (this.should_consume_item)(x_ref) {
-                    match inner.as_mut().poll_next(cx) {
+                    let item = inner.as_mut().poll_next(cx);
+                    match item {
                         Poll::Ready(Some(x)) => Poll::Ready(Some((this.try_extract_item_case)(x).expect(
                             "`try_extract_item_case` returned `None` despite `should_consume_item` returning `true`",
                         ))),
                         res => panic!(
-                    "Peekable::poll_next() returned {:?} when Peekable::peek() returned Ready(Some(_))",
-                    res
+                    "Peekable::poll_next() returned {res:?} when Peekable::peek() returned Ready(Some(_))"
                 ),
                     }
                 } else {
@@ -148,21 +144,8 @@ where
     stream::select(via.into_stream(), errs.map(Err)) // recombine
 }
 
-#[cfg(target_arch = "wasm32")]
-use {futures::future::RemoteHandle, futures::task::SpawnExt};
-
-#[cfg(not(target_arch = "wasm32"))]
-use {
-    futures::FutureExt,
-    tokio::{runtime::Handle, task::JoinHandle},
-};
-
 /// A [`JoinHandle`] that cancels the [`Future`] when dropped, rather than detaching it
-pub(crate) struct CancelableJoinHandle<T> {
-    #[cfg(target_arch = "wasm32")]
-    inner: RemoteHandle<T>,
-
-    #[cfg(not(target_arch = "wasm32"))]
+pub struct CancelableJoinHandle<T> {
     inner: JoinHandle<T>,
 }
 
@@ -170,36 +153,24 @@ impl<T> CancelableJoinHandle<T>
 where
     T: Send + 'static,
 {
-    pub fn spawn(future: impl Future<Output = T> + Send + 'static) -> Self {
+    /// Wrap a future in a cancelable handle, and spawn in a runtime
+    pub fn spawn(future: impl Future<Output = T> + Send + 'static, runtime: &Handle) -> Self {
         CancelableJoinHandle {
-            #[cfg(target_arch = "wasm32")]
-            inner: kube_runtime_abi::get_spawner()
-                .expect("spawner not initialised!")
-                .spawn_with_handle(future)
-                .unwrap(),
-
-            #[cfg(not(target_arch = "wasm32"))]
-            inner: (&Handle::current()).spawn(future),
+            inner: runtime.spawn(future),
         }
     }
 }
 
 impl<T> Drop for CancelableJoinHandle<T> {
     fn drop(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
         self.inner.abort()
     }
 }
 
-impl<T: 'static> Future for CancelableJoinHandle<T> {
+impl<T> Future for CancelableJoinHandle<T> {
     type Output = T;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        #[cfg(target_arch = "wasm32")]
-        #[allow(unsafe_code)]
-        return unsafe { Pin::new_unchecked(&mut self.inner) }.poll(cx);
-
-        #[cfg(not(target_arch = "wasm32"))]
         self.inner.poll_unpin(cx).map(
             // JoinError => underlying future was either aborted (which should only happen when the handle is dropped), or
             // panicked (which should be propagated)
@@ -242,3 +213,36 @@ pub(crate) trait KubeRuntimeStreamExt: Stream + Sized {
 }
 
 impl<S: Stream> KubeRuntimeStreamExt for S {}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use futures::stream::{self, StreamExt};
+
+    use super::trystream_try_via;
+
+    // Type-level test does not need to be executed
+    #[allow(dead_code)]
+    fn trystream_try_via_should_be_able_to_borrow() {
+        struct WeirdComplexObject {}
+        impl Drop for WeirdComplexObject {
+            fn drop(&mut self) {}
+        }
+
+        let mut x = WeirdComplexObject {};
+        let y = WeirdComplexObject {};
+        drop(trystream_try_via(
+            Box::pin(stream::once(async {
+                let _ = &mut x;
+                Result::<_, Infallible>::Ok(())
+            })),
+            |s| {
+                s.map(|()| {
+                    let _ = &y;
+                    Ok(())
+                })
+            },
+        ));
+    }
+}

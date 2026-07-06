@@ -1,15 +1,15 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::{
+    Client, CustomResource, CustomResourceExt, KubeSchema,
     api::{
-        Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, Patch, PatchParams,
-        PostParams, WatchEvent,
+        Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams, PostParams,
+        WatchEvent, WatchParams,
     },
     runtime::wait::{await_condition, conditions},
-    Client, CustomResource, CustomResourceExt,
 };
-use schemars::JsonSchema;
+use schemars::json_schema;
 use serde::{Deserialize, Serialize};
 
 // This example shows how the generated schema affects defaulting and validation.
@@ -19,16 +19,18 @@ use serde::{Deserialize, Serialize};
 // - https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#defaulting
 // - https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#defaulting-and-nullable
 
-#[derive(CustomResource, Serialize, Deserialize, Default, Debug, PartialEq, Clone, JsonSchema)]
+#[derive(CustomResource, KubeSchema, Serialize, Deserialize, Default, Debug, PartialEq, Eq, Clone)]
 #[kube(
     group = "clux.dev",
     version = "v1",
     kind = "Foo",
     namespaced,
     derive = "PartialEq",
-    derive = "Default"
+    derive = "Default",
+    validation = "self.metadata.name != 'forbidden'"
 )]
-#[kube(apiextensions = "v1")]
+#[serde(rename_all = "camelCase")]
+#[x_kube(validation = "self.nonNullable == oldSelf.nonNullable")]
 pub struct FooSpec {
     // Non-nullable without default is required.
     //
@@ -86,24 +88,64 @@ pub struct FooSpec {
     #[serde(default)]
     #[schemars(schema_with = "set_listable_schema")]
     set_listable: Vec<u32>,
+
+    // Field with CEL validation
+    #[serde(default = "default_legal")]
+    #[x_kube(
+        validation = Rule::new("self != 'illegal'").message(Message::Expression("'string cannot be illegal'".into())).reason(Reason::FieldValueForbidden),
+        validation = Rule::new("self != 'not legal'").reason(Reason::FieldValueInvalid),
+    )]
+    cel_validated: Option<String>,
+
+    /// Immutable field that uses optionalOldSelf
+    #[serde(default)]
+    #[x_kube(
+        validation = Rule::new("oldSelf.optMap(o, o == self).orValue(true)").optional_old_self(true).message("Immutable after creation")
+    )]
+    immutable: Option<String>,
+
+    #[x_kube(validation = Rule::new("self == oldSelf").message("is immutable"))]
+    foo_sub_spec: Option<FooSubSpec>,
+
+    #[serde(default = "FooSpec::default_value")]
+    associated_default: bool,
+}
+
+#[derive(KubeSchema, Serialize, Deserialize, Default, Debug, PartialEq, Eq, Clone)]
+pub struct FooSubSpec {
+    /// Heterogenous CEL rule set
+    #[x_kube(validation = "self != 'not legal'", validation = Rule::new("self != 'not that'"))]
+    #[x_kube(validation = ("self != 'also not that'", "some pretty good reason"))]
+    field: String,
+
+    other: Option<String>,
+}
+
+impl FooSpec {
+    fn default_value() -> bool {
+        true
+    }
 }
 
 // https://kubernetes.io/docs/reference/using-api/server-side-apply/#merge-strategy
-fn set_listable_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-    serde_json::from_value(serde_json::json!({
+fn set_listable_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::Schema {
+    json_schema!({
         "type": "array",
         "items": {
             "format": "u32",
-            "minium": 0,
+            "minimum": 0,
             "type": "integer"
         },
         "x-kubernetes-list-type": "set"
-    }))
-    .unwrap()
+    })
 }
 
 fn default_value() -> String {
     "default_value".into()
+}
+
+fn default_legal() -> Option<String> {
+    Some("legal".into())
 }
 
 fn default_nullable() -> Option<String> {
@@ -113,7 +155,7 @@ fn default_nullable() -> Option<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Show the generated CRD
-    println!("Foo CRD:\n{}\n", serde_yaml::to_string(&Foo::crd())?);
+    println!("Foo CRD:\n{}\n", serde_saphyr::to_string(&Foo::crd())?);
 
     // Creating CRD v1 works as expected.
     println!("Creating CRD v1");
@@ -122,8 +164,7 @@ async fn main() -> Result<()> {
     assert!(create_crd(client.clone()).await.is_ok());
 
     // Test creating Foo resource.
-    let namespace = std::env::var("NAMESPACE").unwrap_or_else(|_| "default".into());
-    let foos = Api::<Foo>::namespaced(client.clone(), &namespace);
+    let foos = Api::<Foo>::default_namespaced(client.clone());
     // Create with defaults using typed Api first.
     // `non_nullable` and `non_nullable_with_default` are set to empty strings.
     // Nullables defaults to `None` and only sent if it's not configured to skip.
@@ -146,12 +187,16 @@ async fn main() -> Result<()> {
         // Empty listables to be patched in later
         default_listable: Default::default(),
         set_listable: Default::default(),
+        cel_validated: Default::default(),
+        immutable: Default::default(),
+        foo_sub_spec: Default::default(),
+        associated_default: Default::default(),
     });
 
     // Set up dynamic resource to test using raw values.
     let gvk = GroupVersionKind::gvk("clux.dev", "v1", "Foo");
     let api_resource = ApiResource::from_gvk(&gvk);
-    let dynapi: Api<DynamicObject> = Api::namespaced_with(client.clone(), &namespace, &api_resource);
+    let dynapi: Api<DynamicObject> = Api::default_namespaced_with(client.clone(), &api_resource);
 
     // Test that skipped nullable field without default is not defined.
     let val = dynapi.get("bar").await?.data;
@@ -164,22 +209,24 @@ async fn main() -> Result<()> {
     // Test defaulting of `non_nullable_with_default` field
     let data = DynamicObject::new("baz", &api_resource).data(serde_json::json!({
         "spec": {
-            "non_nullable": "a required field",
+            "nonNullable": "a required field",
             // `non_nullable_with_default` field is missing
 
             // listable values to patch later to verify merge strategies
-            "default_listable": vec![2],
-            "set_listable": vec![2],
+            "defaultListable": vec![2],
+            "setListable": vec![2],
         }
     }));
     let val = dynapi.create(&PostParams::default(), &data).await?.data;
     println!("{:?}", val["spec"]);
     // Defaulting happened for non-nullable field
-    assert_eq!(val["spec"]["non_nullable_with_default"], default_value());
+    assert_eq!(val["spec"]["nonNullableWithDefault"], default_value());
 
     // Listables
-    assert_eq!(serde_json::to_string(&val["spec"]["default_listable"])?, "[2]");
-    assert_eq!(serde_json::to_string(&val["spec"]["set_listable"])?, "[2]");
+    assert_eq!(serde_json::to_string(&val["spec"]["defaultListable"])?, "[2]");
+    assert_eq!(serde_json::to_string(&val["spec"]["setListable"])?, "[2]");
+    assert_eq!(serde_json::to_string(&val["spec"]["celValidated"])?, "\"legal\"");
+    assert_eq!(serde_json::to_string(&val["spec"]["associatedDefault"])?, "true");
 
     // Missing required field (non-nullable without default) is an error
     let data = DynamicObject::new("qux", &api_resource).data(serde_json::json!({
@@ -191,14 +238,17 @@ async fn main() -> Result<()> {
         Some(kube::Error::Api(err)) => {
             assert_eq!(err.code, 422);
             assert_eq!(err.reason, "Invalid");
-            assert_eq!(err.status, "Failure");
-            assert_eq!(
-                err.message,
-                "Foo.clux.dev \"qux\" is invalid: spec.non_nullable: Required value"
-            );
+            assert!(err.is_failure());
+            assert!(err.message.contains("clux.dev \"qux\" is invalid"));
+            assert!(err.message.contains("spec.nonNullable: Required value"));
         }
         _ => panic!(),
     }
+
+    // Resource level metadata validations check
+    let forbidden = Foo::new("forbidden", FooSpec { ..FooSpec::default() });
+    let res = foos.create(&PostParams::default(), &forbidden).await;
+    assert!(res.is_err());
 
     // Test the manually specified merge strategy
     let ssapply = PatchParams::apply("crd_derive_schema_example").force();
@@ -206,8 +256,8 @@ async fn main() -> Result<()> {
         "apiVersion": "clux.dev/v1",
         "kind": "Foo",
         "spec": {
-            "default_listable": vec![3],
-            "set_listable": vec![3]
+            "defaultListable": vec![3],
+            "setListable": vec![3]
         }
     });
     let pres = foos.patch("baz", &ssapply, &Patch::Apply(patch)).await?;
@@ -215,8 +265,144 @@ async fn main() -> Result<()> {
     assert_eq!(pres.spec.set_listable, vec![2, 3]);
     println!("{:?}", serde_json::to_value(pres.spec));
 
-    delete_crd(client.clone()).await?;
+    // cel validation triggers:
+    let cel_patch = serde_json::json!({
+        "apiVersion": "clux.dev/v1",
+        "kind": "Foo",
+        "spec": {
+            "celValidated": Some("illegal")
+        }
+    });
+    let cel_res = foos.patch("baz", &ssapply, &Patch::Apply(cel_patch)).await;
+    assert!(cel_res.is_err());
+    match cel_res.err() {
+        Some(kube::Error::Api(err)) => {
+            assert_eq!(err.code, 422);
+            assert_eq!(err.reason, "Invalid");
+            assert!(err.is_failure());
+            assert!(err.message.contains("Foo.clux.dev \"baz\" is invalid"));
+            assert!(err.message.contains("spec.celValidated: Forbidden"));
+            assert!(err.message.contains("string cannot be illegal"));
+        }
+        _ => panic!(),
+    }
 
+    // cel validation triggers:
+    let cel_patch = serde_json::json!({
+        "apiVersion": "clux.dev/v1",
+        "kind": "Foo",
+        "spec": {
+            "celValidated": Some("not legal")
+        }
+    });
+    let cel_res = foos.patch("baz", &ssapply, &Patch::Apply(cel_patch)).await;
+    assert!(cel_res.is_err());
+    match cel_res.err() {
+        Some(kube::Error::Api(err)) => {
+            assert_eq!(err.code, 422);
+            assert_eq!(err.reason, "Invalid");
+            assert!(err.is_failure());
+            assert!(err.message.contains("Foo.clux.dev \"baz\" is invalid"));
+            assert!(err.message.contains("spec.celValidated: Invalid value"));
+            assert!(err.message.contains("failed rule: self != 'not legal'"));
+        }
+        _ => panic!(),
+    }
+
+    let cel_patch = serde_json::json!({
+        "apiVersion": "clux.dev/v1",
+        "kind": "Foo",
+        "spec": {
+            "fooSubSpec": {
+                "field": Some("not legal"),
+            }
+        }
+    });
+    let cel_res = foos.patch("baz", &ssapply, &Patch::Apply(cel_patch)).await;
+    assert!(cel_res.is_err());
+    match cel_res.err() {
+        Some(kube::Error::Api(err)) => {
+            assert_eq!(err.code, 422);
+            assert_eq!(err.reason, "Invalid");
+            assert!(err.is_failure());
+            assert!(err.message.contains("Foo.clux.dev \"baz\" is invalid"));
+            assert!(err.message.contains("spec.fooSubSpec.field: Invalid value"));
+            assert!(err.message.contains("failed rule: self != 'not legal'"));
+        }
+        _ => panic!(),
+    }
+
+    let cel_patch = serde_json::json!({
+        "apiVersion": "clux.dev/v1",
+        "kind": "Foo",
+        "spec": {
+            "fooSubSpec": {
+                "field": Some("also not that"),
+            }
+        }
+    });
+    let cel_res = foos.patch("baz", &ssapply, &Patch::Apply(cel_patch)).await;
+    assert!(cel_res.is_err());
+    match cel_res.err() {
+        Some(kube::Error::Api(err)) => {
+            assert_eq!(err.code, 422);
+            assert_eq!(err.reason, "Invalid");
+            assert!(err.is_failure());
+            assert!(err.message.contains("Foo.clux.dev \"baz\" is invalid"));
+            assert!(err.message.contains("spec.fooSubSpec.field: Invalid value"));
+            assert!(err.message.contains("some pretty good reason"));
+        }
+        _ => panic!(),
+    }
+
+    let cel_patch = serde_json::json!({
+        "apiVersion": "clux.dev/v1",
+        "kind": "Foo",
+        "spec": {
+            "fooSubSpec": {
+                "field": Some("legal"),
+            }
+        }
+    });
+    let cel_res = foos.patch("baz", &ssapply, &Patch::Apply(cel_patch)).await;
+    assert!(cel_res.is_ok());
+
+    let cel_patch = serde_json::json!({
+        "apiVersion": "clux.dev/v1",
+        "kind": "Foo",
+        "spec": {
+            "fooSubSpec": {
+                "field": Some("legal"),
+                "other": "different",
+            }
+        }
+    });
+    let cel_res = foos.patch("baz", &ssapply, &Patch::Apply(cel_patch)).await;
+    assert!(cel_res.is_err());
+    match cel_res.err() {
+        Some(kube::Error::Api(err)) => {
+            assert_eq!(err.code, 422);
+            assert_eq!(err.reason, "Invalid");
+            assert!(err.is_failure());
+            assert!(err.message.contains("Foo.clux.dev \"baz\" is invalid"));
+            assert!(err.message.contains("spec.fooSubSpec: Invalid value"));
+            assert!(err.message.contains("Immutable after creation") || err.message.contains("is immutable"));
+        }
+        _ => panic!(),
+    }
+
+    // cel validation happy:
+    let cel_patch_ok = serde_json::json!({
+        "apiVersion": "clux.dev/v1",
+        "kind": "Foo",
+        "spec": {
+            "celValidated": Some("legal")
+        }
+    });
+    foos.patch("baz", &ssapply, &Patch::Apply(cel_patch_ok)).await?;
+
+    // all done
+    delete_crd(client.clone()).await?;
     Ok(())
 }
 
@@ -243,16 +429,16 @@ async fn delete_crd(client: Client) -> Result<()> {
 
         // Wait until deleted
         let timeout_secs = 15;
-        let lp = ListParams::default()
+        let wp = WatchParams::default()
             .fields("metadata.name=foos.clux.dev")
             .timeout(timeout_secs);
-        let mut stream = api.watch(&lp, "0").await?.boxed_local();
+        let mut stream = api.watch(&wp, "0").await?.boxed_local();
         while let Some(status) = stream.try_next().await? {
             if let WatchEvent::Deleted(_) = status {
                 return Ok(());
             }
         }
-        Err(anyhow!(format!("CRD not deleted after {} seconds", timeout_secs)))
+        Err(anyhow!(format!("CRD not deleted after {timeout_secs} seconds")))
     } else {
         Ok(())
     }

@@ -1,41 +1,35 @@
-//! In this example we will implement something similar
-//! to `kubectl get all --all-namespaces`.
+//! In this example we will implement something similar to `kubectl get all`.
 
 use kube::{
-    api::{Api, DynamicObject, ResourceExt},
-    discovery::{verbs, Discovery, Scope},
     Client,
+    api::{Api, DynamicObject, ResourceExt},
+    discovery::{Discovery, Scope, verbs},
 };
-use log::info;
+use tracing::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    std::env::set_var("RUST_LOG", "info,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
-    let ns_filter = std::env::var("NAMESPACE").ok();
 
-    let discovery = Discovery::new(client.clone()).run().await?;
+    // Uses Aggregated Discovery API for fewer API calls (2 instead of N+2)
+    let discovery = Discovery::new(client.clone()).run_aggregated().await?;
     for group in discovery.groups() {
         for (ar, caps) in group.recommended_resources() {
             if !caps.supports_operation(verbs::LIST) {
                 continue;
             }
-            let api: Api<DynamicObject> = if caps.scope == Scope::Namespaced {
-                if let Some(ns) = &ns_filter {
-                    Api::namespaced_with(client.clone(), ns, &ar)
-                } else {
-                    Api::all_with(client.clone(), &ar)
-                }
-            } else {
+            let api: Api<DynamicObject> = if caps.scope == Scope::Cluster {
                 Api::all_with(client.clone(), &ar)
+            } else {
+                Api::default_namespaced_with(client.clone(), &ar)
             };
 
             info!("{}/{} : {}", group.name(), ar.version, ar.kind);
 
             let list = api.list(&Default::default()).await?;
             for item in list.items {
-                let name = item.name();
+                let name = item.name_any();
                 let ns = item.metadata.namespace.map(|s| s + "/").unwrap_or_default();
                 info!("\t\t{}{}", ns, name);
             }

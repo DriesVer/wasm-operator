@@ -6,6 +6,7 @@
 //! <https://github.com/kubernetes/api/blob/master/admission/v1/types.go>
 
 use crate::{
+    Status,
     dynamic::DynamicObject,
     gvk::{GroupVersionKind, GroupVersionResource},
     metadata::TypeMeta,
@@ -14,10 +15,7 @@ use crate::{
 
 use std::collections::HashMap;
 
-use k8s_openapi::{
-    api::authentication::v1::UserInfo,
-    apimachinery::pkg::{apis::meta::v1::Status, runtime::RawExtension},
-};
+use k8s_openapi::{api::authentication::v1::UserInfo, apimachinery::pkg::runtime::RawExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -35,11 +33,14 @@ pub struct ConvertAdmissionReviewError;
 pub const META_KIND: &str = "AdmissionReview";
 /// The `api_version` field in [`TypeMeta`] on the v1 version.
 pub const META_API_VERSION_V1: &str = "admission.k8s.io/v1";
-/// The `api_version` field in [`TypeMeta`] on the v1beta1 version.
-pub const META_API_VERSION_V1BETA1: &str = "admission.k8s.io/v1beta1";
 
 /// The top level struct used for Serializing and Deserializing AdmissionReview
 /// requests and responses.
+///
+/// This is both the input type received by admission controllers, and the
+/// output type admission controllers should return.
+///
+/// An admission controller should start by inspecting the [`AdmissionRequest`].
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AdmissionReview<T: Resource> {
@@ -70,20 +71,32 @@ impl<T: Resource> TryInto<AdmissionRequest<T>> for AdmissionReview<T> {
 }
 
 /// An incoming [`AdmissionReview`] request.
-/// ```ignore
-/// use kube::api::{admission::{AdmissionRequest, AdmissionReview}, DynamicObject};
+///
+/// In an admission controller scenario, this is extracted from an [`AdmissionReview`] via [`TryInto`]
+///
+/// ```no_run
+/// use kube::core::{admission::{AdmissionRequest, AdmissionReview}, DynamicObject};
 ///
 /// // The incoming AdmissionReview received by the controller.
-/// let body: AdmissionReview<DynamicObject>;
+/// let body: AdmissionReview<DynamicObject> = todo!();
 /// let req: AdmissionRequest<_> = body.try_into().unwrap();
 /// ```
+///
+/// Based on the contents of the request, an admission controller should construct an
+/// [`AdmissionResponse`] using:
+///
+/// - [`AdmissionResponse::deny`] for illegal/rejected requests
+/// - [`AdmissionResponse::invalid`] for malformed requests
+/// - [`AdmissionResponse::from`] for the happy path
+///
+/// then wrap the chosen response in an [`AdmissionReview`] via [`AdmissionResponse::into_review`].
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AdmissionRequest<T: Resource> {
     /// Copied from the containing [`AdmissionReview`] and used to specify a
     /// response type and version when constructing an [`AdmissionResponse`].
     #[serde(skip)]
-    types: TypeMeta,
+    pub types: TypeMeta,
     /// An identifier for the individual request/response. It allows us to
     /// distinguish instances of requests which are otherwise identical (parallel
     /// requests, requests when earlier requests did not modify, etc). The UID is
@@ -174,7 +187,7 @@ pub struct AdmissionRequest<T: Resource> {
 }
 
 /// The operation specified in an [`AdmissionRequest`].
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Operation {
     /// An operation that creates a resource.
@@ -187,16 +200,57 @@ pub enum Operation {
     Connect,
 }
 
+#[cfg(feature = "cel")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cel")))]
+impl<T: Resource> AdmissionRequest<T> {
+    /// Project this request into the [`kube_cel::AdmissionRequest`] used to
+    /// bind the `request` variable for ValidatingAdmissionPolicy CEL evaluation.
+    ///
+    /// This is a lossy view: only the fields exposed to VAP's `request` variable
+    /// are carried over (`operation`, `name`, `namespace`, `dryRun`, `kind`,
+    /// `resource`, and `userInfo`'s `username`/`uid`/`groups`). Webhook-only fields
+    /// such as `object`, `oldObject`, `requestKind`, `subResource`, and `options`
+    /// are dropped. The carried `uid` is the *user* uid (`userInfo.uid`), matching
+    /// the VAP `request.userInfo.uid` variable, not the request round-trip uid.
+    pub fn to_cel_request(&self) -> kube_cel::AdmissionRequest {
+        kube_cel::AdmissionRequest {
+            operation: match self.operation {
+                Operation::Create => "CREATE",
+                Operation::Update => "UPDATE",
+                Operation::Delete => "DELETE",
+                Operation::Connect => "CONNECT",
+            }
+            .to_owned(),
+            username: self.user_info.username.clone().unwrap_or_default(),
+            uid: self.user_info.uid.clone().unwrap_or_default(),
+            groups: self.user_info.groups.clone().unwrap_or_default(),
+            name: self.name.clone(),
+            namespace: self.namespace.clone().unwrap_or_default(),
+            dry_run: self.dry_run,
+            kind: kube_cel::GroupVersionKind {
+                group: self.kind.group.clone(),
+                version: self.kind.version.clone(),
+                kind: self.kind.kind.clone(),
+            },
+            resource: kube_cel::GroupVersionResource {
+                group: self.resource.group.clone(),
+                version: self.resource.version.clone(),
+                resource: self.resource.resource.clone(),
+            },
+        }
+    }
+}
+
 /// An outgoing [`AdmissionReview`] response. Constructed from the corresponding
 /// [`AdmissionRequest`].
-/// ```ignore
-/// use kube::api::{
-///         admission::{AdmissionRequest, AdmissionResponse, AdmissionReview},
-///         DynamicObject,
+/// ```no_run
+/// use kube::core::{
+///     admission::{AdmissionRequest, AdmissionResponse, AdmissionReview},
+///     DynamicObject,
 /// };
 ///
 /// // The incoming AdmissionReview received by the controller.
-/// let body: AdmissionReview<DynamicObject>;
+/// let body: AdmissionReview<DynamicObject> = todo!();
 /// let req: AdmissionRequest<_> = body.try_into().unwrap();
 ///
 /// // A normal response with no side effects.
@@ -207,12 +261,12 @@ pub enum Operation {
 ///     .deny("Some rejection reason.")
 ///     .into_review();
 ///
-/// use json_patch::{AddOperation, Patch, PatchOperation};
+/// use json_patch::{AddOperation, Patch, PatchOperation, jsonptr::PointerBuf};
 ///
 /// // A response adding a label to the resource.
 /// let _: AdmissionReview<_> = AdmissionResponse::from(&req)
 ///     .with_patch(Patch(vec![PatchOperation::Add(AddOperation {
-///         path: "/metadata/labels/my-label".to_owned(),
+///         path: PointerBuf::from_tokens(["metadata","labels","my-label"]),
 ///         value: serde_json::Value::String("my-value".to_owned()),
 ///     })]))
 ///     .unwrap()
@@ -223,9 +277,9 @@ pub enum Operation {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AdmissionResponse {
-    /// Copied from the corresponding consructing [`AdmissionRequest`].
+    /// Copied from the corresponding constructing [`AdmissionRequest`].
     #[serde(skip)]
-    types: TypeMeta,
+    pub types: TypeMeta,
     /// Identifier for the individual request/response. This must be copied over
     /// from the corresponding AdmissionRequest.
     pub uid: String,
@@ -249,7 +303,7 @@ pub struct AdmissionResponse {
     /// imagepolicy.example.com/error=image-blacklisted). AuditAnnotations will
     /// be provided by the admission webhook to add additional context to the
     /// audit log for this request.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub audit_annotations: HashMap<String, String>,
     /// A list of warning messages to return to the requesting API client.
     /// Warning messages describe a problem the client making the API request
@@ -286,14 +340,11 @@ impl AdmissionResponse {
             // supported and we won't be using any of the new fields.
             types: TypeMeta {
                 kind: META_KIND.to_owned(),
-                api_version: META_API_VERSION_V1BETA1.to_owned(),
+                api_version: META_API_VERSION_V1.to_owned(),
             },
             uid: Default::default(),
             allowed: false,
-            result: Status {
-                reason: Some(reason.to_string()),
-                ..Default::default()
-            },
+            result: Status::failure(&reason.to_string(), "InvalidRequest"),
             patch: None,
             patch_type: None,
             audit_annotations: Default::default(),
@@ -305,7 +356,7 @@ impl AdmissionResponse {
     #[must_use]
     pub fn deny<T: ToString>(mut self, reason: T) -> Self {
         self.allowed = false;
-        self.result.message = Some(reason.to_string());
+        self.result.message = reason.to_string();
         self
     }
 
@@ -329,7 +380,7 @@ impl AdmissionResponse {
 }
 
 /// The type of patch returned in an [`AdmissionResponse`].
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum PatchType {
     /// Specifies the patch body implements JSON Patch under RFC 6902.
     #[serde(rename = "JSONPatch")]
@@ -341,8 +392,8 @@ mod test {
     const WEBHOOK_BODY: &str = r#"{"kind":"AdmissionReview","apiVersion":"admission.k8s.io/v1","request":{"uid":"0c9a8d74-9cb7-44dd-b98e-09fd62def2f4","kind":{"group":"","version":"v1","kind":"Pod"},"resource":{"group":"","version":"v1","resource":"pods"},"requestKind":{"group":"","version":"v1","kind":"Pod"},"requestResource":{"group":"","version":"v1","resource":"pods"},"name":"echo-pod","namespace":"colin-coder","operation":"CREATE","userInfo":{"username":"colin@coder.com","groups":["system:authenticated"],"extra":{"iam.gke.io/user-assertion":["REDACTED"],"user-assertion.cloud.google.com":["REDACTED"]}},"object":{"kind":"Pod","apiVersion":"v1","metadata":{"name":"echo-pod","namespace":"colin-coder","creationTimestamp":null,"labels":{"app":"echo-server"},"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"annotations\":{},\"labels\":{\"app\":\"echo-server\"},\"name\":\"echo-pod\",\"namespace\":\"colin-coder\"},\"spec\":{\"containers\":[{\"image\":\"jmalloc/echo-server\",\"name\":\"echo-server\",\"ports\":[{\"containerPort\":8080,\"name\":\"http-port\"}]}]}}\n"},"managedFields":[{"manager":"kubectl","operation":"Update","apiVersion":"v1","time":"2021-03-29T23:02:16Z","fieldsType":"FieldsV1","fieldsV1":{"f:metadata":{"f:annotations":{".":{},"f:kubectl.kubernetes.io/last-applied-configuration":{}},"f:labels":{".":{},"f:app":{}}},"f:spec":{"f:containers":{"k:{\"name\":\"echo-server\"}":{".":{},"f:image":{},"f:imagePullPolicy":{},"f:name":{},"f:ports":{".":{},"k:{\"containerPort\":8080,\"protocol\":\"TCP\"}":{".":{},"f:containerPort":{},"f:name":{},"f:protocol":{}}},"f:resources":{},"f:terminationMessagePath":{},"f:terminationMessagePolicy":{}}},"f:dnsPolicy":{},"f:enableServiceLinks":{},"f:restartPolicy":{},"f:schedulerName":{},"f:securityContext":{},"f:terminationGracePeriodSeconds":{}}}}]},"spec":{"volumes":[{"name":"default-token-rxbqq","secret":{"secretName":"default-token-rxbqq"}}],"containers":[{"name":"echo-server","image":"jmalloc/echo-server","ports":[{"name":"http-port","containerPort":8080,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"name":"default-token-rxbqq","readOnly":true,"mountPath":"/var/run/secrets/kubernetes.io/serviceaccount"}],"terminationMessagePath":"/dev/termination-log","terminationMessagePolicy":"File","imagePullPolicy":"Always"}],"restartPolicy":"Always","terminationGracePeriodSeconds":30,"dnsPolicy":"ClusterFirst","serviceAccountName":"default","serviceAccount":"default","securityContext":{},"schedulerName":"default-scheduler","tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute","tolerationSeconds":300},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute","tolerationSeconds":300}],"priority":0,"enableServiceLinks":true},"status":{}},"oldObject":null,"dryRun":false,"options":{"kind":"CreateOptions","apiVersion":"meta.k8s.io/v1"}}}"#;
 
     use crate::{
-        admission::{AdmissionResponse, AdmissionReview, ConvertAdmissionReviewError},
         DynamicObject,
+        admission::{AdmissionResponse, AdmissionReview, ConvertAdmissionReviewError},
     };
 
     #[test]
@@ -362,5 +413,46 @@ mod test {
         // request.
         assert_eq!(&rev_typ, &res.types);
         Ok(())
+    }
+
+    #[cfg(feature = "cel")]
+    #[test]
+    fn to_cel_request_projects_fields() {
+        use crate::admission::{AdmissionRequest, Operation};
+        let rev = serde_json::from_str::<AdmissionReview<DynamicObject>>(WEBHOOK_BODY).unwrap();
+        let mut req: AdmissionRequest<DynamicObject> = rev.try_into().unwrap();
+
+        let cel = req.to_cel_request();
+        assert_eq!(cel.operation, "CREATE");
+        assert_eq!(cel.name, "echo-pod");
+        assert_eq!(cel.namespace, "colin-coder");
+        assert_eq!(cel.username, "colin@coder.com");
+        assert_eq!(cel.groups, vec!["system:authenticated".to_string()]);
+        assert_eq!(cel.kind.group, "");
+        assert_eq!(cel.kind.version, "v1");
+        assert_eq!(cel.kind.kind, "Pod");
+        assert_eq!(cel.resource.resource, "pods");
+        assert!(!cel.dry_run);
+
+        // `uid` is the *user* uid (`userInfo.uid`), never the round-trip request uid.
+        assert_ne!(req.uid, ""); // sanity: round-trip uid is populated in the payload
+        assert_eq!(cel.uid, ""); // userInfo.uid is absent -> empty, NOT req.uid
+        req.user_info.uid = Some("user-123".to_owned());
+        assert_eq!(req.to_cel_request().uid, "user-123");
+
+        // every Operation variant maps to its SCREAMING_SNAKE form
+        for (op, expected) in [
+            (Operation::Create, "CREATE"),
+            (Operation::Update, "UPDATE"),
+            (Operation::Delete, "DELETE"),
+            (Operation::Connect, "CONNECT"),
+        ] {
+            req.operation = op;
+            assert_eq!(req.to_cel_request().operation, expected);
+        }
+
+        // dry_run passes through
+        req.dry_run = true;
+        assert!(req.to_cel_request().dry_run);
     }
 }

@@ -1,26 +1,51 @@
-use futures::prelude::*;
+use std::pin::pin;
+
+use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
-    api::{Api, ListParams},
-    runtime::{reflector, watcher},
-    Client,
+    Client, ResourceExt,
+    api::Api,
+    runtime::{WatchStreamExt, predicates, reflector, watcher},
 };
+use tracing::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
-    let namespace = std::env::var("NAMESPACE").unwrap_or_else(|_| "default".into());
 
-    let api: Api<Pod> = Api::namespaced(client, &namespace);
-    let store_w = reflector::store::Writer::default();
-    let store = store_w.as_reader();
-    let reflector = reflector(store_w, watcher(api, ListParams::default()));
-    // Use try_for_each to fail on first error, use for_each to keep retrying
-    reflector
-        .try_for_each(|_event| async {
-            println!("Current pod count: {}", store.state().len());
-            Ok(())
+    let api: Api<Pod> = Api::default_namespaced(client);
+    let (reader, writer) = reflector::store::<Pod>();
+
+    tokio::spawn(async move {
+        // Show state every 5 seconds of watching
+        loop {
+            reader.wait_until_ready().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            info!("Current pod count: {}", reader.state().len());
+            // full information with debug logs
+            for p in reader.state() {
+                let yaml = serde_saphyr::to_string(p.as_ref()).unwrap();
+                debug!("Pod {}: \n{}", p.name_any(), yaml);
+            }
+        }
+    });
+
+    let stream = watcher(api, watcher::Config::default().any_semantic())
+        .default_backoff()
+        .modify(|pod| {
+            // memory optimization for our store - we don't care about managed fields/annotations/status
+            pod.managed_fields_mut().clear();
+            pod.annotations_mut().clear();
+            pod.status = None;
         })
-        .await?;
+        .reflect(writer)
+        .applied_objects()
+        .predicate_filter(predicates::resource_version, Default::default());
+    let mut stream = pin!(stream);
+
+    while let Some(pod) = stream.try_next().await? {
+        info!("saw {}", pod.name_any());
+    }
     Ok(())
 }

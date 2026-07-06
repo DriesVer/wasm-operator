@@ -1,15 +1,16 @@
-#[macro_use] extern crate log;
 use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{
-    api::{Api, ListParams, ResourceExt},
-    runtime::{reflector, reflector::Store, utils::try_flatten_applied, watcher},
     Client,
+    api::{Api, ResourceExt},
+    runtime::{WatchStreamExt, reflector, reflector::Store, watcher},
 };
 use std::collections::BTreeMap;
+use tracing::*;
 
 /// Example way to read secrets
 #[derive(Debug)]
+#[allow(dead_code)] // we only gather data in this ex, we don't print the secrets
 enum Decoded {
     /// Usually secrets are just short utf8 encoded strings
     Utf8(String),
@@ -39,7 +40,7 @@ fn spawn_periodic_reader(reader: Store<Secret>) {
             let cms: Vec<_> = reader
                 .state()
                 .iter()
-                .map(|s| format!("{}: {:?}", s.name(), decode(s).keys()))
+                .map(|s| format!("{}: {:?}", s.name_any(), decode(s).keys()))
                 .collect();
             info!("Current secrets: {:?}", cms);
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
@@ -49,22 +50,20 @@ fn spawn_periodic_reader(reader: Store<Secret>) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    std::env::set_var("RUST_LOG", "info,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
-    let namespace = std::env::var("NAMESPACE").unwrap_or_else(|_| "default".into());
 
-    let secrets: Api<Secret> = Api::namespaced(client, &namespace);
-    let lp = ListParams::default().timeout(10); // short watch timeout in this example
+    let secrets: Api<Secret> = Api::default_namespaced(client);
+    let wc = watcher::Config::default().timeout(10); // short watch timeout in this example
 
-    let store = reflector::store::Writer::<Secret>::default();
-    let reader = store.as_reader();
-    let rf = reflector(store, watcher(secrets, lp));
+    let (reader, writer) = reflector::store::<Secret>();
+    let rf = reflector(writer, watcher(secrets, wc));
+
     spawn_periodic_reader(reader); // read from a reader in the background
 
-    try_flatten_applied(rf)
+    rf.applied_objects()
         .try_for_each(|s| async move {
-            log::info!("Applied: {}", s.name());
+            info!("saw: {}", s.name_any());
             Ok(())
         })
         .await?;

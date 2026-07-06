@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -exuo pipefail
 
 main() {
   cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. # aka $WORKSPACE_ROOT
@@ -13,7 +13,7 @@ main() {
     | head -n -3 > release.txt
 
   # Add links to critical bugs
-  local -r CRITISSUES="$(curl -sSL -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/kube-rs/kube-rs/issues?labels=critical)"
+  local -r CRITISSUES="$(curl -sSL -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/kube-rs/kube/issues?labels=critical)"
   if (( $(echo "${CRITISSUES}" | jq length) > 0 )); then
     echo -e "\n### Known Issues" >> release.txt
     echo "${CRITISSUES}" | jq '.[] | "- \(.title) - #[\(.number)](\(.url))"' -r >> release.txt

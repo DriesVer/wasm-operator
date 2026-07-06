@@ -1,17 +1,23 @@
-#[macro_use] extern crate log;
+// Nightly clippy (0.1.64) considers Drop a side effect, see https://github.com/rust-lang/rust-clippy/issues/9608
+#![allow(clippy::unnecessary_lazy_evaluations)]
+
 use anyhow::Result;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
-    api::{Api, ListParams, ObjectMeta, Patch, PatchParams, Resource},
-    runtime::controller::{Action, Context, Controller},
     Client, CustomResource,
+    api::{Api, ObjectMeta, Patch, PatchParams, Resource},
+    runtime::{
+        controller::{Action, Config, Controller},
+        watcher,
+    },
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::BufRead, sync::Arc};
 use thiserror::Error;
 use tokio::time::Duration;
+use tracing::*;
 
 #[derive(Debug, Error)]
 enum Error {
@@ -29,12 +35,8 @@ struct ConfigMapGeneratorSpec {
 }
 
 /// Controller triggers this whenever our main object or our children changed
-async fn reconcile(generator: Arc<ConfigMapGenerator>, ctx: Context<Data>) -> Result<Action, Error> {
-    log::info!("working hard");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    log::info!("hard work is done!");
-
-    let client = ctx.get_ref().client.clone();
+async fn reconcile(generator: Arc<ConfigMapGenerator>, ctx: Arc<Data>) -> Result<Action, Error> {
+    let client = &ctx.client;
 
     let mut contents = BTreeMap::new();
     contents.insert("content".to_string(), generator.spec.content.clone());
@@ -54,14 +56,14 @@ async fn reconcile(generator: Arc<ConfigMapGenerator>, ctx: Context<Data>) -> Re
             .metadata
             .namespace
             .as_ref()
-            .ok_or(Error::MissingObjectKey(".metadata.namespace"))?,
+            .ok_or_else(|| Error::MissingObjectKey(".metadata.namespace"))?,
     );
     cm_api
         .patch(
             cm.metadata
                 .name
                 .as_ref()
-                .ok_or(Error::MissingObjectKey(".metadata.name"))?,
+                .ok_or_else(|| Error::MissingObjectKey(".metadata.name"))?,
             &PatchParams::apply("configmapgenerator.kube-rt.nullable.se"),
             &Patch::Apply(&cm),
         )
@@ -71,7 +73,11 @@ async fn reconcile(generator: Arc<ConfigMapGenerator>, ctx: Context<Data>) -> Re
 }
 
 /// The controller triggers this on reconcile errors
-fn error_policy(_error: &Error, _ctx: Context<Data>) -> Action {
+fn error_policy(_object: Arc<ConfigMapGenerator>, error: &Error, _ctx: Arc<Data>) -> Action {
+    match error {
+        Error::ConfigMapCreationFailed(e) => warn!("cf creation failed: {e:?}"),
+        Error::MissingObjectKey(s) => warn!("missing key {s}"),
+    }
     Action::requeue(Duration::from_secs(1))
 }
 
@@ -82,15 +88,14 @@ struct Data {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    std::env::set_var("RUST_LOG", "info,kube-runtime=debug,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
 
     let cmgs = Api::<ConfigMapGenerator>::all(client.clone());
     let cms = Api::<ConfigMap>::all(client.clone());
 
-    log::info!("starting configmapgen-controller");
-    log::info!("press <enter> to force a reconciliation of all objects");
+    info!("starting configmapgen-controller");
+    info!("press <enter> to force a reconciliation of all objects");
 
     let (mut reload_tx, reload_rx) = futures::channel::mpsc::channel(0);
     // Using a regular background thread since tokio::io::stdin() doesn't allow aborting reads,
@@ -101,11 +106,15 @@ async fn main() -> Result<()> {
         }
     });
 
-    Controller::new(cmgs, ListParams::default())
-        .owns(cms, ListParams::default())
+    // limit the controller to running a maximum of two concurrent reconciliations
+    let config = Config::default().concurrency(2);
+
+    Controller::new(cmgs, watcher::Config::default())
+        .owns(cms, watcher::Config::default())
+        .with_config(config)
         .reconcile_all_on(reload_rx.map(|_| ()))
         .shutdown_on_signal()
-        .run(reconcile, error_policy, Context::new(Data { client }))
+        .run(reconcile, error_policy, Arc::new(Data { client }))
         .for_each(|res| async move {
             match res {
                 Ok(o) => info!("reconciled {:?}", o),
@@ -113,6 +122,6 @@ async fn main() -> Result<()> {
             }
         })
         .await;
-    log::info!("controller terminated");
+    info!("controller terminated");
     Ok(())
 }

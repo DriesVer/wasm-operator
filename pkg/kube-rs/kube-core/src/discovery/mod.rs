@@ -1,5 +1,7 @@
 //! Type information structs for API discovery
 use crate::{gvk::GroupVersionKind, resource::Resource};
+
+pub mod v2;
 use serde::{Deserialize, Serialize};
 
 /// Information about a Kubernetes API resource
@@ -125,24 +127,23 @@ fn to_plural(word: &str) -> String {
         || word.ends_with("ch")
         || word.ends_with("sh")
     {
-        return format!("{}es", word);
+        return format!("{word}es");
     }
 
     // Words ending in y that are preceded by a consonant will be pluralized by
     // replacing y with -ies (eg. puppies).
-    if word.ends_with('y') {
-        if let Some(c) = word.chars().nth(word.len() - 2) {
-            if !matches!(c, 'a' | 'e' | 'i' | 'o' | 'u') {
-                // Remove 'y' and add `ies`
-                let mut chars = word.chars();
-                chars.next_back();
-                return format!("{}ies", chars.as_str());
-            }
-        }
+    if word.ends_with('y')
+        && let Some(c) = word.chars().nth(word.len() - 2)
+        && !matches!(c, 'a' | 'e' | 'i' | 'o' | 'u')
+    {
+        // Remove 'y' and add `ies`
+        let mut chars = word.chars();
+        chars.next_back();
+        return format!("{}ies", chars.as_str());
     }
 
     // All other words will have "s" added to the end (eg. days).
-    format!("{}s", word)
+    format!("{word}s")
 }
 
 #[test]

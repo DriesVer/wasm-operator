@@ -1,55 +1,78 @@
-//! A basic API client for interacting with the Kubernetes API
+//! API client for interacting with the Kubernetes API
 //!
 //! The [`Client`] uses standard kube error handling.
 //!
-//! This client can be used on its own or in conjuction with the [`Api`][crate::api::Api]
+//! This client can be used on its own or in conjunction with the [`Api`][crate::api::Api]
 //! type for more structured interaction with the kubernetes API.
 //!
 //! The [`Client`] can also be used with [`Discovery`](crate::Discovery) to dynamically
 //! retrieve the resources served by the kubernetes API.
-use bytes::Bytes;
 use either::{Either, Left, Right};
-use futures::{self, Stream, StreamExt, TryStream, TryStreamExt};
-use http::{self, Request, Response, StatusCode};
-use hyper::Body;
+use futures::{AsyncBufRead, StreamExt, TryStream, TryStreamExt, future::BoxFuture};
+use http::{self, Request, Response};
+use http_body_util::BodyExt;
+#[cfg(feature = "ws")]
+use hyper_util::rt::TokioIo;
+use jiff::Timestamp;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1 as k8s_meta_v1;
-pub use kube_core::response::Status;
+use kube_core::{discovery::v2::ACCEPT_AGGREGATED_DISCOVERY_V2, response::Status};
 use serde::de::DeserializeOwned;
 use serde_json::{self, Value};
 #[cfg(feature = "ws")]
-use tokio_tungstenite::{tungstenite as ws, WebSocketStream};
+use tokio_tungstenite::{WebSocketStream, tungstenite as ws};
 use tokio_util::{
     codec::{FramedRead, LinesCodec, LinesCodecError},
     io::StreamReader,
 };
-use tower::{buffer::Buffer, util::BoxService, BoxError, Layer, Service, ServiceExt};
-use tower_http::map_response_body::MapResponseBodyLayer;
+use tower::{BoxError, Service, ServiceExt as _, buffer::Buffer};
+use tower_http::ServiceExt as _;
 
-use crate::{api::WatchEvent, error::ErrorResponse, Config, Error, Result};
+pub use self::body::Body;
+use crate::{Config, Error, Result, api::WatchEvent, config::Kubeconfig};
 
 mod auth;
 mod body;
 mod builder;
-// Add `into_stream()` to `http::Body`
-use body::BodyStreamExt;
+pub use kube_core::discovery::v2::{
+    APIGroupDiscovery, APIGroupDiscoveryList, APIResourceDiscovery, APISubresourceDiscovery,
+    APIVersionDiscovery, GroupVersionKind as DiscoveryGroupVersionKind,
+};
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-client")))]
+#[cfg(feature = "unstable-client")]
+mod client_ext;
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-client")))]
+#[cfg(feature = "unstable-client")]
+pub use client_ext::scope;
 mod config_ext;
 pub use auth::Error as AuthError;
 pub use config_ext::ConfigExt;
 pub mod middleware;
-#[cfg(any(feature = "native-tls", feature = "rustls-tls", feature = "openssl-tls"))]
+pub mod retry;
+
+#[cfg(any(feature = "rustls-tls", feature = "openssl-tls"))]
 mod tls;
 
-#[cfg(feature = "native-tls")] pub use tls::native_tls::Error as NativeTlsError;
 #[cfg(feature = "openssl-tls")]
 pub use tls::openssl_tls::Error as OpensslTlsError;
-#[cfg(feature = "rustls-tls")] pub use tls::rustls_tls::Error as RustlsTlsError;
-#[cfg(feature = "ws")] mod upgrade;
+#[cfg(feature = "rustls-tls")]
+pub use tls::rustls_tls::Error as RustlsTlsError;
+#[cfg(feature = "ws")]
+mod upgrade;
 
 #[cfg(feature = "oauth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
 pub use auth::OAuthError;
 
-#[cfg(feature = "ws")] pub use upgrade::UpgradeConnectionError;
+#[cfg(feature = "oidc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "oidc")))]
+pub use auth::oidc_errors;
+
+#[cfg(feature = "ws")]
+pub use upgrade::UpgradeConnectionError;
+
+#[cfg(feature = "kubelet-debug")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kubelet-debug")))]
+mod kubelet_debug;
 
 pub use builder::{ClientBuilder, DynBody};
 
@@ -63,11 +86,40 @@ pub use builder::{ClientBuilder, DynBody};
 #[derive(Clone)]
 pub struct Client {
     // - `Buffer` for cheap clone
-    // - `BoxService` for dynamic response future type
-    inner: Buffer<BoxService<Request<Body>, Response<Body>, BoxError>, Request<Body>>,
+    // - `BoxFuture` for dynamic response future type
+    inner: Buffer<Request<Body>, BoxFuture<'static, Result<Response<Body>, BoxError>>>,
     default_ns: String,
+    valid_until: Option<Timestamp>,
 }
 
+/// Represents a WebSocket connection.
+/// Value returned by [`Client::connect`].
+#[cfg(feature = "ws")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ws")))]
+pub struct Connection {
+    stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
+    protocol: upgrade::StreamProtocol,
+}
+
+#[cfg(feature = "ws")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ws")))]
+impl Connection {
+    /// Return true if the stream supports graceful close signaling.
+    pub fn supports_stream_close(&self) -> bool {
+        self.protocol.supports_stream_close()
+    }
+
+    /// Transform into the raw WebSocketStream.
+    pub fn into_stream(self) -> WebSocketStream<TokioIo<hyper::upgrade::Upgraded>> {
+        self.stream
+    }
+}
+
+/// Constructors and low-level api interfaces.
+///
+/// Most users only need [`Client::try_default`] or [`Client::new`] from this block.
+///
+/// The many various lower level interfaces here are for more advanced use-cases with specific requirements.
 impl Client {
     /// Create a [`Client`] using a custom `Service` stack.
     ///
@@ -85,13 +137,15 @@ impl Client {
     /// ```rust
     /// # async fn doc() -> Result<(), Box<dyn std::error::Error>> {
     /// use kube::{client::ConfigExt, Client, Config};
-    /// use tower::ServiceBuilder;
+    /// use tower::{BoxError, ServiceBuilder};
+    /// use hyper_util::rt::TokioExecutor;
     ///
     /// let config = Config::infer().await?;
     /// let service = ServiceBuilder::new()
     ///     .layer(config.base_uri_layer())
     ///     .option_layer(config.auth_layer()?)
-    ///     .service(hyper::Client::new());
+    ///     .map_err(BoxError::from)
+    ///     .service(hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http());
     /// let client = Client::new(service, config.default_namespace);
     /// # Ok(())
     /// # }
@@ -105,22 +159,42 @@ impl Client {
         B::Error: Into<BoxError>,
         T: Into<String>,
     {
-        // Transform response body to `hyper::Body` and use type erased error to avoid type parameters.
-        let service = MapResponseBodyLayer::new(|b: B| Body::wrap_stream(b.into_stream()))
-            .layer(service)
-            .map_err(|e| e.into());
+        // Transform response body to `crate::client::Body` and use type erased error to avoid type parameters.
+        let service = service
+            .map_response_body(Body::wrap_body)
+            .map_err(Into::into)
+            .boxed();
         Self {
-            inner: Buffer::new(BoxService::new(service), 1024),
+            inner: Buffer::new(service, 1024),
             default_ns: default_namespace.into(),
+            valid_until: None,
         }
+    }
+
+    /// Sets an expiration timestamp to the client, which has to be checked by the user using [`Client::valid_until`] function.
+    pub fn with_valid_until(self, valid_until: Option<Timestamp>) -> Self {
+        Client { valid_until, ..self }
+    }
+
+    /// Get the expiration timestamp of the client, if it has been set.
+    pub fn valid_until(&self) -> &Option<Timestamp> {
+        &self.valid_until
     }
 
     /// Create and initialize a [`Client`] using the inferred configuration.
     ///
-    /// Will use [`Config::infer`] which attempts to load the local kubec-config first,
+    /// Will use [`Config::infer`] which attempts to load the local kubeconfig first,
     /// and then if that fails, trying the in-cluster environment variables.
     ///
     /// Will fail if neither configuration could be loaded.
+    ///
+    /// ```rust
+    /// # async fn doc() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use kube::Client;
+    /// let client = Client::try_default().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// If you already have a [`Config`] then use [`Client::try_from`](Self::try_from)
     /// instead.
@@ -128,11 +202,19 @@ impl Client {
         Self::try_from(Config::infer().await.map_err(Error::InferConfig)?)
     }
 
-    pub(crate) fn default_ns(&self) -> &str {
+    /// Get the default namespace for the client
+    ///
+    /// The namespace is either configured on `context` in the kubeconfig,
+    /// falls back to `default` when running locally,
+    /// or uses the service account's namespace when deployed in-cluster.
+    pub fn default_namespace(&self) -> &str {
         &self.default_ns
     }
 
-    async fn send(&self, request: Request<Body>) -> Result<Response<Body>> {
+    /// Perform a raw HTTP request against the API and return the raw response back.
+    /// This method can be used to get raw access to the API which may be used to, for example,
+    /// create a proxy server or application-level gateway between localhost and the API server.
+    pub async fn send(&self, request: Request<Body>) -> Result<Response<Body>> {
         let mut svc = self.inner.clone();
         let res = svc
             .ready()
@@ -141,16 +223,13 @@ impl Client {
             .call(request)
             .await
             .map_err(|err| {
-                if err.is::<Error>() {
-                    // Error decorating request
-                    *err.downcast::<Error>().expect("kube_client::Error")
-                } else if err.is::<hyper::Error>() {
+                // Error decorating request
+                err.downcast::<Error>()
+                    .map(|e| *e)
                     // Error requesting
-                    Error::HyperError(*err.downcast::<hyper::Error>().expect("hyper::Error"))
-                } else {
-                    // Errors from other middlewares
-                    Error::Service(err)
-                }
+                    .or_else(|err| err.downcast::<hyper::Error>().map(|err| Error::HyperError(*err)))
+                    // Error from another middleware
+                    .unwrap_or_else(Error::Service)
             })?;
         Ok(res)
     }
@@ -158,10 +237,7 @@ impl Client {
     /// Make WebSocket connection.
     #[cfg(feature = "ws")]
     #[cfg_attr(docsrs, doc(cfg(feature = "ws")))]
-    pub async fn connect(
-        &self,
-        request: Request<Vec<u8>>,
-    ) -> Result<WebSocketStream<hyper::upgrade::Upgraded>> {
+    pub async fn connect(&self, request: Request<Vec<u8>>) -> Result<Connection> {
         use http::header::HeaderValue;
         let (mut parts, body) = request.into_parts();
         parts
@@ -174,27 +250,25 @@ impl Client {
             http::header::SEC_WEBSOCKET_VERSION,
             HeaderValue::from_static("13"),
         );
-        let key = upgrade::sec_websocket_key();
+        let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
         parts.headers.insert(
             http::header::SEC_WEBSOCKET_KEY,
             key.parse().expect("valid header value"),
         );
-        // Use the binary subprotocol v4, to get JSON `Status` object in `error` channel (3).
-        // There's no official documentation about this protocol, but it's described in
-        // [`k8s.io/apiserver/pkg/util/wsstream/conn.go`](https://git.io/JLQED).
-        // There's a comment about v4 and `Status` object in
-        // [`kublet/cri/streaming/remotecommand/httpstream.go`](https://git.io/JLQEh).
-        parts.headers.insert(
-            http::header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static(upgrade::WS_PROTOCOL),
-        );
+        upgrade::StreamProtocol::add_to_headers(&mut parts.headers)?;
 
         let res = self.send(Request::from_parts(parts, Body::from(body))).await?;
-        upgrade::verify_response(&res, &key).map_err(Error::UpgradeConnection)?;
+        let protocol = upgrade::verify_response(&res, &key).map_err(Error::UpgradeConnection)?;
         match hyper::upgrade::on(res).await {
-            Ok(upgraded) => {
-                Ok(WebSocketStream::from_raw_socket(upgraded, ws::protocol::Role::Client, None).await)
-            }
+            Ok(upgraded) => Ok(Connection {
+                stream: WebSocketStream::from_raw_socket(
+                    TokioIo::new(upgraded),
+                    ws::protocol::Role::Client,
+                    None,
+                )
+                .await,
+                protocol,
+            }),
 
             Err(e) => Err(Error::UpgradeConnection(
                 UpgradeConnectionError::GetPendingUpgrade(e),
@@ -220,26 +294,23 @@ impl Client {
     /// as a string
     pub async fn request_text(&self, request: Request<Vec<u8>>) -> Result<String> {
         let res = self.send(request.map(Body::from)).await?;
-        let status = res.status();
-        // trace!("Status = {:?} for {}", status, res.url());
-        let body_bytes = hyper::body::to_bytes(res.into_body())
-            .await
-            .map_err(Error::HyperError)?;
+        let res = handle_api_errors(res).await?;
+        let body_bytes = res.into_body().collect().await?.to_bytes();
         let text = String::from_utf8(body_bytes.to_vec()).map_err(Error::FromUtf8)?;
-        handle_api_errors(&text, status)?;
-
         Ok(text)
     }
 
-    /// Perform a raw HTTP request against the API and get back the response
-    /// as a stream of bytes
-    pub async fn request_text_stream(
-        &self,
-        request: Request<Vec<u8>>,
-    ) -> Result<impl Stream<Item = Result<Bytes>>> {
+    /// Perform a raw HTTP request against the API and stream the response body.
+    ///
+    /// The response can be processed using [`AsyncReadExt`](futures::AsyncReadExt)
+    /// and [`AsyncBufReadExt`](futures::AsyncBufReadExt).
+    pub async fn request_stream(&self, request: Request<Vec<u8>>) -> Result<impl AsyncBufRead + use<>> {
         let res = self.send(request.map(Body::from)).await?;
-        // trace!("Status = {:?} for {}", res.status(), res.url());
-        Ok(res.into_body().map_err(Error::HyperError))
+        let res = handle_api_errors(res).await?;
+        // Map the error, since we want to convert this into an `AsyncBufReader` using
+        // `into_async_read` which specifies `std::io::Error` as the stream's error type.
+        let body = res.into_body().into_data_stream().map_err(std::io::Error::other);
+        Ok(body.into_async_read())
     }
 
     /// Perform a raw HTTP request against the API and get back either an object
@@ -269,7 +340,7 @@ impl Client {
     pub async fn request_events<T>(
         &self,
         request: Request<Vec<u8>>,
-    ) -> Result<impl TryStream<Item = Result<WatchEvent<T>>>>
+    ) -> Result<impl TryStream<Item = Result<WatchEvent<T>>> + use<T>>
     where
         T: Clone + DeserializeOwned,
     {
@@ -278,17 +349,13 @@ impl Client {
         tracing::trace!("headers: {:?}", res.headers());
 
         let frames = FramedRead::new(
-            StreamReader::new(res.into_body().map_err(|e| {
-                // Client timeout. This will be ignored.
-                if e.is_timeout() {
-                    return std::io::Error::new(std::io::ErrorKind::TimedOut, e);
-                }
+            StreamReader::new(res.into_body().into_data_stream().map_err(|e| {
                 // Unexpected EOF from chunked decoder.
                 // Tends to happen when watching for 300+s. This will be ignored.
                 if e.to_string().contains("unexpected EOF during chunk") {
                     return std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e);
                 }
-                std::io::Error::new(std::io::ErrorKind::Other, e)
+                std::io::Error::other(e)
             })),
             LinesCodec::new(),
         );
@@ -304,8 +371,8 @@ impl Client {
                         }
 
                         // Got general error response
-                        if let Ok(e_resp) = serde_json::from_str::<ErrorResponse>(&line) {
-                            return Some(Err(Error::Api(e_resp)));
+                        if let Ok(status) = serde_json::from_str::<Status>(&line) {
+                            return Some(Err(Error::Api(status.boxed())));
                         }
                         // Parsing error
                         Some(Err(Error::SerdeError(e)))
@@ -345,24 +412,14 @@ impl Client {
 impl Client {
     /// Returns apiserver version.
     pub async fn apiserver_version(&self) -> Result<k8s_openapi::apimachinery::pkg::version::Info> {
-        self.request(
-            Request::builder()
-                .uri("/version")
-                .body(vec![])
-                .map_err(Error::HttpError)?,
-        )
-        .await
+        self.request(Request::get("/version").body(vec![]).map_err(Error::HttpError)?)
+            .await
     }
 
     /// Lists api groups that apiserver serves.
     pub async fn list_api_groups(&self) -> Result<k8s_meta_v1::APIGroupList> {
-        self.request(
-            Request::builder()
-                .uri("/apis")
-                .body(vec![])
-                .map_err(Error::HttpError)?,
-        )
-        .await
+        self.request(Request::get("/apis").body(vec![]).map_err(Error::HttpError)?)
+            .await
     }
 
     /// Lists resources served in given API group.
@@ -384,33 +441,91 @@ impl Client {
     /// # }
     /// ```
     pub async fn list_api_group_resources(&self, apiversion: &str) -> Result<k8s_meta_v1::APIResourceList> {
-        let url = format!("/apis/{}", apiversion);
-        self.request(
-            Request::builder()
-                .uri(url)
-                .body(vec![])
-                .map_err(Error::HttpError)?,
-        )
-        .await
+        let url = format!("/apis/{apiversion}");
+        self.request(Request::get(url).body(vec![]).map_err(Error::HttpError)?)
+            .await
     }
 
     /// Lists versions of `core` a.k.a. `""` legacy API group.
     pub async fn list_core_api_versions(&self) -> Result<k8s_meta_v1::APIVersions> {
+        self.request(Request::get("/api").body(vec![]).map_err(Error::HttpError)?)
+            .await
+    }
+
+    /// Lists resources served in particular `core` group version.
+    pub async fn list_core_api_resources(&self, version: &str) -> Result<k8s_meta_v1::APIResourceList> {
+        let url = format!("/api/{version}");
+        self.request(Request::get(url).body(vec![]).map_err(Error::HttpError)?)
+            .await
+    }
+}
+
+/// Aggregated Discovery API methods
+///
+/// These methods use the Aggregated Discovery API (available since Kubernetes 1.26, stable in 1.30)
+/// to fetch all API resources in a single request, reducing the number of API calls compared to
+/// the traditional discovery methods.
+impl Client {
+    /// Returns aggregated discovery for all API groups served at /apis.
+    ///
+    /// This uses the Aggregated Discovery API to fetch all non-core API groups
+    /// and their resources in a single request.
+    ///
+    /// Requires Kubernetes 1.26+ (beta) or 1.30+ (stable).
+    ///
+    /// ### Example usage:
+    /// ```rust,no_run
+    /// # async fn scope(client: kube::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// let discovery = client.list_api_groups_aggregated().await?;
+    /// for group in discovery.items {
+    ///     let name = group.metadata.as_ref().and_then(|m| m.name.as_ref());
+    ///     println!("Group: {:?}", name);
+    ///     for version in group.versions {
+    ///         println!("  Version: {:?}", version.version);
+    ///         for resource in version.resources {
+    ///             println!("    Resource: {:?}", resource.resource);
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_api_groups_aggregated(&self) -> Result<APIGroupDiscoveryList> {
         self.request(
-            Request::builder()
-                .uri("/api")
+            Request::get("/apis")
+                .header(http::header::ACCEPT, ACCEPT_AGGREGATED_DISCOVERY_V2)
                 .body(vec![])
                 .map_err(Error::HttpError)?,
         )
         .await
     }
 
-    /// Lists resources served in particular `core` group version.
-    pub async fn list_core_api_resources(&self, version: &str) -> Result<k8s_meta_v1::APIResourceList> {
-        let url = format!("/api/{}", version);
+    /// Returns aggregated discovery for core API group served at /api.
+    ///
+    /// This uses the Aggregated Discovery API to fetch the core API group
+    /// and all its resources in a single request.
+    ///
+    /// Requires Kubernetes 1.26+ (beta) or 1.30+ (stable).
+    ///
+    /// ### Example usage:
+    /// ```rust,no_run
+    /// # async fn scope(client: kube::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// let discovery = client.list_core_api_versions_aggregated().await?;
+    /// for group in discovery.items {
+    ///     for version in group.versions {
+    ///         println!("Core version: {:?}", version.version);
+    ///         for resource in version.resources {
+    ///             println!("  Resource: {:?} (scope: {:?})", resource.resource, resource.scope);
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_core_api_versions_aggregated(&self) -> Result<APIGroupDiscoveryList> {
         self.request(
-            Request::builder()
-                .uri(url)
+            Request::get("/api")
+                .header(http::header::ACCEPT, ACCEPT_AGGREGATED_DISCOVERY_V2)
                 .body(vec![])
                 .map_err(Error::HttpError)?,
         )
@@ -425,54 +540,109 @@ impl Client {
 ///
 /// In either case, present an ApiError upstream.
 /// The latter is probably a bug if encountered.
-fn handle_api_errors(text: &str, s: StatusCode) -> Result<()> {
-    if s.is_client_error() || s.is_server_error() {
+async fn handle_api_errors(res: Response<Body>) -> Result<Response<Body>> {
+    let status = res.status();
+    if status.is_client_error() || status.is_server_error() {
+        // trace!("Status = {:?} for {}", status, res.url());
+        let body_bytes = res.into_body().collect().await?.to_bytes();
+        let text = String::from_utf8(body_bytes.to_vec()).map_err(Error::FromUtf8)?;
         // Print better debug when things do fail
         // trace!("Parsing error: {}", text);
-        if let Ok(errdata) = serde_json::from_str::<ErrorResponse>(text) {
-            tracing::debug!("Unsuccessful: {:?}", errdata);
-            Err(Error::Api(errdata))
+        if let Ok(status) = serde_json::from_str::<Status>(&text) {
+            tracing::debug!("Unsuccessful: {status:?}");
+            Err(Error::Api(status.boxed()))
         } else {
-            tracing::warn!("Unsuccessful data error parse: {}", text);
-            let ae = ErrorResponse {
-                status: s.to_string(),
-                code: s.as_u16(),
-                message: format!("{:?}", text),
-                reason: "Failed to parse error data".into(),
-            };
-            tracing::debug!("Unsuccessful: {:?} (reconstruct)", ae);
-            Err(Error::Api(ae))
+            tracing::warn!("Unsuccessful data error parse: {text}");
+            let status = Status::failure(&text, "Failed to parse error data").with_code(status.as_u16());
+            tracing::debug!("Unsuccessful: {status:?} (reconstruct)");
+            Err(Error::Api(status.boxed()))
         }
     } else {
-        Ok(())
+        Ok(res)
     }
 }
 
 impl TryFrom<Config> for Client {
     type Error = Error;
 
-    /// Builds a default [`Client`] from a [`Config`], see [`ClientBuilder`] if more customization is required
+    /// Builds a default [`Client`] from a [`Config`].
+    ///
+    /// See [`ClientBuilder`] or [`Client::new`] if more customization is required
     fn try_from(config: Config) -> Result<Self> {
+        Ok(ClientBuilder::try_from(config)?.build())
+    }
+}
+
+impl TryFrom<Kubeconfig> for Client {
+    type Error = Error;
+
+    fn try_from(kubeconfig: Kubeconfig) -> Result<Self> {
+        let config = Config::try_from(kubeconfig)?;
         Ok(ClientBuilder::try_from(config)?.build())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Api, Client};
+    use std::pin::pin;
 
-    use futures::pin_mut;
+    use crate::{
+        Api, Client,
+        client::Body,
+        config::{AuthInfo, Cluster, Context, Kubeconfig, NamedAuthInfo, NamedCluster, NamedContext},
+    };
+
     use http::{Request, Response};
-    use hyper::Body;
     use k8s_openapi::api::core::v1::Pod;
+    use kube_core::metadata::PartialObjectMeta;
     use tower_test::mock;
+
+    #[tokio::test]
+    async fn test_default_ns() {
+        let (mock_service, _) = mock::pair::<Request<Body>, Response<Body>>();
+        let client = Client::new(mock_service, "test-namespace");
+        assert_eq!(client.default_namespace(), "test-namespace");
+    }
+
+    #[tokio::test]
+    async fn test_try_from_kubeconfig() {
+        let config = Kubeconfig {
+            current_context: Some("test-context".to_string()),
+            auth_infos: vec![NamedAuthInfo {
+                name: "test-user".to_string(),
+                auth_info: Some(AuthInfo::default()), // <-- empty but valid
+                ..Default::default()
+            }],
+            contexts: vec![NamedContext {
+                name: "test-context".to_string(),
+                context: Some(Context {
+                    cluster: "test-cluster".to_string(),
+                    user: Some("test-user".to_string()),
+                    namespace: Some("test-namespace".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            clusters: vec![NamedCluster {
+                name: "test-cluster".to_string(),
+                cluster: Some(Cluster {
+                    server: Some("http://localhost:8080".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let client = Client::try_from(config).expect("Failed to create client from kubeconfig");
+        assert_eq!(client.default_namespace(), "test-namespace");
+    }
 
     #[tokio::test]
     async fn test_mock() {
         let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
         let spawned = tokio::spawn(async move {
             // Receive a request for pod and respond with some data
-            pin_mut!(handle);
+            let mut handle = pin!(handle);
             let (request, send) = handle.next_request().await.expect("service not called");
             assert_eq!(request.method(), http::Method::GET);
             assert_eq!(request.uri().to_string(), "/api/v1/namespaces/default/pods/test");
@@ -488,16 +658,123 @@ mod tests {
                 }
             }))
             .unwrap();
-            send.send_response(
-                Response::builder()
-                    .body(Body::from(serde_json::to_vec(&pod).unwrap()))
-                    .unwrap(),
-            );
+            send.send_response(Response::new(Body::from(serde_json::to_vec(&pod).unwrap())));
         });
 
         let pods: Api<Pod> = Api::default_namespaced(Client::new(mock_service, "default"));
         let pod = pods.get("test").await.unwrap();
         assert_eq!(pod.metadata.annotations.unwrap().get("kube-rs").unwrap(), "test");
+        spawned.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_partial_object_meta_get_uses_metadata_header() {
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let spawned = tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            let (request, send) = handle.next_request().await.expect("service not called");
+            // Verify the metadata-only Accept header is set
+            assert_eq!(
+                request.headers().get(http::header::ACCEPT).unwrap(),
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+            );
+            let pod_meta: PartialObjectMeta<Pod> =
+                serde_json::from_value(serde_json::json!({
+                    "apiVersion": "meta.k8s.io/v1",
+                    "kind": "PartialObjectMetadata",
+                    "metadata": {
+                        "name": "test",
+                    },
+                }))
+                .unwrap();
+            send.send_response(Response::new(Body::from(
+                serde_json::to_vec(&pod_meta).unwrap(),
+            )));
+        });
+
+        let pods: Api<PartialObjectMeta<Pod>> =
+            Api::default_namespaced(Client::new(mock_service, "default"));
+        let pod = pods.get("test").await.unwrap();
+        assert_eq!(pod.metadata.name, Some("test".to_string()));
+        spawned.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_partial_object_meta_list_uses_metadata_header() {
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let spawned = tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            let (request, send) = handle.next_request().await.expect("service not called");
+            assert_eq!(
+                request.headers().get(http::header::ACCEPT).unwrap(),
+                "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+            );
+            send.send_response(Response::new(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "meta.k8s.io/v1",
+                    "kind": "PartialObjectMetadataList",
+                    "metadata": { "resourceVersion": "1" },
+                    "items": [],
+                }))
+                .unwrap(),
+            )));
+        });
+
+        let pods: Api<PartialObjectMeta<Pod>> =
+            Api::default_namespaced(Client::new(mock_service, "default"));
+        let list = pods.list(&Default::default()).await.unwrap();
+        assert_eq!(list.items.len(), 0);
+        spawned.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_partial_object_meta_patch_uses_metadata_header() {
+        use kube_core::params::{Patch, PatchParams};
+
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let spawned = tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            let (request, send) = handle.next_request().await.expect("service not called");
+            assert_eq!(request.method(), http::Method::PATCH);
+            assert_eq!(
+                request.headers().get(http::header::ACCEPT).unwrap(),
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+            );
+            send.send_response(Response::new(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "meta.k8s.io/v1",
+                    "kind": "PartialObjectMetadata",
+                    "metadata": { "name": "test" },
+                }))
+                .unwrap(),
+            )));
+        });
+
+        let pods: Api<PartialObjectMeta<Pod>> =
+            Api::default_namespaced(Client::new(mock_service, "default"));
+        let patch = Patch::Merge(serde_json::json!({ "metadata": { "labels": { "a": "b" } } }));
+        let pod = pods.patch("test", &PatchParams::default(), &patch).await.unwrap();
+        assert_eq!(pod.metadata.name, Some("test".to_string()));
+        spawned.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_partial_object_meta_watch_uses_metadata_header() {
+        let (mock_service, handle) = mock::pair::<Request<Body>, Response<Body>>();
+        let spawned = tokio::spawn(async move {
+            let mut handle = pin!(handle);
+            let (request, send) = handle.next_request().await.expect("service not called");
+            assert_eq!(
+                request.headers().get(http::header::ACCEPT).unwrap(),
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+            );
+            // Send an empty response to close the stream
+            send.send_response(Response::new(Body::from(vec![])));
+        });
+
+        let pods: Api<PartialObjectMeta<Pod>> =
+            Api::default_namespaced(Client::new(mock_service, "default"));
+        let _ = pods.watch(&Default::default(), "0").await;
         spawned.await.unwrap();
     }
 }

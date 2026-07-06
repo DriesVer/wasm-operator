@@ -1,22 +1,109 @@
-use derivative::Derivative;
+use educe::Educe;
 use k8s_openapi::{api::core::v1::ObjectReference, apimachinery::pkg::apis::meta::v1::OwnerReference};
+#[cfg(doc)] use kube_client::core::ObjectMeta;
 use kube_client::{
     api::{DynamicObject, Resource},
-    core::ObjectMeta,
-    ResourceExt,
+    core::api_version_from_group_version,
 };
 use std::{
+    borrow::Cow,
     fmt::{Debug, Display},
     hash::Hash,
 };
 
-#[derive(Derivative)]
-#[derivative(
-    Debug(bound = "K::DynamicType: Debug"),
-    PartialEq(bound = "K::DynamicType: PartialEq"),
-    Eq(bound = "K::DynamicType: Eq"),
-    Hash(bound = "K::DynamicType: Hash"),
-    Clone(bound = "K::DynamicType: Clone")
+/// Minimal lookup behaviour needed by a [reflector store](super::Store).
+///
+/// This trait is blanket-implemented for all [`Resource`] objects.
+pub trait Lookup {
+    /// Type information for types that do not know their resource information at compile time.
+    /// This is equivalent to [`Resource::DynamicType`].
+    type DynamicType;
+
+    /// The [kind](Resource::kind) for this object.
+    fn kind(dyntype: &Self::DynamicType) -> Cow<'_, str>;
+
+    /// The [group](Resource::group) for this object.
+    fn group(dyntype: &Self::DynamicType) -> Cow<'_, str>;
+
+    /// The [version](Resource::version) for this object.
+    fn version(dyntype: &Self::DynamicType) -> Cow<'_, str>;
+
+    /// The [apiVersion](Resource::_version) for this object.
+    fn api_version(dyntype: &Self::DynamicType) -> Cow<'_, str> {
+        api_version_from_group_version(Self::group(dyntype), Self::version(dyntype))
+    }
+
+    /// The [plural](Resource::plural) for this object.
+    fn plural(dyntype: &Self::DynamicType) -> Cow<'_, str>;
+
+    /// The [name](ObjectMeta#structfield.name) of the object.
+    fn name(&self) -> Option<Cow<'_, str>>;
+
+    /// The [namespace](ObjectMeta#structfield.namespace) of the object.
+    fn namespace(&self) -> Option<Cow<'_, str>>;
+
+    /// The [resource version](ObjectMeta#structfield.resource_version) of the object.
+    fn resource_version(&self) -> Option<Cow<'_, str>>;
+
+    /// The [UID](ObjectMeta#structfield.uid) of the object.
+    fn uid(&self) -> Option<Cow<'_, str>>;
+
+    /// Constructs an [`ObjectRef`] for this object.
+    fn to_object_ref(&self, dyntype: Self::DynamicType) -> ObjectRef<Self> {
+        ObjectRef {
+            dyntype,
+            name: self.name().expect(".metadata.name missing").into_owned(),
+            namespace: self.namespace().map(Cow::into_owned),
+            extra: Extra {
+                resource_version: self.resource_version().map(Cow::into_owned),
+                uid: self.uid().map(Cow::into_owned),
+            },
+        }
+    }
+}
+
+impl<K: Resource> Lookup for K {
+    type DynamicType = K::DynamicType;
+
+    fn kind(dyntype: &Self::DynamicType) -> Cow<'_, str> {
+        K::kind(dyntype)
+    }
+
+    fn version(dyntype: &Self::DynamicType) -> Cow<'_, str> {
+        K::version(dyntype)
+    }
+
+    fn group(dyntype: &Self::DynamicType) -> Cow<'_, str> {
+        K::group(dyntype)
+    }
+
+    fn plural(dyntype: &Self::DynamicType) -> Cow<'_, str> {
+        K::plural(dyntype)
+    }
+
+    fn name(&self) -> Option<Cow<'_, str>> {
+        self.meta().name.as_deref().map(Cow::Borrowed)
+    }
+
+    fn namespace(&self) -> Option<Cow<'_, str>> {
+        self.meta().namespace.as_deref().map(Cow::Borrowed)
+    }
+
+    fn resource_version(&self) -> Option<Cow<'_, str>> {
+        self.meta().resource_version.as_deref().map(Cow::Borrowed)
+    }
+
+    fn uid(&self) -> Option<Cow<'_, str>> {
+        self.meta().uid.as_deref().map(Cow::Borrowed)
+    }
+}
+
+#[derive(Educe)]
+#[educe(
+    Debug(bound("K::DynamicType: Debug")),
+    PartialEq(bound("K::DynamicType: PartialEq")),
+    Hash(bound("K::DynamicType: Hash")),
+    Clone(bound("K::DynamicType: Clone"))
 )]
 /// A typed and namedspaced (if relevant) reference to a Kubernetes object
 ///
@@ -33,7 +120,8 @@ use std::{
 /// );
 /// ```
 #[non_exhaustive]
-pub struct ObjectRef<K: Resource> {
+pub struct ObjectRef<K: Lookup + ?Sized> {
+    /// Resource information for the object K
     pub dyntype: K::DynamicType,
     /// The name of the object
     pub name: String,
@@ -53,9 +141,11 @@ pub struct ObjectRef<K: Resource> {
     ///
     /// This is *not* considered when comparing objects, but may be used when converting to and from other representations,
     /// such as [`OwnerReference`] or [`ObjectReference`].
-    #[derivative(Hash = "ignore", PartialEq = "ignore")]
+    #[educe(Hash(ignore), PartialEq(ignore))]
     pub extra: Extra,
 }
+
+impl<K: Lookup + ?Sized> Eq for ObjectRef<K> where K::DynamicType: Eq {}
 
 /// Non-vital information about an object being referred to
 ///
@@ -69,25 +159,36 @@ pub struct Extra {
     pub uid: Option<String>,
 }
 
-impl<K: Resource> ObjectRef<K>
+impl<K: Lookup> ObjectRef<K>
 where
     K::DynamicType: Default,
 {
+    /// Create a default object ref with a name
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self::new_with(name, Default::default())
     }
 
+    /// Create an object ref from an object `K`
+    ///
+    /// This object is assumed to be valid and will expect a .metadata.name.
     #[must_use]
-    pub fn from_obj(obj: &K) -> Self
-    where
-        K: Resource,
-    {
-        Self::from_obj_with(obj, Default::default())
+    pub fn from_obj(obj: &K) -> Self {
+        obj.to_object_ref(Default::default())
     }
 }
 
-impl<K: Resource> ObjectRef<K> {
+impl<K: Lookup> From<&K> for ObjectRef<K>
+where
+    K::DynamicType: Default,
+{
+    fn from(obj: &K) -> Self {
+        Self::from_obj(obj)
+    }
+}
+
+impl<K: Lookup> ObjectRef<K> {
+    /// Create an object ref with a name and a dynamic resource type
     #[must_use]
     pub fn new_with(name: &str, dyntype: K::DynamicType) -> Self {
         Self {
@@ -98,6 +199,7 @@ impl<K: Resource> ObjectRef<K> {
         }
     }
 
+    /// Set the namespace on an object ref
     #[must_use]
     pub fn within(mut self, namespace: &str) -> Self {
         self.namespace = Some(namespace.to_string());
@@ -108,15 +210,9 @@ impl<K: Resource> ObjectRef<K> {
     #[must_use]
     pub fn from_obj_with(obj: &K, dyntype: K::DynamicType) -> Self
     where
-        K: Resource,
+        K: Lookup,
     {
-        let meta = obj.meta();
-        Self {
-            dyntype,
-            name: obj.name(),
-            namespace: meta.namespace.clone(),
-            extra: Extra::from_obj_meta(meta),
-        }
+        obj.to_object_ref(dyntype)
     }
 
     /// Create an `ObjectRef` from an `OwnerReference`
@@ -148,7 +244,7 @@ impl<K: Resource> ObjectRef<K> {
     /// Note that no checking is done on whether this conversion makes sense. For example, every `Service`
     /// has a corresponding `Endpoints`, but it wouldn't make sense to convert a `Pod` into a `Deployment`.
     #[must_use]
-    pub fn into_kind_unchecked<K2: Resource>(self, dt2: K2::DynamicType) -> ObjectRef<K2> {
+    pub fn into_kind_unchecked<K2: Lookup>(self, dt2: K2::DynamicType) -> ObjectRef<K2> {
         ObjectRef {
             dyntype: dt2,
             name: self.name,
@@ -157,9 +253,16 @@ impl<K: Resource> ObjectRef<K> {
         }
     }
 
+    /// Create a object ref for a type erased dynamic object (using a static impl)
     pub fn erase(self) -> ObjectRef<DynamicObject> {
         ObjectRef {
-            dyntype: kube_client::api::ApiResource::erase::<K>(&self.dyntype),
+            dyntype: kube_client::api::ApiResource {
+                group: K::group(&self.dyntype).to_string(),
+                version: K::version(&self.dyntype).to_string(),
+                api_version: K::api_version(&self.dyntype).to_string(),
+                kind: K::kind(&self.dyntype).to_string(),
+                plural: K::plural(&self.dyntype).to_string(),
+            },
             name: self.name,
             namespace: self.namespace,
             extra: self.extra,
@@ -167,7 +270,7 @@ impl<K: Resource> ObjectRef<K> {
     }
 }
 
-impl<K: Resource> From<ObjectRef<K>> for ObjectReference {
+impl<K: Lookup> From<ObjectRef<K>> for ObjectReference {
     fn from(val: ObjectRef<K>) -> Self {
         let ObjectRef {
             dyntype: dt,
@@ -190,7 +293,7 @@ impl<K: Resource> From<ObjectRef<K>> for ObjectReference {
     }
 }
 
-impl<K: Resource> Display for ObjectRef<K> {
+impl<K: Lookup> Display for ObjectRef<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -201,18 +304,9 @@ impl<K: Resource> Display for ObjectRef<K> {
             self.name
         )?;
         if let Some(namespace) = &self.namespace {
-            write!(f, ".{}", namespace)?;
+            write!(f, ".{namespace}")?;
         }
         Ok(())
-    }
-}
-
-impl Extra {
-    fn from_obj_meta(obj_meta: &ObjectMeta) -> Self {
-        Self {
-            resource_version: obj_meta.resource_version.clone(),
-            uid: obj_meta.uid.clone(),
-        }
     }
 }
 
@@ -251,11 +345,11 @@ mod tests {
     #[test]
     fn display_should_be_transparent_to_representation() {
         let pod_ref = ObjectRef::<Pod>::new("my-pod").within("my-namespace");
-        assert_eq!(format!("{}", pod_ref), format!("{}", pod_ref.erase()));
+        assert_eq!(format!("{pod_ref}"), format!("{}", pod_ref.erase()));
         let deploy_ref = ObjectRef::<Deployment>::new("my-deploy").within("my-namespace");
-        assert_eq!(format!("{}", deploy_ref), format!("{}", deploy_ref.erase()));
+        assert_eq!(format!("{deploy_ref}"), format!("{}", deploy_ref.erase()));
         let node_ref = ObjectRef::<Node>::new("my-node");
-        assert_eq!(format!("{}", node_ref), format!("{}", node_ref.erase()));
+        assert_eq!(format!("{node_ref}"), format!("{}", node_ref.erase()));
     }
 
     #[test]

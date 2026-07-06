@@ -2,7 +2,7 @@
 //!
 //! See <https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes>
 
-use crate::{error::ErrorResponse, metadata::TypeMeta};
+use crate::{metadata::TypeMeta, response::Status};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 /// A raw event returned from a watch query
@@ -17,14 +17,14 @@ pub enum WatchEvent<K> {
     Modified(K),
     /// Resource was deleted
     Deleted(K),
-    /// Resource bookmark. `Bookmark` is a slimmed down `K` due to [#285](https://github.com/kube-rs/kube-rs/issues/285).
+    /// Resource bookmark. `Bookmark` is a slimmed down `K` due to [#285](https://github.com/kube-rs/kube/issues/285).
     ///
     /// From [Watch bookmarks](https://kubernetes.io/docs/reference/using-api/api-concepts/#watch-bookmarks).
     ///
     /// NB: This became Beta first in Kubernetes 1.16.
     Bookmark(Bookmark),
     /// There was some kind of error
-    Error(ErrorResponse),
+    Error(Box<Status>),
 }
 
 impl<K> Debug for WatchEvent<K> {
@@ -34,12 +34,12 @@ impl<K> Debug for WatchEvent<K> {
             WatchEvent::Modified(_) => write!(f, "Modified event"),
             WatchEvent::Deleted(_) => write!(f, "Deleted event"),
             WatchEvent::Bookmark(_) => write!(f, "Bookmark event"),
-            WatchEvent::Error(e) => write!(f, "Error event: {:?}", e),
+            WatchEvent::Error(e) => write!(f, "Error event: {e:?}"),
         }
     }
 }
 
-/// Slimed down K for [`WatchEvent::Bookmark`] due to [#285](https://github.com/kube-rs/kube-rs/issues/285).
+/// Slimed down K for [`WatchEvent::Bookmark`] due to [#285](https://github.com/kube-rs/kube/issues/285).
 ///
 /// Can only be relied upon to have metadata with resource version.
 /// Bookmarks contain apiVersion + kind + basically empty metadata.
@@ -59,4 +59,9 @@ pub struct Bookmark {
 pub struct BookmarkMeta {
     /// The only field we need from a Bookmark event.
     pub resource_version: String,
+
+    /// Kubernetes 1.27 Streaming Lists
+    /// The rest of the fields are optional and may be empty.
+    #[serde(default)]
+    pub annotations: std::collections::BTreeMap<String, String>,
 }

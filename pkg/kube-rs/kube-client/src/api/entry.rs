@@ -7,8 +7,8 @@
 use std::fmt::Debug;
 
 use crate::{Api, Error, Result};
-use kube_core::{params::PostParams, Resource};
-use serde::{de::DeserializeOwned, Serialize};
+use kube_core::{Resource, params::PostParams};
+use serde::{Serialize, de::DeserializeOwned};
 
 impl<K: Resource + Clone + DeserializeOwned + Debug> Api<K> {
     /// Gets a given object's "slot" on the Kubernetes API, designed for "get-or-create" and "get-and-modify" patterns
@@ -134,7 +134,7 @@ enum Dirtiness {
     New,
 }
 
-impl<'a, K> OccupiedEntry<'a, K> {
+impl<K> OccupiedEntry<'_, K> {
     /// Borrow the object
     pub fn get(&self) -> &K {
         &self.object
@@ -227,7 +227,7 @@ impl<'a, K> OccupiedEntry<'a, K> {
             Some(_) => (),
         }
         match &mut meta.namespace {
-            ns @ None => *ns = self.api.namespace.clone(),
+            ns @ None => ns.clone_from(&self.api.namespace),
             Some(ns) if Some(ns.as_str()) != self.api.namespace.as_deref() => {
                 return Err(CommitValidationError::NamespaceMismatch {
                     object_namespace: Some(ns.clone()),
@@ -260,7 +260,9 @@ pub enum CommitError {
 /// Pre-commit validation errors
 pub enum CommitValidationError {
     /// `ObjectMeta::name` does not match the name passed to [`Api::entry`]
-    #[error(".metadata.name does not match the name passed to Api::entry (got: {object_name:?}, expected: {expected:?})")]
+    #[error(
+        ".metadata.name does not match the name passed to Api::entry (got: {object_name:?}, expected: {expected:?})"
+    )]
     NameMismatch {
         /// The name of the object (`ObjectMeta::name`)
         object_name: String,
@@ -268,7 +270,9 @@ pub enum CommitValidationError {
         expected: String,
     },
     /// `ObjectMeta::namespace` does not match the namespace of the [`Api`]
-    #[error(".metadata.namespace does not match the namespace of the Api (got: {object_namespace:?}, expected: {expected:?})")]
+    #[error(
+        ".metadata.namespace does not match the namespace of the Api (got: {object_namespace:?}, expected: {expected:?})"
+    )]
     NamespaceMismatch {
         /// The name of the object (`ObjectMeta::namespace`)
         object_namespace: Option<String>,
@@ -316,17 +320,17 @@ mod tests {
 
     use k8s_openapi::api::core::v1::ConfigMap;
     use kube_core::{
+        ObjectMeta,
         params::{DeleteParams, PostParams},
-        ErrorResponse, ObjectMeta,
     };
 
     use crate::{
-        api::entry::{CommitError, Entry},
         Api, Client, Error,
+        api::entry::{CommitError, Entry},
     };
 
     #[tokio::test]
-    #[ignore] // needs cluster (gets and writes cms)
+    #[ignore = "needs cluster (gets and writes cms)"]
     async fn entry_create_missing_object() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::try_default().await?;
         let api = Api::<ConfigMap>::default_namespaced(client);
@@ -398,7 +402,7 @@ mod tests {
             ..ConfigMap::default()
         });
         assert!(
-            matches!(dbg!(entry2.commit(&PostParams::default()).await), Err(CommitError::Save(Error::Api(ErrorResponse { reason, .. }))) if reason == "AlreadyExists")
+            matches!(dbg!(entry2.commit(&PostParams::default()).await), Err(CommitError::Save(Error::Api(status))) if status.is_already_exists())
         );
 
         // Cleanup
@@ -407,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // needs cluster (gets and writes cms)
+    #[ignore = "needs cluster (gets and writes cms)"]
     async fn entry_update_existing_object() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::try_default().await?;
         let api = Api::<ConfigMap>::default_namespaced(client);
@@ -429,11 +433,11 @@ mod tests {
 
         let mut entry = match api.entry(object_name).await? {
             Entry::Occupied(entry) => entry,
-            entry => panic!("entry for existing object must be occupied: {:?}", entry),
+            entry => panic!("entry for existing object must be occupied: {entry:?}"),
         };
         let mut entry2 = match api.entry(object_name).await? {
             Entry::Occupied(entry) => entry,
-            entry => panic!("entry for existing object must be occupied: {:?}", entry),
+            entry => panic!("entry for existing object must be occupied: {entry:?}"),
         };
 
         // Entry is up-to-date, modify cleanly
@@ -469,7 +473,7 @@ mod tests {
             .get_or_insert_with(BTreeMap::default)
             .insert("key".to_string(), "value3".to_string());
         assert!(
-            matches!(entry2.commit(&PostParams::default()).await, Err(CommitError::Save(Error::Api(ErrorResponse { reason, .. }))) if reason == "Conflict")
+            matches!(entry2.commit(&PostParams::default()).await, Err(CommitError::Save(Error::Api(status))) if status.is_conflict())
         );
 
         // Cleanup
@@ -478,7 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // needs cluster (gets and writes cms)
+    #[ignore = "needs cluster (gets and writes cms)"]
     async fn entry_create_dry_run() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::try_default().await?;
         let api = Api::<ConfigMap>::default_namespaced(client);

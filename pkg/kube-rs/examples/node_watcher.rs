@@ -1,39 +1,39 @@
-#[macro_use] extern crate log;
-use backoff::ExponentialBackoff;
-use futures::{pin_mut, TryStreamExt};
+use std::pin::pin;
+
+use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::{Event, Node};
 use kube::{
     api::{Api, ListParams, ResourceExt},
-    runtime::{
-        utils::{try_flatten_applied, StreamBackoff},
-        watcher,
-    },
-    Client,
+    client::{Client, scope},
+    runtime::{WatchStreamExt, watcher},
 };
+use tracing::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    std::env::set_var("RUST_LOG", "info,node_watcher=debug,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
-    let events: Api<Event> = Api::all(client.clone());
     let nodes: Api<Node> = Api::all(client.clone());
 
-    let obs = try_flatten_applied(StreamBackoff::new(
-        watcher(nodes, ListParams::default().labels("beta.kubernetes.io/os=linux")),
-        ExponentialBackoff::default(),
-    ));
+    let use_watchlist = std::env::var("WATCHLIST").map(|s| s == "1").unwrap_or(false);
+    let wc = if use_watchlist {
+        // requires WatchList feature gate on 1.27 or later
+        watcher::Config::default().streaming_lists()
+    } else {
+        watcher::Config::default()
+    };
+    let obs = watcher(nodes, wc).default_backoff().applied_objects();
+    let mut obs = pin!(obs);
 
-    pin_mut!(obs);
     while let Some(n) = obs.try_next().await? {
-        check_for_node_failures(&events, n).await?;
+        check_for_node_failures(&client, n).await?;
     }
     Ok(())
 }
 
 // A simple node problem detector
-async fn check_for_node_failures(events: &Api<Event>, o: Node) -> anyhow::Result<()> {
-    let name = o.name();
+async fn check_for_node_failures(client: &Client, o: Node) -> anyhow::Result<()> {
+    let name = o.name_any();
     // Nodes often modify a lot - only print broken nodes
     if let Some(true) = o.spec.unwrap().unschedulable {
         let failed = o
@@ -52,14 +52,13 @@ async fn check_for_node_failures(events: &Api<Event>, o: Node) -> anyhow::Result
         warn!("Unschedulable Node: {}, ({:?})", name, failed);
         // Find events related to this node
         let opts =
-            ListParams::default().fields(&format!("involvedObject.kind=Node,involvedObject.name={}", name));
-        let evlist = events.list(&opts).await?;
+            ListParams::default().fields(&format!("involvedObject.kind=Node,involvedObject.name={name}"));
+        let evlist = client.list::<Event>(&opts, &scope::Cluster).await?;
         for e in evlist {
             warn!("Node event: {:?}", serde_json::to_string_pretty(&e)?);
         }
     } else {
-        // Turn node_watcher=debug in log to see all
-        debug!("Healthy node: {}", name);
+        info!("Healthy node: {}", name);
     }
     Ok(())
 }

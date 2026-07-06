@@ -1,13 +1,13 @@
 use super::parse::{self, GroupVersionData};
-use crate::{error::DiscoveryError, Client, Error, Result};
+use crate::{Client, Error, Result, error::DiscoveryError};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{APIGroup, APIVersions};
-pub use kube_core::discovery::{verbs, ApiCapabilities, ApiResource, Scope};
+pub use kube_core::discovery::{ApiCapabilities, ApiResource};
 use kube_core::{
-    gvk::{GroupVersion, GroupVersionKind, ParseGroupVersionError},
     Version,
+    discovery::v2::APIGroupDiscovery,
+    gvk::{GroupVersion, GroupVersionKind, ParseGroupVersionError},
 };
-use std::cmp::Reverse;
-
+use std::{cmp::Reverse, collections::HashMap, iter::Iterator};
 
 /// Describes one API groups collected resources and capabilities.
 ///
@@ -49,11 +49,20 @@ use std::cmp::Reverse;
 ///     let (ar, caps) = apigroup.recommended_kind("APIService").unwrap();
 ///     let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
 ///     for service in api.list(&Default::default()).await? {
-///         println!("Found APIService: {}", service.name());
+///         println!("Found APIService: {}", service.name_any());
 ///     }
 ///     Ok(())
 /// }
 /// ```
+///
+/// This type represents an abstraction over the native [`APIGroup`] to provide easier access to underlying group resources.
+///
+/// ### Common Pitfall
+/// Version preference and recommendations shown herein is a **group concept**, not a resource-wide concept.
+/// A common mistake is have different stored versions for resources within a group, and then receive confusing results from this module.
+/// Resources in a shared group should share versions - and transition together - to minimize confusion.
+/// See <https://kubernetes.io/docs/concepts/overview/kubernetes-api/#api-groups-and-versioning> for more info.
+///
 /// [`ApiResource`]: crate::discovery::ApiResource
 /// [`ApiCapabilities`]: crate::discovery::ApiCapabilities
 /// [`DynamicObject`]: crate::api::DynamicObject
@@ -116,6 +125,36 @@ impl ApiGroup {
         Ok(group)
     }
 
+    /// Create an ApiGroup from aggregated discovery v2 types
+    ///
+    /// This is used by `Discovery::run_aggregated()` to convert the aggregated
+    /// discovery response into the same format used by regular discovery.
+    /// Takes ownership to avoid cloning internal data.
+    pub(crate) fn from_v2(ag: APIGroupDiscovery) -> Result<Self> {
+        let name = ag.metadata.and_then(|m| m.name).unwrap_or_default();
+
+        if ag.versions.is_empty() {
+            return Err(Error::Discovery(DiscoveryError::EmptyApiGroup(name)));
+        }
+
+        // Preferred version is the first one in the list (they're sorted by preference)
+        let preferred = ag.versions.first().and_then(|v| v.version.clone());
+
+        let data: Vec<GroupVersionData> = ag
+            .versions
+            .into_iter()
+            .map(|ver| GroupVersionData::from_v2(&name, ver))
+            .collect();
+
+        let mut group = ApiGroup {
+            name,
+            data,
+            preferred,
+        };
+        group.sort_versions();
+        Ok(group)
+    }
+
     fn sort_versions(&mut self) {
         self.data
             .sort_by_cached_key(|gvd| Reverse(Version::parse(gvd.version.as_str()).priority()))
@@ -141,10 +180,7 @@ impl ApiGroup {
                 return Ok((ar, caps));
             }
         }
-        Err(Error::Discovery(DiscoveryError::MissingKind(format!(
-            "{:?}",
-            gvk
-        ))))
+        Err(Error::Discovery(DiscoveryError::MissingKind(format!("{gvk:?}"))))
     }
 
     // shortcut method to give cheapest return for a pinned group
@@ -187,6 +223,8 @@ impl ApiGroup {
     }
 
     /// Returns preferred version for working with given group.
+    ///
+    /// Please note the [ApiGroup Common Pitfall](ApiGroup#common-pitfall).
     pub fn preferred_version(&self) -> Option<&str> {
         self.preferred.as_deref()
     }
@@ -196,6 +234,8 @@ impl ApiGroup {
     /// If the server does not recommend a version, we pick the "most stable and most recent" version
     /// in accordance with [kubernetes version priority](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/#version-priority)
     /// via the descending sort order from [`Version`](kube_core::Version).
+    ///
+    /// Please note the [ApiGroup Common Pitfall](ApiGroup#common-pitfall).
     pub fn preferred_version_or_latest(&self) -> &str {
         // NB: self.versions is non-empty by construction in ApiGroup
         self.preferred
@@ -231,7 +271,7 @@ impl ApiGroup {
     ///         }
     ///         let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
     ///         for inst in api.list(&Default::default()).await? {
-    ///             println!("Found {}: {}", ar.kind, inst.name());
+    ///             println!("Found {}: {}", ar.kind, inst.name_any());
     ///         }
     ///     }
     ///     Ok(())
@@ -239,9 +279,51 @@ impl ApiGroup {
     /// ```
     ///
     /// This is equivalent to taking the [`ApiGroup::versioned_resources`] at the [`ApiGroup::preferred_version_or_latest`].
+    ///
+    /// Please note the [ApiGroup Common Pitfall](ApiGroup#common-pitfall).
     pub fn recommended_resources(&self) -> Vec<(ApiResource, ApiCapabilities)> {
         let ver = self.preferred_version_or_latest();
         self.versioned_resources(ver)
+    }
+
+    ///  Returns all resources in the group at their the most stable respective version
+    ///
+    /// ```no_run
+    /// use kube::{Client, api::{Api, DynamicObject}, discovery::{self, verbs}, ResourceExt};
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let client = Client::try_default().await?;
+    ///     let apigroup = discovery::group(&client, "apiregistration.k8s.io").await?;
+    ///     for (ar, caps) in apigroup.resources_by_stability() {
+    ///         if !caps.supports_operation(verbs::LIST) {
+    ///             continue;
+    ///         }
+    ///         let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+    ///         for inst in api.list(&Default::default()).await? {
+    ///             println!("Found {}: {}", ar.kind, inst.name_any());
+    ///         }
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    /// See an example in [examples/kubectl.rs](https://github.com/kube-rs/kube/blob/main/examples/kubectl.rs)
+    pub fn resources_by_stability(&self) -> Vec<(ApiResource, ApiCapabilities)> {
+        let mut lookup = HashMap::new();
+        self.data.iter().for_each(|gvd| {
+            gvd.resources.iter().for_each(|resource| {
+                lookup
+                    .entry(resource.0.kind.clone())
+                    .or_insert_with(Vec::new)
+                    .push(resource);
+            })
+        });
+        lookup
+            .into_values()
+            .map(|mut v| {
+                v.sort_by_cached_key(|(ar, _)| Reverse(Version::parse(ar.version.as_str()).priority()));
+                v[0].to_owned()
+            })
+            .collect()
     }
 
     /// Returns the recommended version of the `kind` in the recommended resources (if found)
@@ -255,7 +337,7 @@ impl ApiGroup {
     ///     let (ar, caps) = apigroup.recommended_kind("APIService").unwrap();
     ///     let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
     ///     for service in api.list(&Default::default()).await? {
-    ///         println!("Found APIService: {}", service.name());
+    ///         println!("Found APIService: {}", service.name_any());
     ///     }
     ///     Ok(())
     /// }
@@ -270,5 +352,227 @@ impl ApiGroup {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use kube_core::discovery::{
+        Scope,
+        v2::{APIGroupDiscovery, APIResourceDiscovery, APIVersionDiscovery, GroupVersionKind},
+    };
+
+    fn make_v2_resource(resource: &str, kind: &str, scope: &str, verbs: Vec<&str>) -> APIResourceDiscovery {
+        APIResourceDiscovery {
+            resource: Some(resource.to_string()),
+            response_kind: Some(GroupVersionKind {
+                group: None,
+                version: None,
+                kind: Some(kind.to_string()),
+            }),
+            scope: Some(scope.to_string()),
+            verbs: verbs.into_iter().map(String::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_api_group_from_v2_apps() {
+        let ag = APIGroupDiscovery {
+            metadata: Some(ObjectMeta {
+                name: Some("apps".to_string()),
+                ..Default::default()
+            }),
+            versions: vec![APIVersionDiscovery {
+                version: Some("v1".to_string()),
+                resources: vec![
+                    make_v2_resource("deployments", "Deployment", "Namespaced", vec![
+                        "get", "list", "create",
+                    ]),
+                    make_v2_resource("replicasets", "ReplicaSet", "Namespaced", vec!["get", "list"]),
+                ],
+                freshness: Some("Current".to_string()),
+            }],
+        };
+
+        let group = ApiGroup::from_v2(ag).unwrap();
+
+        assert_eq!(group.name(), "apps");
+        assert_eq!(group.preferred_version(), Some("v1"));
+        assert_eq!(group.versions().collect::<Vec<_>>(), vec!["v1"]);
+
+        let resources = group.recommended_resources();
+        assert_eq!(resources.len(), 2);
+
+        let (deploy_ar, deploy_caps) = group.recommended_kind("Deployment").unwrap();
+        assert_eq!(deploy_ar.group, "apps");
+        assert_eq!(deploy_ar.version, "v1");
+        assert_eq!(deploy_ar.api_version, "apps/v1");
+        assert_eq!(deploy_ar.kind, "Deployment");
+        assert_eq!(deploy_caps.scope, Scope::Namespaced);
+    }
+
+    #[test]
+    fn test_api_group_from_v2_core() {
+        let ag = APIGroupDiscovery {
+            metadata: Some(ObjectMeta {
+                name: Some("".to_string()), // core group has empty name
+                ..Default::default()
+            }),
+            versions: vec![APIVersionDiscovery {
+                version: Some("v1".to_string()),
+                resources: vec![
+                    make_v2_resource("pods", "Pod", "Namespaced", vec!["get", "list", "watch"]),
+                    make_v2_resource("nodes", "Node", "Cluster", vec!["get", "list"]),
+                ],
+                freshness: Some("Current".to_string()),
+            }],
+        };
+
+        let group = ApiGroup::from_v2(ag).unwrap();
+
+        assert_eq!(group.name(), "");
+        assert_eq!(group.preferred_version(), Some("v1"));
+
+        let (pod_ar, pod_caps) = group.recommended_kind("Pod").unwrap();
+        assert_eq!(pod_ar.group, "");
+        assert_eq!(pod_ar.api_version, "v1"); // core group: no prefix
+        assert_eq!(pod_caps.scope, Scope::Namespaced);
+
+        let (node_ar, node_caps) = group.recommended_kind("Node").unwrap();
+        assert_eq!(node_ar.kind, "Node");
+        assert_eq!(node_caps.scope, Scope::Cluster);
+    }
+
+    #[test]
+    fn test_api_group_from_v2_multiple_versions() {
+        // Use autoscaling group which has multiple major versions (v1, v2)
+        // Major versions are never removed per deprecation policy Rule #4a
+        let ag = APIGroupDiscovery {
+            metadata: Some(ObjectMeta {
+                name: Some("autoscaling".to_string()),
+                ..Default::default()
+            }),
+            versions: vec![
+                // First version is preferred
+                APIVersionDiscovery {
+                    version: Some("v2".to_string()),
+                    resources: vec![make_v2_resource(
+                        "horizontalpodautoscalers",
+                        "HorizontalPodAutoscaler",
+                        "Namespaced",
+                        vec!["get", "list"],
+                    )],
+                    freshness: Some("Current".to_string()),
+                },
+                APIVersionDiscovery {
+                    version: Some("v1".to_string()),
+                    resources: vec![make_v2_resource(
+                        "horizontalpodautoscalers",
+                        "HorizontalPodAutoscaler",
+                        "Namespaced",
+                        vec!["get"],
+                    )],
+                    freshness: Some("Current".to_string()),
+                },
+            ],
+        };
+
+        let group = ApiGroup::from_v2(ag).unwrap();
+
+        assert_eq!(group.name(), "autoscaling");
+        assert_eq!(group.preferred_version(), Some("v2"));
+        assert_eq!(group.versions().collect::<Vec<_>>(), vec!["v2", "v1"]);
+
+        // Recommended should be v2
+        let (ar, _) = group.recommended_kind("HorizontalPodAutoscaler").unwrap();
+        assert_eq!(ar.version, "v2");
+
+        // Can also get v1 explicitly
+        let v1_resources = group.versioned_resources("v1");
+        assert_eq!(v1_resources.len(), 1);
+        assert_eq!(v1_resources[0].0.version, "v1");
+    }
+
+    #[test]
+    fn test_api_group_from_v2_empty_versions_error() {
+        let ag = APIGroupDiscovery {
+            metadata: Some(ObjectMeta {
+                name: Some("empty".to_string()),
+                ..Default::default()
+            }),
+            versions: vec![], // empty!
+        };
+
+        let result = ApiGroup::from_v2(ag);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resources_by_stability() {
+        let ac = ApiCapabilities {
+            scope: Scope::Namespaced,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let testlowversioncr_v1alpha1 = ApiResource {
+            group: String::from("kube.rs"),
+            version: String::from("v1alpha1"),
+            kind: String::from("TestLowVersionCr"),
+            api_version: String::from("kube.rs/v1alpha1"),
+            plural: String::from("testlowversioncrs"),
+        };
+
+        let testcr_v1 = ApiResource {
+            group: String::from("kube.rs"),
+            version: String::from("v1"),
+            kind: String::from("TestCr"),
+            api_version: String::from("kube.rs/v1"),
+            plural: String::from("testcrs"),
+        };
+
+        let testcr_v2alpha1 = ApiResource {
+            group: String::from("kube.rs"),
+            version: String::from("v2alpha1"),
+            kind: String::from("TestCr"),
+            api_version: String::from("kube.rs/v2alpha1"),
+            plural: String::from("testcrs"),
+        };
+
+        let group = ApiGroup {
+            name: "kube.rs".to_string(),
+            data: vec![
+                GroupVersionData {
+                    version: "v1alpha1".to_string(),
+                    resources: vec![(testlowversioncr_v1alpha1, ac.clone())],
+                },
+                GroupVersionData {
+                    version: "v1".to_string(),
+                    resources: vec![(testcr_v1, ac.clone())],
+                },
+                GroupVersionData {
+                    version: "v2alpha1".to_string(),
+                    resources: vec![(testcr_v2alpha1, ac)],
+                },
+            ],
+            preferred: Some(String::from("v1")),
+        };
+
+        let resources = group.resources_by_stability();
+        assert!(
+            resources
+                .iter()
+                .any(|(ar, _)| ar.kind == "TestCr" && ar.version == "v1"),
+            "wrong stable version"
+        );
+        assert!(
+            resources
+                .iter()
+                .any(|(ar, _)| ar.kind == "TestLowVersionCr" && ar.version == "v1alpha1"),
+            "lost low version resource"
+        );
     }
 }

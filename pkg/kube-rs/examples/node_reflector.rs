@@ -1,40 +1,48 @@
-#[macro_use] extern crate log;
-use futures::{StreamExt, TryStreamExt};
+use std::pin::pin;
+
+use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Node;
 use kube::{
-    api::{Api, ListParams, ResourceExt},
-    runtime::{reflector, utils::try_flatten_applied, watcher},
     Client,
+    api::{Api, ResourceExt},
+    runtime::{Predicate, WatchStreamExt, predicates, reflector, watcher},
 };
+use tracing::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    std::env::set_var("RUST_LOG", "info,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
 
     let nodes: Api<Node> = Api::all(client.clone());
-    let lp = ListParams::default()
-        .labels("beta.kubernetes.io/instance-type=m4.2xlarge") // filter instances by label
+    let wc = watcher::Config::default()
+        .labels("kubernetes.io/arch=amd64") // filter instances by label
         .timeout(10); // short watch timeout in this example
 
-    let store = reflector::store::Writer::<Node>::default();
-    let reader = store.as_reader();
-    let rf = reflector(store, watcher(nodes, lp));
+    let (reader, writer) = reflector::store();
+    let stream = watcher(nodes, wc)
+        .default_backoff()
+        .reflect(writer)
+        .applied_objects()
+        .predicate_filter(
+            predicates::labels.combine(predicates::annotations),
+            Default::default(),
+        );
+    let mut stream = pin!(stream);
 
     // Periodically read our state in the background
     tokio::spawn(async move {
+        reader.wait_until_ready().await.unwrap();
         loop {
-            let nodes = reader.state().iter().map(|r| r.name()).collect::<Vec<_>>();
+            let nodes = reader.state().iter().map(|r| r.name_any()).collect::<Vec<_>>();
             info!("Current {} nodes: {:?}", nodes.len(), nodes);
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
 
-    // Drain and log applied events from the reflector
-    let mut rfa = try_flatten_applied(rf).boxed();
-    while let Some(event) = rfa.try_next().await? {
-        info!("Applied {}", event.name());
+    // Log applied events with changes from the reflector
+    while let Some(node) = stream.try_next().await? {
+        info!("saw node {} with new labels/annots", node.name_any());
     }
 
     Ok(())

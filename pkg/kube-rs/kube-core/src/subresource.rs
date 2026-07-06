@@ -1,10 +1,10 @@
 //! Request builder types and parameters for subresources
-use std::fmt::Debug;
-
 use crate::{
     params::{DeleteParams, PostParams},
-    request::{Error, Request, JSON_MIME},
+    request::{Error, JSON_MIME, Request},
 };
+use jiff::{Timestamp, Unit};
+use std::fmt::Debug;
 
 pub use k8s_openapi::api::autoscaling::v1::{Scale, ScaleSpec, ScaleStatus};
 
@@ -30,6 +30,11 @@ pub struct LogParams {
     /// If this value precedes the time a pod was started, only logs since the pod start will be returned.
     /// If this value is in the future, no logs will be returned. Only one of sinceSeconds or sinceTime may be specified.
     pub since_seconds: Option<i64>,
+    /// An RFC3339 timestamp from which to show logs. If this value
+    /// precedes the time a pod was started, only logs since the pod start will be returned.
+    /// If this value is in the future, no logs will be returned.
+    /// Only one of sinceSeconds or sinceTime may be specified.
+    pub since_time: Option<Timestamp>,
     /// If set, the number of lines from the end of the logs to show.
     /// If not specified, logs are shown from the creation of the container or sinceSeconds or sinceTime
     pub tail_lines: Option<i64>,
@@ -65,6 +70,12 @@ impl Request {
 
         if let Some(ss) = &lp.since_seconds {
             qp.append_pair("sinceSeconds", &ss.to_string());
+        } else if let Some(st) = &lp.since_time {
+            // Unwrapping here is ok as `round` only errors if a.) the smallest unit is larger than hour (we set second as smallest unit)
+            // or b.) a rounding increment is configured (which we don't set) that does not fit into 86400 seconds (a day)
+            // without any remainder.
+            // `jiff::Timestamp` provides RFC3339 via `Display`, docs: https://docs.rs/jiff/latest/jiff/struct.Timestamp.html#impl-Display-for-Timestamp
+            qp.append_pair("sinceTime", &st.round(Unit::Second).unwrap().to_string());
         }
 
         if let Some(tl) = &lp.tail_lines {
@@ -102,9 +113,7 @@ impl Request {
         let pp = &ep.post_options;
         pp.validate()?;
         let mut qp = form_urlencoded::Serializer::new(target);
-        if pp.dry_run {
-            qp.append_pair("dryRun", "All");
-        }
+        pp.populate_qp(&mut qp);
         let urlstr = qp.finish();
         // eviction body parameters are awkward, need metadata with name
         let data = serde_json::to_vec(&serde_json::json!({
@@ -257,7 +266,7 @@ impl AttachParams {
         self
     }
 
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if !self.stdin && !self.stdout && !self.stderr {
             return Err(Error::Validation(
                 "AttachParams: one of stdin, stdout, or stderr must be true".into(),
@@ -289,6 +298,23 @@ impl AttachParams {
         }
         if let Some(container) = &self.container {
             qp.append_pair("container", container);
+        }
+    }
+
+    #[cfg(feature = "kubelet-debug")]
+    // https://github.com/kubernetes/kubernetes/blob/466d9378dbb0a185df9680657f5cd96d5e5aab57/pkg/apis/core/types.go#L6005-L6013
+    pub(crate) fn append_to_url_serializer_local(&self, qp: &mut form_urlencoded::Serializer<String>) {
+        if self.stdin {
+            qp.append_pair("input", "1");
+        }
+        if self.stdout {
+            qp.append_pair("output", "1");
+        }
+        if self.stderr {
+            qp.append_pair("error", "1");
+        }
+        if self.tty {
+            qp.append_pair("tty", "1");
         }
     }
 }
@@ -342,37 +368,6 @@ impl Request {
 }
 
 // ----------------------------------------------------------------------------
-// tests
-// ----------------------------------------------------------------------------
-
-/// Cheap sanity check to ensure type maps work as expected
-#[cfg(test)]
-mod test {
-    use crate::{request::Request, resource::Resource};
-    use k8s::core::v1 as corev1;
-    use k8s_openapi::api as k8s;
-
-    use crate::subresource::LogParams;
-
-    #[test]
-    fn logs_all_params() {
-        let url = corev1::Pod::url_path(&(), Some("ns"));
-        let lp = LogParams {
-            container: Some("nginx".into()),
-            follow: true,
-            limit_bytes: Some(10 * 1024 * 1024),
-            pretty: true,
-            previous: true,
-            since_seconds: Some(3600),
-            tail_lines: Some(4096),
-            timestamps: true,
-        };
-        let req = Request::new(url).logs("mypod", &lp).unwrap();
-        assert_eq!(req.uri(), "/api/v1/namespaces/ns/pods/mypod/log?&container=nginx&follow=true&limitBytes=10485760&pretty=true&previous=true&sinceSeconds=3600&tailLines=4096&timestamps=true");
-    }
-}
-
-// ----------------------------------------------------------------------------
 // Portforward subresource
 // ----------------------------------------------------------------------------
 #[cfg(feature = "ws")]
@@ -394,8 +389,7 @@ impl Request {
             for port in ports.iter() {
                 if seen.contains(port) {
                     return Err(Error::Validation(format!(
-                        "ports must be unique, found multiple {}",
-                        port
+                        "ports must be unique, found multiple {port}"
                     )));
                 }
                 seen.insert(port);
@@ -411,5 +405,57 @@ impl Request {
 
         let req = http::Request::get(qp.finish());
         req.body(vec![]).map_err(Error::BuildRequest)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// tests
+// ----------------------------------------------------------------------------
+
+/// Cheap sanity check to ensure type maps work as expected
+#[cfg(test)]
+mod test {
+    use crate::{request::Request, resource::Resource};
+    use jiff::Timestamp;
+    use k8s::core::v1 as corev1;
+    use k8s_openapi::api as k8s;
+
+    use crate::subresource::LogParams;
+
+    #[test]
+    fn logs_all_params() {
+        let url = corev1::Pod::url_path(&(), Some("ns"));
+        let lp = LogParams {
+            container: Some("nginx".into()),
+            follow: true,
+            limit_bytes: Some(10 * 1024 * 1024),
+            pretty: true,
+            previous: true,
+            since_seconds: Some(3600),
+            since_time: None,
+            tail_lines: Some(4096),
+            timestamps: true,
+        };
+        let req = Request::new(url).logs("mypod", &lp).unwrap();
+        assert_eq!(
+            req.uri(),
+            "/api/v1/namespaces/ns/pods/mypod/log?&container=nginx&follow=true&limitBytes=10485760&pretty=true&previous=true&sinceSeconds=3600&tailLines=4096&timestamps=true"
+        );
+    }
+
+    #[test]
+    fn logs_since_time() {
+        let url = corev1::Pod::url_path(&(), Some("ns"));
+        let date: Timestamp = "2023-10-19T13:14:26Z".parse().unwrap();
+        let lp = LogParams {
+            since_seconds: None,
+            since_time: Some(date),
+            ..Default::default()
+        };
+        let req = Request::new(url).logs("mypod", &lp).unwrap();
+        assert_eq!(
+            req.uri(),
+            "/api/v1/namespaces/ns/pods/mypod/log?&sinceTime=2023-10-19T13%3A14%3A26Z" // cross-referenced with kubectl
+        );
     }
 }

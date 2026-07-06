@@ -2,9 +2,9 @@
 use crate::{
     discovery::ApiResource,
     metadata::{ListMeta, ObjectMeta, TypeMeta},
-    resource::Resource,
+    resource::{DynamicResourceScope, Resource},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 
 /// A generic Kubernetes object list
@@ -16,20 +16,47 @@ use std::borrow::Cow;
 /// and is generally produced from list/watch/delete collection queries on an [`Resource`](super::Resource).
 ///
 /// This is almost equivalent to [`k8s_openapi::List<T>`](k8s_openapi::List), but iterable.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ObjectList<T>
 where
     T: Clone,
 {
-    // NB: kind and apiVersion can be set here, but no need for it atm
+    /// The type fields, always present
+    #[serde(flatten, deserialize_with = "deserialize_v1_list_as_default")]
+    pub types: TypeMeta,
+
     /// ListMeta - only really used for its `resourceVersion`
     ///
     /// See [ListMeta](k8s_openapi::apimachinery::pkg::apis::meta::v1::ListMeta)
+    #[serde(default)]
     pub metadata: ListMeta,
 
     /// The items we are actually interested in. In practice; `T := Resource<T,U>`.
-    #[serde(bound(deserialize = "Vec<T>: Deserialize<'de>"))]
+    #[serde(
+        deserialize_with = "deserialize_null_as_default",
+        bound(deserialize = "Vec<T>: Deserialize<'de>")
+    )]
     pub items: Vec<T>,
+}
+
+fn deserialize_v1_list_as_default<'de, D>(deserializer: D) -> Result<TypeMeta, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let meta = Option::<TypeMeta>::deserialize(deserializer)?;
+    Ok(meta.unwrap_or(TypeMeta {
+        api_version: "v1".to_owned(),
+        kind: "List".to_owned(),
+    }))
+}
+
+fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
 }
 
 impl<T: Clone> ObjectList<T> {
@@ -38,16 +65,18 @@ impl<T: Clone> ObjectList<T> {
     /// # Example
     ///
     /// ```
-    /// use kube::api::{ListMeta, ObjectList};
+    /// use kube::api::{ListMeta, ObjectList, TypeMeta};
+    /// use k8s_openapi::api::core::v1::Pod;
     ///
+    /// let types: TypeMeta = TypeMeta::list::<Pod>();
     /// let metadata: ListMeta = Default::default();
     /// let items = vec![1, 2, 3];
-    /// let objectlist = ObjectList { metadata, items };
+    /// # let objectlist = ObjectList { types, metadata, items };
     ///
     /// let first = objectlist.iter().next();
     /// println!("First element: {:?}", first); // prints "First element: Some(1)"
     /// ```
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item = &T> + 'a {
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.items.iter()
     }
 
@@ -56,11 +85,13 @@ impl<T: Clone> ObjectList<T> {
     /// # Example
     ///
     /// ```
-    /// use kube::api::{ObjectList, ListMeta};
+    /// use kube::api::{ListMeta, ObjectList, TypeMeta};
+    /// use k8s_openapi::api::core::v1::Pod;
     ///
+    /// let types: TypeMeta = TypeMeta::list::<Pod>();
     /// let metadata: ListMeta = Default::default();
     /// let items = vec![1, 2, 3];
-    /// let mut objectlist = ObjectList { metadata, items };
+    /// # let mut objectlist = ObjectList { types, metadata, items };
     ///
     /// let mut first = objectlist.iter_mut().next();
     ///
@@ -69,8 +100,7 @@ impl<T: Clone> ObjectList<T> {
     ///     *elem = 2;
     ///     println!("First element: {:?}", elem); // prints "First element: 2"
     /// }
-
-    pub fn iter_mut<'a>(&'a mut self) -> impl Iterator<Item = &mut T> + 'a {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
         self.items.iter_mut()
     }
 }
@@ -216,6 +246,7 @@ where
     U: Clone,
 {
     type DynamicType = ApiResource;
+    type Scope = DynamicResourceScope;
 
     fn group(dt: &ApiResource) -> Cow<'_, str> {
         dt.group.as_str().into()
@@ -287,7 +318,9 @@ pub struct NotUsed {}
 
 #[cfg(test)]
 mod test {
-    use super::{ApiResource, HasSpec, HasStatus, NotUsed, Object, Resource};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ListMeta, ObjectMeta};
+
+    use super::{ApiResource, HasSpec, HasStatus, NotUsed, Object, ObjectList, Resource, TypeMeta};
     use crate::resource::ResourceExt;
 
     #[test]
@@ -322,7 +355,7 @@ mod test {
         assert_eq!(mypod.types.as_ref().unwrap().api_version, "v1");
 
         assert_eq!(mypod.namespace().unwrap(), "dev");
-        assert_eq!(mypod.name(), "blog");
+        assert_eq!(mypod.name_unchecked(), "blog");
         assert!(mypod.status().is_none());
         assert_eq!(mypod.spec().containers[0], ContainerSimple {
             image: "blog".into()
@@ -333,5 +366,63 @@ mod test {
         assert_eq!(PodSimple::plural(&ar), "pods");
         assert_eq!(PodSimple::kind(&ar), "Pod");
         assert_eq!(PodSimple::group(&ar), "");
+    }
+
+    #[test]
+    fn k8s_object_list() {
+        use k8s_openapi::api::core::v1::Pod;
+        // by grabbing the ApiResource info from the Resource trait
+        let ar = ApiResource::erase::<Pod>(&());
+        assert_eq!(ar.group, "");
+        assert_eq!(ar.kind, "Pod");
+        let podlist: ObjectList<Pod> = ObjectList {
+            types: TypeMeta {
+                api_version: ar.api_version,
+                kind: ar.kind + "List",
+            },
+            metadata: ListMeta { ..Default::default() },
+            items: vec![Pod {
+                metadata: ObjectMeta {
+                    name: Some("test".into()),
+                    namespace: Some("dev".into()),
+                    ..ObjectMeta::default()
+                },
+                spec: None,
+                status: None,
+            }],
+        };
+
+        assert_eq!(&podlist.types.kind, "PodList");
+        assert_eq!(&podlist.types.api_version, "v1");
+
+        let mypod = &podlist.items[0];
+        let meta = mypod.meta();
+        assert_eq!(&mypod.metadata, meta);
+        assert_eq!(meta.namespace.as_ref().unwrap(), "dev");
+        assert_eq!(meta.name.as_ref().unwrap(), "test");
+        assert_eq!(mypod.namespace().unwrap(), "dev");
+        assert_eq!(mypod.name_unchecked(), "test");
+        assert!(mypod.status.is_none());
+        assert!(mypod.spec.is_none());
+    }
+
+    #[test]
+    fn k8s_object_list_default_types() {
+        use k8s_openapi::api::core::v1::Pod;
+
+        let raw_value = serde_json::json!({
+            "metadata": {
+                "resourceVersion": ""
+            },
+            "items": []
+        });
+        let pod_list: ObjectList<Pod> = serde_json::from_value(raw_value).unwrap();
+        assert_eq!(
+            TypeMeta {
+                api_version: "v1".to_owned(),
+                kind: "List".to_owned(),
+            },
+            pod_list.types,
+        );
     }
 }

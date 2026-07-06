@@ -1,3 +1,4 @@
+[graph]
 # examples sometimes lag behind as they use higher level dependencies
 # we exclude these from the check because they are not part of our
 # actual dependency tree
@@ -6,33 +7,15 @@ exclude = ["kube-examples"]
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
+# these are deprecated, but not super helpful for us
+# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html#the-version-field-optional
+# remove them when we have to
 yanked = "warn"
-notice = "warn"
-ignore = [
-    # Ignoring issues related to `localtime_r` for now
-    # See https://github.com/kube-rs/kube-rs/issues/650
-    #
-    # Potential segfault in the `time` crate
-    # Tracking issue: https://github.com/kube-rs/kube-rs/issues/656
-    # PR to update `time`: https://github.com/chronotope/chrono/pull/578
-    "RUSTSEC-2020-0071",
-    # Potential segfault in `localtime_r` invocations
-    # Tracking issue: https://github.com/kube-rs/kube-rs/issues/660
-    # Upstream issue: https://github.com/chronotope/chrono/issues/499
-    "RUSTSEC-2020-0159",
-]
-
 
 [licenses]
 # See https://spdx.org/licenses/ for list of possible licenses
 # [possible values: any SPDX 3.11 short identifier (+ optional exception)].
-
 confidence-threshold = 1.0
-copyleft = "deny"
-default = "deny"
-unlicensed = "deny"
 
 # We are beholden to https://github.com/cncf/foundation/blob/master/allowed-third-party-license-policy.md#approved-licenses-for-allowlist
 allow = [
@@ -40,51 +23,40 @@ allow = [
     "Apache-2.0",
     "BSD-3-Clause",
     "ISC",
-    "LicenseRef-ring",
-    "LicenseRef-webpki"
+    # Blanket addition for Unicode-3.0 libs for optional features (affects many deps, but it's a very clean license)
+    # https://github.com/unicode-org/icu4x/blob/main/LICENSE
+    "Unicode-3.0",
+    # Pulled in via aws_lc_rs when using rustls-tls and aws-lc-rs features
+    # https://openssl-library.org/source/license/index.html
+    "OpenSSL",
+    # Pulled in via hashbrown through its foldhash dependency
+    "Zlib",
 ]
 
-
-[[licenses.clarify]]
-name = "ring"
-expression = "LicenseRef-ring"
-license-files = [
-    { path = "LICENSE", hash = 0xbd0eed23 },
+exceptions = [
+    # Pulled in via hyper-rustls when using the webpki-roots feature,
+    # which is off by default.
+    { allow = ["CDLA-Permissive-2.0", "MPL-2.0"], crate = "webpki-roots" },
 ]
-
-[[licenses.clarify]]
-name = "webpki"
-expression = "LicenseRef-webpki"
-license-files = [
-    { path = "LICENSE", hash = 0x001c7e6c },
-]
-
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/Arnavion/k8s-openapi"]
 
 [bans]
 multiple-versions = "deny"
 
+[[bans.skip-tree]]
+name = "windows-sys"
+
+# currently multiple version of thiserror in flight due to its major bump
 [[bans.skip]]
-# The following dependencies are still working on upgrading to 0.7:
-# https://github.com/hyperium/h2/pull/603
-# https://github.com/tower-rs/tower/pull/638
-# https://github.com/tower-rs/tower-http/pull/221
-name = "tokio-util"
-version = "0.6"
+name = "thiserror"
+[[bans.skip]]
+name = "thiserror-impl"
 
 [[bans.skip]]
-# The following dependencies are still working on upgrading to 0.3
-# https://github.com/rustls/hyper-rustls/pull/165
-name = "rustls-pemfile"
-version = "0.2"
-
-[[bans.skip]]
-# waiting for ahash/getrandom to bump wasi as we have two branches:
-# ahash -> getrandom -> wasi old
-# tokio -> mio -> wasi new
-name = "wasi"
+# ahash hasn't had a release in 12mo
+name = "getrandom"

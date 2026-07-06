@@ -1,11 +1,13 @@
+#![allow(missing_docs)]
+
 use kube_derive::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(CustomResource, Serialize, Deserialize, Debug, Clone, JsonSchema)]
 #[kube(group = "clux.dev", version = "v1", kind = "FooEnum")]
-#[kube(apiextensions = "v1")]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::enum_variant_names)]
 enum FooEnumSpec {
     /// First variant with an int
     VariantOne { int: i32 },

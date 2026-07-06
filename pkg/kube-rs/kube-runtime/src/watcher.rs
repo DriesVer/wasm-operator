@@ -2,87 +2,134 @@
 //!
 //! See [`watcher`] for the primary entry point.
 
-use crate::utils::ResetTimerBackoff;
-use backoff::{backoff::Backoff, ExponentialBackoff};
-use derivative::Derivative;
-use futures::{stream::BoxStream, Stream, StreamExt};
+use crate::utils::{Backoff, ResetTimerBackoff};
+
+use backon::BackoffBuilder;
+use educe::Educe;
+use futures::{Stream, StreamExt, stream::BoxStream};
 use kube_client::{
-    api::{ListParams, Resource, ResourceExt, WatchEvent},
-    Api,
+    Api, Error as ClientErr,
+    api::{ListParams, Resource, ResourceExt, VersionMatch, WatchEvent, WatchParams},
+    core::{ObjectList, Selector, metadata::PartialObjectMeta},
+    error::Status,
 };
 use serde::de::DeserializeOwned;
-use smallvec::SmallVec;
-use std::{clone::Clone, fmt::Debug, time::Duration};
+use std::{clone::Clone, collections::VecDeque, fmt::Debug, future, time::Duration};
 use thiserror::Error;
+use tracing::{debug, error, warn};
 
+/// Errors that a watcher can emit
+///
+/// These are all considered retryable from a watcher's point of view,
+/// even though they may require patching of rbac/netpols in the background to fix.
+///
+/// To avoid constantly looping errors, make sure backoff is applied.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Received a raw error while performing an api.list
     #[error("failed to perform initial object list: {0}")]
     InitialListFailed(#[source] kube_client::Error),
+
+    /// Received a raw error while starting an api.watch
     #[error("failed to start watching object: {0}")]
     WatchStartFailed(#[source] kube_client::Error),
+
+    /// Received a `WatchEvent::Error` from the apiserver
     #[error("error returned by apiserver during watch: {0}")]
-    WatchError(#[source] kube_client::error::ErrorResponse),
+    WatchError(#[source] Box<Status>),
+
+    /// Received a raw error while watching
     #[error("watch stream failed: {0}")]
     WatchFailed(#[source] kube_client::Error),
-    #[error("too many objects matched search criteria")]
-    TooManyObjects,
+
+    /// Missing resource version field from api server
+    #[error("no metadata.resourceVersion in watch result (does resource support watch?)")]
+    NoResourceVersion,
 }
+
+/// Type alias for Result with a `watcher::Error` as default.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
 /// Watch events returned from the [`watcher`]
 pub enum Event<K> {
     /// An object was added or modified
-    Applied(K),
+    Apply(K),
     /// An object was deleted
     ///
     /// NOTE: This should not be used for managing persistent state elsewhere, since
     /// events may be lost if the watcher is unavailable. Use Finalizers instead.
-    Deleted(K),
-    /// The watch stream was restarted, so `Deleted` events may have been missed
+    Delete(K),
+    /// The watch stream was restarted.
     ///
-    /// Should be used as a signal to replace the store contents atomically.
+    /// A series of `InitApply` events are expected to follow until all matching objects
+    /// have been listed. This event can be used to prepare a buffer for `InitApply` events.
+    Init,
+    /// Received an object during `Init`.
     ///
-    /// Any objects that were previously [`Applied`](Event::Applied) but are not listed in this event
-    /// should be assumed to have been [`Deleted`](Event::Deleted).
-    Restarted(Vec<K>),
+    /// Objects returned here are either from the initial stream using the `StreamingList` strategy,
+    /// or from pages using the `ListWatch` strategy.
+    ///
+    /// These events can be passed up if having a complete set of objects is not a concern.
+    /// If you need to wait for a complete set, please buffer these events until an `InitDone`.
+    InitApply(K),
+    /// The initialisation is complete.
+    ///
+    /// This can be used as a signal to replace buffered store contents atomically.
+    /// No more `InitApply` events will happen until the next `Init` event.
+    ///
+    /// Any objects that were previously [`Applied`](Event::Applied) but are not listed in any of
+    /// the `InitApply` events should be assumed to have been [`Deleted`](Event::Deleted).
+    InitDone,
 }
 
 impl<K> Event<K> {
-    /// Flattens out all objects that were added or modified in the event.
+    /// Map each object in an event through a mutator fn
     ///
-    /// `Deleted` objects are ignored, all objects mentioned by `Restarted` events are
-    /// emitted individually.
-    pub fn into_iter_applied(self) -> impl Iterator<Item = K> {
-        match self {
-            Event::Applied(obj) => SmallVec::from_buf([obj]),
-            Event::Deleted(_) => SmallVec::new(),
-            Event::Restarted(objs) => SmallVec::from_vec(objs),
-        }
-        .into_iter()
-    }
-
-    /// Flattens out all objects that were added, modified, or deleted in the event.
+    /// This allows for memory optimizations in watch streams.
+    /// If you are chaining a watch stream into a reflector as an in memory state store,
+    /// you can control the space used by each object by dropping fields.
     ///
-    /// Note that `Deleted` events may be missed when restarting the stream. Use finalizers
-    /// or owner references instead if you care about cleaning up external resources after
-    /// deleted objects.
-    pub fn into_iter_touched(self) -> impl Iterator<Item = K> {
-        match self {
-            Event::Applied(obj) | Event::Deleted(obj) => SmallVec::from_buf([obj]),
-            Event::Restarted(objs) => SmallVec::from_vec(objs),
+    /// ```no_run
+    /// use k8s_openapi::api::core::v1::Pod;
+    /// use kube::ResourceExt;
+    /// # use kube::runtime::watcher::Event;
+    /// # let event: Event<Pod> = todo!();
+    /// event.modify(|pod| {
+    ///     pod.managed_fields_mut().clear();
+    ///     pod.annotations_mut().clear();
+    ///     pod.status = None;
+    /// });
+    /// ```
+    #[must_use]
+    pub fn modify(mut self, mut f: impl FnMut(&mut K)) -> Self {
+        match &mut self {
+            Self::Apply(obj) | Self::Delete(obj) | Self::InitApply(obj) => (f)(obj),
+            Self::Init | Self::InitDone => {} // markers, nothing to modify
         }
-        .into_iter()
+        self
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Educe, Default)]
+#[educe(Debug)]
 /// The internal finite state machine driving the [`watcher`]
-enum State<K: Resource + Clone> {
+enum State<K> {
     /// The Watcher is empty, and the next [`poll`](Stream::poll_next) will start the initial LIST to get all existing objects
+    #[default]
     Empty,
+    /// The Watcher is in the process of paginating through the initial LIST
+    InitPage {
+        continue_token: Option<String>,
+        objects: VecDeque<K>,
+        last_bookmark: Option<String>,
+    },
+    /// Kubernetes 1.27 Streaming Lists
+    /// The initial watch is in progress
+    InitialWatch {
+        #[educe(Debug(ignore))]
+        stream: BoxStream<'static, kube_client::Result<WatchEvent<K>>>,
+    },
     /// The initial LIST was successful, so we should move on to starting the actual watch.
     InitListed { resource_version: String },
     /// The watch is in progress, from this point we just return events from the server.
@@ -93,54 +140,544 @@ enum State<K: Resource + Clone> {
     /// with `Empty`.
     Watching {
         resource_version: String,
-        #[derivative(Debug = "ignore")]
+        #[educe(Debug(ignore))]
         stream: BoxStream<'static, kube_client::Result<WatchEvent<K>>>,
     },
+}
+
+/// Used to control whether the watcher receives the full object, or only the
+/// metadata
+trait ApiMode {
+    type Value: Clone;
+
+    async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>>;
+    async fn watch(
+        &self,
+        wp: &WatchParams,
+        version: &str,
+    ) -> kube_client::Result<BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>>;
+}
+
+/// A wrapper around the `Api` of a `Resource` type that when used by the
+/// watcher will return the entire (full) object
+struct FullObject<'a, K> {
+    api: &'a Api<K>,
+}
+
+/// Configurable list semantics for `watcher` relists
+#[derive(Clone, Default, Debug, PartialEq)]
+pub enum ListSemantic {
+    /// List calls perform a full quorum read for most recent results
+    ///
+    /// Prefer this if you have strong consistency requirements. Note that this
+    /// is more taxing for the apiserver and can be less scalable for the cluster.
+    ///
+    /// If you are observing large resource sets (such as congested `Controller` cases),
+    /// you typically have a delay between the list call completing, and all the events
+    /// getting processed. In such cases, it is probably worth picking `Any` over `MostRecent`,
+    /// as your events are not guaranteed to be up-to-date by the time you get to them anyway.
+    #[default]
+    MostRecent,
+
+    /// List calls returns cached results from apiserver
+    ///
+    /// This is faster and much less taxing on the apiserver, but can result
+    /// in much older results than has previously observed for `Restarted` events,
+    /// particularly in HA configurations, due to partitions or stale caches.
+    ///
+    /// This option makes the most sense for controller usage where events have
+    /// some delay between being seen by the runtime, and it being sent to the reconciler.
+    Any,
+}
+
+/// Configurable watcher listwatch semantics
+
+#[derive(Clone, Default, Debug, PartialEq)]
+pub enum InitialListStrategy {
+    /// List first, then watch from given resource version
+    ///
+    /// This is the old and default way of watching. The watcher will do a paginated list call first before watching.
+    /// When using this mode, you can configure the `page_size` on the watcher.
+    #[default]
+    ListWatch,
+    /// Kubernetes 1.27 Streaming Lists
+    ///
+    /// See [upstream documentation on streaming lists](https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists),
+    /// and the [KEP](https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/3157-watch-list#design-details).
+    StreamingList,
+}
+
+/// Accumulates all options that can be used on the watcher invocation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Config {
+    /// A selector to restrict the list of returned objects by their labels.
+    ///
+    /// Defaults to everything if `None`.
+    pub label_selector: Option<String>,
+
+    /// A selector to restrict the list of returned objects by their fields.
+    ///
+    /// Defaults to everything if `None`.
+    pub field_selector: Option<String>,
+
+    /// Timeout for the list/watch call.
+    ///
+    /// This limits the duration of the call, regardless of any activity or inactivity.
+    /// If unset for a watch call, we will use 290s.
+    /// We limit this to 295s due to [inherent watch limitations](https://github.com/kubernetes/kubernetes/issues/6513).
+    pub timeout: Option<u32>,
+
+    /// Semantics for list calls.
+    ///
+    /// Configures re-list for performance vs. consistency.
+    ///
+    /// NB: This option only has an effect for [`InitialListStrategy::ListWatch`].
+    pub list_semantic: ListSemantic,
+
+    /// Control how the watcher fetches the initial list of objects.
+    ///
+    /// - `ListWatch`: The watcher will fetch the initial list of objects using a list call.
+    /// - `StreamingList`: The watcher will fetch the initial list of objects using a watch call.
+    ///
+    /// `StreamingList` is more efficient than `ListWatch`, but it requires the server to support
+    /// streaming list bookmarks (opt-in feature gate in Kubernetes 1.27).
+    ///
+    /// See [upstream documentation on streaming lists](https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists),
+    /// and the [KEP](https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/3157-watch-list#design-details).
+    pub initial_list_strategy: InitialListStrategy,
+
+    /// Maximum number of objects retrieved per list operation resyncs.
+    ///
+    /// This can reduce the memory consumption during resyncs, at the cost of requiring more
+    /// API roundtrips to complete.
+    ///
+    /// Defaults to 500. Note that `None` represents unbounded.
+    ///
+    /// NB: This option only has an effect for [`InitialListStrategy::ListWatch`].
+    pub page_size: Option<u32>,
+
+    /// Enables watch events with type "BOOKMARK".
+    ///
+    /// Requests watch bookmarks from the apiserver when enabled for improved watch precision and reduced list calls.
+    /// This is default enabled and should generally not be turned off.
+    pub bookmarks: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bookmarks: true,
+            label_selector: None,
+            field_selector: None,
+            timeout: None,
+            list_semantic: ListSemantic::default(),
+            // same default page size limit as client-go
+            // https://github.com/kubernetes/client-go/blob/aed71fa5cf054e1c196d67b2e21f66fd967b8ab1/tools/pager/pager.go#L31
+            page_size: Some(500),
+            initial_list_strategy: InitialListStrategy::ListWatch,
+        }
+    }
+}
+
+/// Builder interface to Config
+///
+/// Usage:
+/// ```
+/// use kube::runtime::watcher::Config;
+/// let wc = Config::default()
+///     .timeout(60)
+///     .labels("kubernetes.io/lifecycle=spot");
+/// ```
+impl Config {
+    /// Configure the timeout for list/watch calls
+    ///
+    /// This limits the duration of the call, regardless of any activity or inactivity.
+    /// Defaults to 290s
+    #[must_use]
+    pub fn timeout(mut self, timeout_secs: u32) -> Self {
+        self.timeout = Some(timeout_secs);
+        self
+    }
+
+    /// Configure the selector to restrict the list of returned objects by their fields.
+    ///
+    /// Defaults to everything.
+    /// Supports `=`, `==`, `!=`, and can be comma separated: `key1=value1,key2=value2`.
+    /// The server only supports a limited number of field queries per type.
+    #[must_use]
+    pub fn fields(mut self, field_selector: &str) -> Self {
+        self.field_selector = Some(field_selector.to_string());
+        self
+    }
+
+    /// Configure the selector to restrict the list of returned objects by their labels.
+    ///
+    /// Defaults to everything.
+    /// Supports `=`, `==`, `!=`, and can be comma separated: `key1=value1,key2=value2`.
+    #[must_use]
+    pub fn labels(mut self, label_selector: &str) -> Self {
+        self.label_selector = Some(label_selector.to_string());
+        self
+    }
+
+    /// Configure typed label selectors
+    ///
+    /// Configure typed selectors from [`Selector`](kube_client::core::Selector) and [`Expression`](kube_client::core::Expression) lists.
+    ///
+    /// ```
+    /// use kube_runtime::watcher::Config;
+    /// use kube_client::core::{Expression, Selector, ParseExpressionError};
+    /// use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+    /// let selector: Selector = Expression::In("env".into(), ["development".into(), "sandbox".into()].into()).into();
+    /// let cfg = Config::default().labels_from(&selector);
+    /// let cfg = Config::default().labels_from(&Expression::Exists("foo".into()).into());
+    /// let selector: Selector = LabelSelector::default().try_into()?;
+    /// let cfg = Config::default().labels_from(&selector);
+    /// # Ok::<(), ParseExpressionError>(())
+    ///```
+    #[must_use]
+    pub fn labels_from(mut self, selector: &Selector) -> Self {
+        self.label_selector = Some(selector.to_string());
+        self
+    }
+
+    /// Sets list semantic to configure re-list performance and consistency
+    ///
+    /// NB: This option only has an effect for [`InitialListStrategy::ListWatch`].
+    #[must_use]
+    pub fn list_semantic(mut self, semantic: ListSemantic) -> Self {
+        self.list_semantic = semantic;
+        self
+    }
+
+    /// Sets list semantic to `Any` to improve list performance
+    ///
+    /// NB: This option only has an effect for [`InitialListStrategy::ListWatch`].
+    #[must_use]
+    pub fn any_semantic(self) -> Self {
+        self.list_semantic(ListSemantic::Any)
+    }
+
+    /// Disables watch bookmarks to simplify watch handling
+    ///
+    /// This is not recommended to use with production watchers as it can cause desyncs.
+    /// See [#219](https://github.com/kube-rs/kube/issues/219) for details.
+    #[must_use]
+    pub fn disable_bookmarks(mut self) -> Self {
+        self.bookmarks = false;
+        self
+    }
+
+    /// Limits the number of objects retrieved in each list operation during resync.
+    ///
+    /// This can reduce the memory consumption during resyncs, at the cost of requiring more
+    /// API roundtrips to complete.
+    ///
+    /// NB: This option only has an effect for [`InitialListStrategy::ListWatch`].
+    #[must_use]
+    pub fn page_size(mut self, page_size: u32) -> Self {
+        self.page_size = Some(page_size);
+        self
+    }
+
+    /// Kubernetes 1.27 Streaming Lists
+    /// Sets list semantic to `Stream` to make use of watch bookmarks
+    #[must_use]
+    pub fn streaming_lists(mut self) -> Self {
+        self.initial_list_strategy = InitialListStrategy::StreamingList;
+        self
+    }
+
+    /// Converts generic `watcher::Config` structure to the instance of `ListParams` used for list requests.
+    fn to_list_params(&self) -> ListParams {
+        let (resource_version, version_match) = match self.list_semantic {
+            ListSemantic::Any => (Some("0".into()), Some(VersionMatch::NotOlderThan)),
+            ListSemantic::MostRecent => (None, None),
+        };
+        ListParams {
+            label_selector: self.label_selector.clone(),
+            field_selector: self.field_selector.clone(),
+            timeout: self.timeout,
+            version_match,
+            resource_version,
+            // The watcher handles pagination internally.
+            limit: self.page_size,
+            continue_token: None,
+        }
+    }
+
+    /// Converts generic `watcher::Config` structure to the instance of `WatchParams` used for watch requests.
+    fn to_watch_params(&self, phase: WatchPhase) -> WatchParams {
+        WatchParams {
+            label_selector: self.label_selector.clone(),
+            field_selector: self.field_selector.clone(),
+            timeout: self.timeout,
+            bookmarks: self.bookmarks,
+            send_initial_events: phase == WatchPhase::Initial
+                && self.initial_list_strategy == InitialListStrategy::StreamingList,
+        }
+    }
+}
+
+/// Distinguishes between initial watch and resumed watch for streaming lists.
+///
+/// This is used to determine whether to set `sendInitialEvents=true` in watch requests.
+/// Only initial watches should request initial events; reconnections should not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchPhase {
+    /// Initial watch from `State::Empty` - requests initial events for streaming lists
+    Initial,
+    /// Resumed watch from `State::InitListed` - does not request initial events
+    Resumed,
+}
+
+impl<K> ApiMode for FullObject<'_, K>
+where
+    K: Clone + Debug + DeserializeOwned + Send + 'static,
+{
+    type Value = K;
+
+    async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>> {
+        self.api.list(lp).await
+    }
+
+    async fn watch(
+        &self,
+        wp: &WatchParams,
+        version: &str,
+    ) -> kube_client::Result<BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>> {
+        self.api.watch(wp, version).await.map(StreamExt::boxed)
+    }
+}
+
+/// A wrapper around the `Api` of a `Resource` type that when used by the
+/// watcher will return only the metadata associated with an object
+struct MetaOnly<'a, K> {
+    api: &'a Api<K>,
+}
+
+impl<K> ApiMode for MetaOnly<'_, K>
+where
+    K: Clone + Debug + DeserializeOwned + Send + 'static,
+{
+    type Value = PartialObjectMeta<K>;
+
+    async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>> {
+        self.api.list_metadata(lp).await
+    }
+
+    async fn watch(
+        &self,
+        wp: &WatchParams,
+        version: &str,
+    ) -> kube_client::Result<BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>> {
+        self.api.watch_metadata(wp, version).await.map(StreamExt::boxed)
+    }
+}
+
+/// Client-side idle timeout margin added on top of the server-side watch timeout.
+///
+/// The server closes the watch stream after the configured timeout (default 290s).
+/// We add a small margin so the client detects dead connections where the
+/// server's close never arrives (e.g. network failure).
+const WATCH_IDLE_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
+
+/// Poll the next item from a watch stream with an idle timeout.
+///
+/// Returns `None` when the stream ends **or** when no item arrives within
+/// `timeout + WATCH_IDLE_TIMEOUT_MARGIN`, causing the watcher to
+/// treat the connection as dead and reconnect.
+async fn next_with_idle_timeout<S, T>(stream: &mut S, timeout: Option<u32>) -> Option<T>
+where
+    S: Stream<Item = T> + Unpin,
+{
+    let idle_timeout = Duration::from_secs(u64::from(timeout.unwrap_or(290))) + WATCH_IDLE_TIMEOUT_MARGIN;
+    match tokio::time::timeout(idle_timeout, stream.next()).await {
+        Ok(item) => item,
+        Err(_elapsed) => {
+            debug!(
+                timeout_secs = idle_timeout.as_secs(),
+                "watch stream idle timeout, reconnecting"
+            );
+            None
+        }
+    }
 }
 
 /// Progresses the watcher a single step, returning (event, state)
 ///
 /// This function should be trampolined: if event == `None`
 /// then the function should be called again until it returns a Some.
-async fn step_trampolined<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
-    api: &Api<K>,
-    list_params: &ListParams,
-    state: State<K>,
-) -> (Option<Result<Event<K>>>, State<K>) {
+#[allow(clippy::too_many_lines)] // for now
+async fn step_trampolined<A>(
+    api: &A,
+    wc: &Config,
+    state: State<A::Value>,
+) -> (Option<Result<Event<A::Value>>>, State<A::Value>)
+where
+    A: ApiMode,
+    A::Value: Resource + 'static,
+{
     match state {
-        State::Empty => match api.list(list_params).await {
-            Ok(list) => (Some(Ok(Event::Restarted(list.items))), State::InitListed {
-                resource_version: list.metadata.resource_version.unwrap(),
+        State::Empty => match wc.initial_list_strategy {
+            InitialListStrategy::ListWatch => (Some(Ok(Event::Init)), State::InitPage {
+                continue_token: None,
+                objects: VecDeque::default(),
+                last_bookmark: None,
             }),
-            Err(err) => (Some(Err(err).map_err(Error::InitialListFailed)), State::Empty),
+            InitialListStrategy::StreamingList => {
+                match api.watch(&wc.to_watch_params(WatchPhase::Initial), "0").await {
+                    Ok(stream) => (None, State::InitialWatch { stream }),
+                    Err(err) => {
+                        if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
+                            warn!("watch initlist error with 403: {err:?}");
+                        } else {
+                            debug!("watch initlist error: {err:?}");
+                        }
+                        (Some(Err(Error::WatchStartFailed(err))), State::default())
+                    }
+                }
+            }
         },
-        State::InitListed { resource_version } => match api.watch(list_params, &resource_version).await {
-            Ok(stream) => (None, State::Watching {
-                resource_version,
-                stream: stream.boxed(),
-            }),
-            Err(err) => (
-                Some(Err(err).map_err(Error::WatchStartFailed)),
-                State::InitListed { resource_version },
-            ),
-        },
+        State::InitPage {
+            continue_token,
+            mut objects,
+            last_bookmark,
+        } => {
+            if let Some(next) = objects.pop_front() {
+                return (Some(Ok(Event::InitApply(next))), State::InitPage {
+                    continue_token,
+                    objects,
+                    last_bookmark,
+                });
+            }
+            // check if we need to perform more pages
+            if continue_token.is_none()
+                && let Some(resource_version) = last_bookmark
+            {
+                // we have drained the last page - move on to next stage
+                return (Some(Ok(Event::InitDone)), State::InitListed { resource_version });
+            }
+            let mut lp = wc.to_list_params();
+            lp.continue_token = continue_token;
+            match api.list(&lp).await {
+                Ok(list) => {
+                    let last_bookmark = list.metadata.resource_version.filter(|s| !s.is_empty());
+                    let continue_token = list.metadata.continue_.filter(|s| !s.is_empty());
+                    if last_bookmark.is_none() && continue_token.is_none() {
+                        return (Some(Err(Error::NoResourceVersion)), State::Empty);
+                    }
+                    // Buffer page here, causing us to return to this enum branch (State::InitPage)
+                    // until the objects buffer has drained
+                    (None, State::InitPage {
+                        continue_token,
+                        objects: list.items.into_iter().collect(),
+                        last_bookmark,
+                    })
+                }
+                Err(err) => {
+                    if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
+                        warn!("watch list error with 403: {err:?}");
+                    } else {
+                        debug!("watch list error: {err:?}");
+                    }
+                    (Some(Err(Error::InitialListFailed(err))), State::Empty)
+                }
+            }
+        }
+        State::InitialWatch { mut stream } => {
+            match next_with_idle_timeout(&mut stream, wc.timeout).await {
+                Some(Ok(WatchEvent::Added(obj) | WatchEvent::Modified(obj))) => {
+                    (Some(Ok(Event::InitApply(obj))), State::InitialWatch { stream })
+                }
+                Some(Ok(WatchEvent::Deleted(_obj))) => {
+                    // Kubernetes claims these events are impossible
+                    // https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
+                    error!("got deleted event during initial watch. this is a bug");
+                    (None, State::InitialWatch { stream })
+                }
+                Some(Ok(WatchEvent::Bookmark(bm))) => {
+                    let marks_initial_end = bm.metadata.annotations.contains_key("k8s.io/initial-events-end");
+                    if marks_initial_end {
+                        (Some(Ok(Event::InitDone)), State::Watching {
+                            resource_version: bm.metadata.resource_version,
+                            stream,
+                        })
+                    } else {
+                        (None, State::InitialWatch { stream })
+                    }
+                }
+                Some(Ok(WatchEvent::Error(err))) => {
+                    // HTTP GONE, means we have desynced and need to start over and re-list :(
+                    let new_state = if err.code == 410 {
+                        State::default()
+                    } else {
+                        State::InitialWatch { stream }
+                    };
+                    if err.code == 403 {
+                        warn!("watcher watchevent error 403: {err:?}");
+                    } else {
+                        debug!("error watchevent error: {err:?}");
+                    }
+                    (Some(Err(Error::WatchError(err.boxed()))), new_state)
+                }
+                Some(Err(err)) => {
+                    if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
+                        warn!("watcher error 403: {err:?}");
+                    } else {
+                        debug!("watcher error: {err:?}");
+                    }
+                    (Some(Err(Error::WatchFailed(err))), State::InitialWatch { stream })
+                }
+                None => (None, State::default()),
+            }
+        }
+        State::InitListed { resource_version } => {
+            match api
+                .watch(&wc.to_watch_params(WatchPhase::Resumed), &resource_version)
+                .await
+            {
+                Ok(stream) => (None, State::Watching {
+                    resource_version,
+                    stream,
+                }),
+                Err(err) => {
+                    if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
+                        warn!("watch initlist error with 403: {err:?}");
+                    } else {
+                        debug!("watch initlist error: {err:?}");
+                    }
+                    (Some(Err(Error::WatchStartFailed(err))), State::InitListed {
+                        resource_version,
+                    })
+                }
+            }
+        }
         State::Watching {
             resource_version,
             mut stream,
-        } => match stream.next().await {
+        } => match next_with_idle_timeout(&mut stream, wc.timeout).await {
             Some(Ok(WatchEvent::Added(obj) | WatchEvent::Modified(obj))) => {
-                let resource_version = obj.resource_version().unwrap();
-                (Some(Ok(Event::Applied(obj))), State::Watching {
-                    resource_version,
-                    stream,
-                })
+                let resource_version = obj.resource_version().unwrap_or_default();
+                if resource_version.is_empty() {
+                    (Some(Err(Error::NoResourceVersion)), State::default())
+                } else {
+                    (Some(Ok(Event::Apply(obj))), State::Watching {
+                        resource_version,
+                        stream,
+                    })
+                }
             }
             Some(Ok(WatchEvent::Deleted(obj))) => {
-                let resource_version = obj.resource_version().unwrap();
-                (Some(Ok(Event::Deleted(obj))), State::Watching {
-                    resource_version,
-                    stream,
-                })
+                let resource_version = obj.resource_version().unwrap_or_default();
+                if resource_version.is_empty() {
+                    (Some(Err(Error::NoResourceVersion)), State::default())
+                } else {
+                    (Some(Ok(Event::Delete(obj))), State::Watching {
+                        resource_version,
+                        stream,
+                    })
+                }
             }
             Some(Ok(WatchEvent::Bookmark(bm))) => (None, State::Watching {
                 resource_version: bm.metadata.resource_version,
@@ -149,32 +686,48 @@ async fn step_trampolined<K: Resource + Clone + DeserializeOwned + Debug + Send 
             Some(Ok(WatchEvent::Error(err))) => {
                 // HTTP GONE, means we have desynced and need to start over and re-list :(
                 let new_state = if err.code == 410 {
-                    State::Empty
+                    State::default()
                 } else {
                     State::Watching {
                         resource_version,
                         stream,
                     }
                 };
-                (Some(Err(err).map_err(Error::WatchError)), new_state)
+                if err.code == 403 {
+                    warn!("watcher watchevent error 403: {err:?}");
+                } else {
+                    debug!("error watchevent error: {err:?}");
+                }
+                (Some(Err(Error::WatchError(err.boxed()))), new_state)
             }
-            Some(Err(err)) => (Some(Err(err).map_err(Error::WatchFailed)), State::Watching {
-                resource_version,
-                stream,
-            }),
+            Some(Err(err)) => {
+                if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
+                    warn!("watcher error 403: {err:?}");
+                } else {
+                    debug!("watcher error: {err:?}");
+                }
+                (Some(Err(Error::WatchFailed(err))), State::Watching {
+                    resource_version,
+                    stream,
+                })
+            }
             None => (None, State::InitListed { resource_version }),
         },
     }
 }
 
 /// Trampoline helper for `step_trampolined`
-async fn step<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
-    api: &Api<K>,
-    list_params: &ListParams,
-    mut state: State<K>,
-) -> (Result<Event<K>>, State<K>) {
+async fn step<A>(
+    api: &A,
+    config: &Config,
+    mut state: State<A::Value>,
+) -> (Result<Event<A::Value>>, State<A::Value>)
+where
+    A: ApiMode,
+    A::Value: Resource + 'static,
+{
     loop {
-        match step_trampolined(api, list_params, state).await {
+        match step_trampolined(api, config, state).await {
             (Some(result), new_state) => return (result, new_state),
             (None, new_state) => state = new_state,
         }
@@ -191,32 +744,31 @@ async fn step<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
 /// [`try_for_each`](futures::TryStreamExt::try_for_each) and [`try_concat`](futures::TryStreamExt::try_concat))
 /// will terminate eagerly as soon as they receive an [`Err`].
 ///
-/// This is intended to provide a safe and atomic input interface for a state store like a [`reflector`],
-/// direct users may want to flatten composite events with [`try_flatten_applied`]:
+/// The events are intended to provide a safe input interface for a state store like a [`reflector`].
+/// Direct users may want to use [`WatchStreamExt`] for higher-level constructs.
 ///
-/// ```no_run
+/// ```
 /// use kube::{
-///   api::{Api, ListParams, ResourceExt}, Client,
-///   runtime::{utils::try_flatten_applied, watcher}
+///   api::{Api, ResourceExt}, Client,
+///   runtime::{watcher, WatchStreamExt}
 /// };
 /// use k8s_openapi::api::core::v1::Pod;
-/// use futures::{StreamExt, TryStreamExt};
-/// #[tokio::main]
-/// async fn main() -> Result<(), watcher::Error> {
-///     let client = Client::try_default().await.unwrap();
-///     let pods: Api<Pod> = Api::namespaced(client, "apps");
+/// use futures::TryStreamExt;
 ///
-///     let watcher = watcher(pods, ListParams::default());
-///     try_flatten_applied(watcher)
-///         .try_for_each(|p| async move {
-///          println!("Applied: {}", p.name());
-///             Ok(())
-///         })
-///         .await?;
-///    Ok(())
-/// }
+/// # async fn wrapper() -> Result<(), watcher::Error> {
+/// #   let client: Client = todo!();
+/// let pods: Api<Pod> = Api::namespaced(client, "apps");
+///
+/// watcher(pods, watcher::Config::default()).applied_objects()
+///     .try_for_each(|p| async move {
+///         println!("Applied: {}", p.name_any());
+///        Ok(())
+///     })
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
-/// [`try_flatten_applied`]: super::utils::try_flatten_applied
+/// [`WatchStreamExt`]: super::WatchStreamExt
 /// [`reflector`]: super::reflector::reflector
 /// [`Api::watch`]: kube_client::Api::watch
 ///
@@ -230,16 +782,85 @@ async fn step<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
 /// [resource version](https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes)
 /// that we have seen on the stream. If this is successful then the stream is simply resumed from where it left off.
 /// If this fails because the resource version is no longer valid then we start over with a new stream, starting with
-/// an [`Event::Restarted`]. The internals mechanics of recovery should be considered an implementation detail.
+/// an [`Event::Init`]. The internals mechanics of recovery should be considered an implementation detail.
+#[doc(alias = "informer")]
 pub fn watcher<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
     api: Api<K>,
-    list_params: ListParams,
+    watcher_config: Config,
 ) -> impl Stream<Item = Result<Event<K>>> + Send {
     futures::stream::unfold(
-        (api, list_params, State::Empty),
-        |(api, list_params, state)| async {
-            let (event, state) = step(&api, &list_params, state).await;
-            Some((event, (api, list_params, state)))
+        (api, watcher_config, State::default()),
+        |(api, watcher_config, state)| async {
+            let (event, state) = step(&FullObject { api: &api }, &watcher_config, state).await;
+            Some((event, (api, watcher_config, state)))
+        },
+    )
+}
+
+/// Watches a Kubernetes Resource for changes continuously and receives only the
+/// metadata
+///
+/// Compared to [`Api::watch_metadata`], this automatically tries to recover the stream upon errors.
+///
+/// Errors from the underlying watch are propagated, after which the stream will go into recovery mode on the next poll.
+/// You can apply your own backoff by not polling the stream for a duration after errors.
+/// Keep in mind that some [`TryStream`](futures::TryStream) combinators (such as
+/// [`try_for_each`](futures::TryStreamExt::try_for_each) and [`try_concat`](futures::TryStreamExt::try_concat))
+/// will terminate eagerly as soon as they receive an [`Err`].
+///
+/// The events are intended to provide a safe input interface for a state store like a [`reflector`].
+/// Direct users may want to use [`WatchStreamExt`] for higher-level constructs.
+///
+/// ```
+/// use kube::{
+///   api::{Api, ResourceExt}, Client,
+///   runtime::{watcher, metadata_watcher, WatchStreamExt}
+/// };
+/// use k8s_openapi::api::core::v1::Pod;
+/// use futures::TryStreamExt;
+///
+/// # async fn wrapper() -> Result<(), watcher::Error> {
+/// #   let client: Client = todo!();
+/// let pods: Api<Pod> = Api::namespaced(client, "apps");
+///
+/// metadata_watcher(pods, watcher::Config::default()).applied_objects()
+///         .try_for_each(|p| async move {
+///          println!("Applied: {}", p.name_any());
+///             Ok(())
+///         })
+///         .await?;
+/// #   Ok(())
+/// # }
+/// ```
+/// [`WatchStreamExt`]: super::WatchStreamExt
+/// [`reflector`]: super::reflector::reflector
+/// [`Api::watch`]: kube_client::Api::watch
+///
+/// # Recovery
+///
+/// The stream will attempt to be recovered on the next poll after an [`Err`] is returned.
+/// This will normally happen immediately, but you can use [`StreamBackoff`](crate::utils::StreamBackoff)
+/// to introduce an artificial delay. [`default_backoff`] returns a suitable default set of parameters.
+///
+/// If the watch connection is interrupted, then `watcher` will attempt to restart the watch using the last
+/// [resource version](https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes)
+/// that we have seen on the stream. If this is successful then the stream is simply resumed from where it left off.
+/// If this fails because the resource version is no longer valid then we start over with a new stream, starting with
+/// an [`Event::Init`]. The internals mechanics of recovery should be considered an implementation detail.
+#[deprecated(
+    since = "3.1.0",
+    note = "Use `watcher(Api::<PartialObjectMeta<K>>::all(client), config)` instead. \
+            `Api<PartialObjectMeta<K>>` now automatically uses metadata-only requests."
+)]
+pub fn metadata_watcher<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
+    api: Api<K>,
+    watcher_config: Config,
+) -> impl Stream<Item = Result<Event<PartialObjectMeta<K>>>> + Send {
+    futures::stream::unfold(
+        (api, watcher_config, State::default()),
+        |(api, watcher_config, state)| async {
+            let (event, state) = step(&MetaOnly { api: &api }, &watcher_config, state).await;
+            Some((event, (api, watcher_config, state)))
         },
     )
 }
@@ -248,44 +869,230 @@ pub fn watcher<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
 ///
 /// Emits `None` if the object is deleted (or not found), and `Some` if an object is updated (or created/found).
 ///
-/// Compared to [`watcher`], `watch_object` does not return return [`Event`], since there is no need for an atomic
-/// [`Event::Restarted`] when only one object is covered anyway.
+/// Often invoked indirectly via [`await_condition`](crate::wait::await_condition()).
+///
+/// ## Scope Warning
+///
+/// When using this with an `Api::all` on namespaced resources there is a chance of duplicated names.
+/// To avoid getting confusing / wrong answers for this, use `Api::namespaced` bound to a specific namespace
+/// when watching for transitions to namespaced objects.
 pub fn watch_object<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
     api: Api<K>,
     name: &str,
-) -> impl Stream<Item = Result<Option<K>>> + Send {
-    watcher(api, ListParams {
-        field_selector: Some(format!("metadata.name={}", name)),
-        ..Default::default()
-    })
-    .map(|event| match event? {
-        Event::Deleted(_) => Ok(None),
-        // We're filtering by object name, so getting more than one object means that either:
-        // 1. The apiserver is accepting multiple objects with the same name, or
-        // 2. The apiserver is ignoring our query
-        // In either case, the K8s apiserver is broken and our API will return invalid data, so
-        // we had better bail out ASAP.
-        Event::Restarted(objs) if objs.len() > 1 => Err(Error::TooManyObjects),
-        Event::Restarted(mut objs) => Ok(objs.pop()),
-        Event::Applied(obj) => Ok(Some(obj)),
-    })
+) -> impl Stream<Item = Result<Option<K>>> + Send + use<K> {
+    // filtering by object name in given scope, so there's at most one matching object
+    // footgun: Api::all may generate events from namespaced objects with the same name in different namespaces
+    let fields = format!("metadata.name={name}");
+    watcher(api, Config::default().fields(&fields))
+        // The `obj_seen` state is used to track whether the object exists in each Init / InitApply / InitDone
+        // sequence of events. If the object wasn't seen in any particular sequence it is treated as deleted and
+        // `None` is emitted when the InitDone event is received.
+        //
+        // The first check ensures `None` is emitted if the object was already gone (or not found), subsequent
+        // checks ensure `None` is emitted even if for some reason the Delete event wasn't received, which
+        // could happen given K8S events aren't guaranteed delivery.
+        .scan(false, |obj_seen, event| {
+            if matches!(event, Ok(Event::Init)) {
+                *obj_seen = false;
+            } else if matches!(event, Ok(Event::InitApply(_))) {
+                *obj_seen = true;
+            }
+            future::ready(Some((*obj_seen, event)))
+        })
+        .filter_map(|(obj_seen, event)| async move {
+            match event {
+                // Pass up `Some` for Found / Updated
+                Ok(Event::Apply(obj) | Event::InitApply(obj)) => Some(Ok(Some(obj))),
+                // Pass up `None` for Deleted
+                Ok(Event::Delete(_)) => Some(Ok(None)),
+                // Pass up `None` if the object wasn't seen in the initial list
+                Ok(Event::InitDone) if !obj_seen => Some(Ok(None)),
+                // Ignore marker events
+                Ok(Event::Init | Event::InitDone) => None,
+                // Bubble up errors
+                Err(err) => Some(Err(err)),
+            }
+        })
 }
 
-/// Default watch [`Backoff`] inspired by Kubernetes' client-go.
+/// A struct with a manually configured exponential backoff
+pub struct ExponentialBackoff {
+    inner: backon::ExponentialBackoff,
+    builder: backon::ExponentialBuilder,
+}
+
+impl ExponentialBackoff {
+    fn new(min_delay: Duration, max_delay: Duration, factor: f32, enable_jitter: bool) -> Self {
+        let builder = backon::ExponentialBuilder::default()
+            .with_min_delay(min_delay)
+            .with_max_delay(max_delay)
+            .with_factor(factor)
+            .without_max_times();
+
+        let builder = if enable_jitter {
+            builder.with_jitter()
+        } else {
+            builder
+        };
+
+        Self {
+            inner: builder.build(),
+            builder,
+        }
+    }
+}
+
+impl Backoff for ExponentialBackoff {
+    fn reset(&mut self) {
+        self.inner = self.builder.build();
+    }
+}
+
+impl Iterator for ExponentialBackoff {
+    type Item = Duration;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl From<backon::ExponentialBuilder> for ExponentialBackoff {
+    fn from(builder: backon::ExponentialBuilder) -> Self {
+        Self {
+            inner: builder.build(),
+            builder,
+        }
+    }
+}
+
+/// Default watcher backoff inspired by Kubernetes' client-go.
 ///
-/// Note that the exact parameters used herein should not be considered stable.
 /// The parameters currently optimize for being kind to struggling apiservers.
-/// See [client-go's reflector source](https://github.com/kubernetes/client-go/blob/980663e185ab6fc79163b1c2565034f6d58368db/tools/cache/reflector.go#L177-L181)
-/// for more details.
-#[must_use]
-pub fn default_backoff() -> impl Backoff + Send + Sync {
-    let expo = backoff::ExponentialBackoff {
-        initial_interval: Duration::from_millis(800),
-        max_interval: Duration::from_secs(30),
-        randomization_factor: 1.0,
-        multiplier: 2.0,
-        max_elapsed_time: None,
-        ..ExponentialBackoff::default()
-    };
-    ResetTimerBackoff::new(expo, Duration::from_secs(120))
+/// The exact parameters are taken from
+/// [client-go's reflector source](https://github.com/kubernetes/client-go/blob/980663e185ab6fc79163b1c2565034f6d58368db/tools/cache/reflector.go#L177-L181)
+/// and should not be considered stable.
+///
+/// This struct implements [`Backoff`] and is the default strategy used
+/// when calling `WatchStreamExt::default_backoff`. If you need to create
+/// this manually then [`DefaultBackoff::default`] can be used.
+pub struct DefaultBackoff(Strategy);
+type Strategy = ResetTimerBackoff<ExponentialBackoff>;
+
+impl Default for DefaultBackoff {
+    fn default() -> Self {
+        Self(ResetTimerBackoff::new(
+            ExponentialBackoff::new(Duration::from_millis(800), Duration::from_secs(30), 2.0, true),
+            Duration::from_secs(120),
+        ))
+    }
+}
+
+impl Iterator for DefaultBackoff {
+    type Item = Duration;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+impl Backoff for DefaultBackoff {
+    fn reset(&mut self) {
+        self.0.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_watch_params_initial_phase_with_streaming_list_sets_send_initial_events() {
+        let config = Config::default().streaming_lists();
+        let params = config.to_watch_params(WatchPhase::Initial);
+        assert!(params.send_initial_events);
+    }
+
+    #[test]
+    fn to_watch_params_resumed_phase_with_streaming_list_does_not_set_send_initial_events() {
+        let config = Config::default().streaming_lists();
+        let params = config.to_watch_params(WatchPhase::Resumed);
+        assert!(!params.send_initial_events);
+    }
+
+    #[test]
+    fn to_watch_params_listwatch_mode_does_not_set_send_initial_events() {
+        let config = Config::default(); // ListWatch mode
+        let params_initial = config.to_watch_params(WatchPhase::Initial);
+        let params_resumed = config.to_watch_params(WatchPhase::Resumed);
+        assert!(!params_initial.send_initial_events);
+        assert!(!params_resumed.send_initial_events);
+    }
+
+    fn approx_eq(a: Duration, b: Duration) -> bool {
+        a.abs_diff(b) < Duration::from_micros(100)
+    }
+
+    #[test]
+    fn exponential_backoff_without_jitter() {
+        let mut backoff =
+            ExponentialBackoff::new(Duration::from_millis(100), Duration::from_secs(1), 2.0, false);
+
+        assert!(approx_eq(backoff.next().unwrap(), Duration::from_millis(100)));
+        assert!(approx_eq(backoff.next().unwrap(), Duration::from_millis(200)));
+        assert!(approx_eq(backoff.next().unwrap(), Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn exponential_backoff_with_jitter_applies_randomness() {
+        let mut backoff =
+            ExponentialBackoff::new(Duration::from_millis(100), Duration::from_secs(1), 2.0, true);
+
+        let delays: Vec<_> = (0..5).filter_map(|_| backoff.next()).collect();
+
+        // All delays should be positive
+        for d in &delays {
+            assert!(*d > Duration::ZERO);
+        }
+
+        // With jitter, at least one delay should differ from exact values
+        let exact_values = [
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(800),
+            Duration::from_secs(1),
+        ];
+
+        let all_exact = delays
+            .iter()
+            .zip(exact_values.iter())
+            .all(|(d, e)| approx_eq(*d, *e));
+
+        assert!(
+            !all_exact,
+            "With jitter enabled, delays should not all match exact exponential values"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_returns_item_when_stream_has_data() {
+        let mut stream = futures::stream::iter(vec![1, 2, 3]);
+        let result = next_with_idle_timeout(&mut stream, Some(290)).await;
+        assert_eq!(result, Some(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_returns_none_on_dead_connection() {
+        let mut stream = futures::stream::pending::<i32>();
+        // NB tokio auto-advances virtual time when the runtime is idle so next_with_idle_timeout resolves immediately
+        let result = next_with_idle_timeout(&mut stream, Some(290)).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_returns_none_when_stream_ends() {
+        let mut stream = futures::stream::empty::<i32>();
+        let result = next_with_idle_timeout(&mut stream, Some(290)).await;
+        assert_eq!(result, None);
+    }
 }

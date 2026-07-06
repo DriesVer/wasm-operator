@@ -1,3 +1,6 @@
+#![doc(
+    html_logo_url = "https://user-images.githubusercontent.com/639336/155115130-758a8ba9-e209-42de-bf6d-cde7be3ed86f.svg#only-light"
+)]
 //! Kube is an umbrella-crate for interacting with [Kubernetes](http://kubernetes.io) in Rust.
 //!
 //! # Overview
@@ -7,14 +10,14 @@
 //!
 //! The main modules are:
 //!
-//! - [`client`](crate::client) with the Kubernetes [`Client`](crate::Client) and its layers
-//! - [`config`](crate::config) for cluster [`Config`](crate::Config)
-//! - [`api`](crate::api) with the generic Kubernetes [`Api`](crate::Api)
-//! - [`derive`](kube_derive) with the [`CustomResource`](crate::CustomResource) derive for building controllers types
-//! - [`runtime`](crate::runtime) with a [`Controller`](crate::runtime::Controller) / [`watcher`](crate::runtime::watcher()) / [`reflector`](crate::runtime::reflector::reflector) / [`Store`](crate::runtime::reflector::Store)
-//! - [`core`](crate::core) with generics from `apimachinery`
+//! - [`client`] with the Kubernetes [`Client`] and its layers
+//! - [`config`] for cluster [`Config`]
+//! - [`api`] with the generic Kubernetes [`Api`]
+//! - [`derive`](kube_derive) with the [`CustomResource`] / [`Resource`](kube_derive::Resource) derive for building controllers types
+//! - [`runtime`] with a [`Controller`](crate::runtime::Controller) / [`watcher`](crate::runtime::watcher()) / [`reflector`](crate::runtime::reflector::reflector) / [`Store`](crate::runtime::reflector::Store)
+//! - [`core`] with generics from `apimachinery`
 //!
-//! You can use each of these as you need with the help of the [exported features](https://github.com/kube-rs/kube-rs/blob/master/kube/Cargo.toml#L18).
+//! You can use each of these as you need with the help of the [exported features](https://kube.rs/features/).
 //!
 //! # Using the Client
 //! ```no_run
@@ -30,7 +33,7 @@
 //!     // Read pods in the configured namespace into the typed interface from k8s-openapi
 //!     let pods: Api<Pod> = Api::default_namespaced(client);
 //!     for p in pods.list(&ListParams::default()).await? {
-//!         println!("found pod {}", p.name());
+//!         println!("found pod {}", p.name_any());
 //!     }
 //!     Ok(())
 //! }
@@ -39,7 +42,7 @@
 //! For details, see:
 //!
 //! - [`Client`](crate::client) for the extensible Kubernetes client
-//! - [`Api`](crate::Api) for the generic api methods available on Kubernetes resources
+//! - [`Api`] for the generic api methods available on Kubernetes resources
 //! - [k8s-openapi](https://docs.rs/k8s-openapi/*/k8s_openapi/) for documentation about the generated Kubernetes types
 //!
 //! # Using the Runtime with the Derive macro
@@ -48,22 +51,21 @@
 //! use schemars::JsonSchema;
 //! use serde::{Deserialize, Serialize};
 //! use serde_json::json;
-//! use validator::Validate;
 //! use futures::{StreamExt, TryStreamExt};
 //! use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 //! use kube::{
-//!     api::{Api, DeleteParams, ListParams, PatchParams, Patch, ResourceExt},
+//!     api::{Api, DeleteParams, PatchParams, Patch, ResourceExt},
 //!     core::CustomResourceExt,
 //!     Client, CustomResource,
-//!     runtime::{watcher, utils::try_flatten_applied, wait::{conditions, await_condition}},
+//!     runtime::{watcher, WatchStreamExt, wait::{conditions, await_condition}},
 //! };
 //!
 //! // Our custom resource
-//! #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Validate, JsonSchema)]
+//! #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
 //! #[kube(group = "clux.dev", version = "v1", kind = "Foo", namespaced)]
 //! pub struct FooSpec {
 //!     info: String,
-//!     #[validate(length(min = 3))]
+//!     #[schemars(length(min = 3))]
 //!     name: String,
 //!     replicas: i32,
 //! }
@@ -87,10 +89,10 @@
 //!
 //!     // Watch for changes to foos in the configured namespace
 //!     let foos: Api<Foo> = Api::default_namespaced(client.clone());
-//!     let lp = ListParams::default();
-//!     let mut apply_stream = try_flatten_applied(watcher(foos, lp)).boxed();
+//!     let wc = watcher::Config::default();
+//!     let mut apply_stream = watcher(foos, wc).applied_objects().boxed();
 //!     while let Some(f) = apply_stream.try_next().await? {
-//!         println!("saw apply to {}", f.name());
+//!         println!("saw apply to {}", f.name_any());
 //!     }
 //!     Ok(())
 //! }
@@ -98,21 +100,22 @@
 //!
 //! For details, see:
 //!
-//! - [`CustomResource`](crate::CustomResource) for documentation how to configure custom resources
+//! - [`CustomResource`] for documentation how to configure custom resources
 //! - [`runtime::watcher`](crate::runtime::watcher()) for how to long-running watches work and why you want to use this over [`Api::watch`](crate::Api::watch)
-//! - [`runtime`](crate::runtime) for abstractions that help with more complicated Kubernetes application
+//! - [`runtime`] for abstractions that help with more complicated Kubernetes application
 //!
 //! # Examples
-//! A large list of complete, runnable examples with explainations are available in the [examples folder](https://github.com/kube-rs/kube-rs/tree/master/examples).
+//! A large list of complete, runnable examples with explanations are available in the [examples folder](https://github.com/kube-rs/kube/tree/main/examples).
+//!
+//! # Features
+//! Documented at [kube.rs/features](https://kube.rs/features/).
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![deny(missing_docs)]
-#![forbid(unsafe_code)]
 
 macro_rules! cfg_client {
     ($($item:item)*) => {
         $(
-            #[cfg_attr(docsrs, doc(cfg(any(feature = "client", feature = "client-wasi"))))]
-            #[cfg(any(feature = "client", feature = "client-wasi"))]
+            #[cfg_attr(docsrs, doc(cfg(feature = "client")))]
+            #[cfg(feature = "client")]
             $item
         )*
     }
@@ -130,15 +133,12 @@ macro_rules! cfg_config {
 macro_rules! cfg_error {
     ($($item:item)*) => {
         $(
-            #[cfg_attr(docsrs, doc(cfg(any(feature = "config", feature = "client", feature = "client-wasi"))))]
-            #[cfg(any(feature = "config", feature = "client", feature = "client-wasi"))]
+            #[cfg_attr(docsrs, doc(cfg(any(feature = "config", feature = "client"))))]
+            #[cfg(any(feature = "config", feature = "client"))]
             $item
         )*
     }
 }
-
-#[cfg(all(feature = "client", feature = "client-wasi"))]
-compile_error!("Feature 'client' and 'client-wasi' cannot be enabled together");
 
 cfg_client! {
     pub use kube_client::api;
@@ -162,25 +162,59 @@ cfg_config! {
 cfg_error! {
     pub use kube_client::error;
     #[doc(inline)] pub use error::Error;
-    /// Convient alias for `Result<T, Error>`
+    /// Convenient alias for `Result<T, Error>`
     pub type Result<T, E = Error> = std::result::Result<T, E>;
 }
 
-/// Re-exports from [`kube-derive`](kube_derive)
 #[cfg(feature = "derive")]
 #[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
 pub use kube_derive::CustomResource;
 
-/// Re-exports from [`kube-runtime`](kube_runtime)
+#[cfg(feature = "derive")]
+#[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
+pub use kube_derive::Resource;
+
+#[cfg(feature = "derive")]
+#[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
+pub use kube_derive::KubeSchema;
+
 #[cfg(feature = "runtime")]
 #[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 #[doc(inline)]
 pub use kube_runtime as runtime;
 
 pub use crate::core::{CustomResourceExt, Resource, ResourceExt};
-/// Re-exports from [`kube_core`](kube_core)
-#[doc(inline)]
-pub use kube_core as core;
+#[doc(inline)] pub use kube_core as core;
+
+// Mock tests for the runtime
+#[cfg(test)]
+#[cfg(all(feature = "derive", feature = "runtime"))]
+mod mock_tests;
+
+pub mod prelude {
+    //! A prelude for kube. Reduces the number of duplicated imports.
+    //!
+    //! This prelude is similar to the standard library's prelude in that you'll
+    //! almost always want to import its entire contents, but unlike the
+    //! standard library's prelude you'll have to do so manually:
+    //!
+    //! ```
+    //! use kube::prelude::*;
+    //! ```
+    //!
+    //! The prelude may grow over time as additional items see ubiquitous use.
+
+    #[cfg(feature = "client")] pub use crate::client::ConfigExt as _;
+
+    #[cfg(feature = "unstable-client")] pub use crate::client::scope::NamespacedRef;
+
+    pub use crate::{
+        Resource as _, ResourceExt as _,
+        core::{PartialObjectMetaExt as _, SelectorExt as _, crd::CustomResourceExt as _},
+    };
+
+    #[cfg(feature = "runtime")] pub use crate::runtime::utils::WatchStreamExt as _;
+}
 
 // Tests that require a cluster and the complete feature set
 // Can be run with `cargo test -p kube --lib --features=runtime,derive -- --ignored`
@@ -188,8 +222,8 @@ pub use kube_core as core;
 #[cfg(all(feature = "derive", feature = "client"))]
 mod test {
     use crate::{
-        api::{DeleteParams, Patch, PatchParams},
         Api, Client, CustomResourceExt, Resource, ResourceExt,
+        api::{DeleteParams, Patch, PatchParams},
     };
     use kube_derive::CustomResource;
     use schemars::JsonSchema;
@@ -198,7 +232,10 @@ mod test {
     #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
     #[kube(group = "clux.dev", version = "v1", kind = "Foo", namespaced)]
     #[kube(status = "FooStatus")]
-    #[kube(scale = r#"{"specReplicasPath":".spec.replicas", "statusReplicasPath":".status.replicas"}"#)]
+    #[kube(scale(
+        spec_replicas_path = ".spec.replicas",
+        status_replicas_path = ".status.replicas"
+    ))]
     #[kube(crates(kube_core = "crate::core"))] // for dev-dep test structure
     pub struct FooSpec {
         name: String,
@@ -213,7 +250,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[ignore] // needs kubeconfig
+    #[ignore = "needs kubeconfig"]
     async fn custom_resource_generates_correct_core_structs() {
         use crate::core::{ApiResource, DynamicObject, GroupVersionKind};
         let client = Client::try_default().await.unwrap();
@@ -232,9 +269,9 @@ mod test {
         apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
     };
     #[tokio::test]
-    #[ignore] // needs cluster (creates + patches foo crd)
+    #[ignore = "needs cluster (creates + patches foo crd)"]
     #[cfg(all(feature = "derive", feature = "runtime"))]
-    async fn derived_resource_queriable_and_has_subresources() -> Result<(), Box<dyn std::error::Error>> {
+    async fn derived_resource_queryable_and_has_subresources() -> Result<(), Box<dyn std::error::Error>> {
         use crate::runtime::wait::{await_condition, conditions};
 
         use serde_json::json;
@@ -246,7 +283,6 @@ mod test {
             .await?;
         let establish = await_condition(crds.clone(), "foos.clux.dev", conditions::is_crd_established());
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), establish).await?;
-
         // Use it
         let foos: Api<Foo> = Api::default_namespaced(client.clone());
         // Apply from generated struct
@@ -273,12 +309,14 @@ mod test {
                 }
             });
             let o = foos.patch("baz", &ssapply, &Patch::Apply(patch)).await?;
-            assert_eq!(o.spec.replicas, 2);
+            assert_eq!(o.spec.replicas, 2, "patching spec updated spec.replicas");
         }
         // check subresource
         {
-            assert_eq!(foos.get_scale("baz").await?.spec.unwrap().replicas, Some(2));
-            assert!(foos.get_status("baz").await?.status.is_none()); // nothing has set this
+            let scale = foos.get_scale("baz").await?;
+            assert_eq!(scale.spec.unwrap().replicas, Some(2));
+            let status = foos.get_status("baz").await?;
+            assert!(status.status.is_none(), "nothing has set status");
         }
         // set status subresource
         {
@@ -286,7 +324,7 @@ mod test {
             let o = foos
                 .patch_status("baz", &Default::default(), &Patch::Merge(&fs))
                 .await?;
-            assert!(o.status.is_some());
+            assert!(o.status.is_some(), "status set after patch_status");
         }
         // set scale subresource
         {
@@ -294,8 +332,9 @@ mod test {
             let o = foos
                 .patch_scale("baz", &Default::default(), &Patch::Merge(&fs))
                 .await?;
-            assert_eq!(o.status.unwrap().replicas, 1); // something needs to set the status for this
-            assert_eq!(o.spec.unwrap().replicas.unwrap(), 3); // what we asked for got updated
+            assert_eq!(o.status.unwrap().replicas, 1, "scale replicas got patched");
+            let linked_replicas = o.spec.unwrap().replicas.unwrap();
+            assert_eq!(linked_replicas, 3, "patch_scale updates linked spec.replicas");
         }
 
         // cleanup
@@ -306,12 +345,12 @@ mod test {
     }
 
     #[tokio::test]
-    #[ignore] // needs cluster (lists pods)
+    #[ignore = "needs cluster (lists pods)"]
     async fn custom_serialized_objects_are_queryable_and_iterable() -> Result<(), Box<dyn std::error::Error>>
     {
         use crate::core::{
-            object::{HasSpec, HasStatus, NotUsed, Object},
             ApiResource,
+            object::{HasSpec, HasStatus, NotUsed, Object},
         };
         use k8s_openapi::api::core::v1::Pod;
         #[derive(Clone, Deserialize, Debug)]
@@ -342,6 +381,7 @@ mod test {
                 .entry("kube.rs".to_string())
                 .or_insert_with(|| "hello".to_string());
             pod.finalizers_mut().push("kube-finalizer".to_string());
+            pod.managed_fields_mut().clear();
             // NB: we are **not** pushing these back upstream - (Api::apply or Api::replace needed for it)
         }
         // check we can iterate over ObjectList normally - and check the mutations worked
@@ -350,18 +390,20 @@ mod test {
             assert!(pod.labels().get("kube.rs").is_some());
             assert!(pod.finalizers().contains(&"kube-finalizer".to_string()));
             assert!(pod.spec().containers.is_empty());
+            assert!(pod.managed_fields().is_empty());
         }
         Ok(())
     }
 
-    #[tokio::test]
-    #[ignore] // needs cluster (fetches api resources, and lists all)
-    #[cfg(all(feature = "derive"))]
+    // #[tokio::test]
+    // #[ignore = "needs cluster (fetches api resources, and lists all)"]
+    // TODO: fixup. gets rate limited in default k3s on CI now.
+    #[cfg(feature = "derive")]
     async fn derived_resources_discoverable() -> Result<(), Box<dyn std::error::Error>> {
         use crate::{
             core::{DynamicObject, GroupVersion, GroupVersionKind},
-            discovery::{self, verbs, Discovery, Scope},
-            runtime::wait::{await_condition, conditions},
+            discovery::{self, ApiGroup, Discovery, Scope, verbs},
+            runtime::wait::{Condition, await_condition, conditions},
         };
 
         #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -377,7 +419,9 @@ mod test {
         crds.patch("testcrs.kube.rs", &ssapply, &Patch::Apply(TestCr::crd()))
             .await?;
         let establish = await_condition(crds.clone(), "testcrs.kube.rs", conditions::is_crd_established());
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), establish).await?;
+        let crd = tokio::time::timeout(std::time::Duration::from_secs(10), establish).await??;
+        assert!(conditions::is_crd_established().matches_object(crd.as_ref()));
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await; // Established condition is actually not enough for api discovery :(
 
         // create partial information for it to discover
         let gvk = GroupVersionKind::gvk("kube.rs", "v1", "TestCr");
@@ -387,9 +431,9 @@ mod test {
         let apigroup = discovery::oneshot::pinned_group(&client, &gv).await?;
         let (ar1, caps1) = apigroup.recommended_kind("TestCr").unwrap();
         let (ar2, caps2) = discovery::pinned_kind(&client, &gvk).await?;
-        assert_eq!(caps1.operations.len(), caps2.operations.len());
-        assert_eq!(ar1, ar2);
-        assert_eq!(DynamicObject::api_version(&ar2), "kube.rs/v1");
+        assert_eq!(caps1.operations.len(), caps2.operations.len(), "unequal caps");
+        assert_eq!(ar1, ar2, "unequal apiresource");
+        assert_eq!(DynamicObject::api_version(&ar2), "kube.rs/v1", "unequal dynver");
 
         // run (almost) full discovery
         let discovery = Discovery::new(client.clone())
@@ -399,14 +443,17 @@ mod test {
             .await?;
 
         // check our custom resource first by resolving within groups
-        assert!(discovery.has_group("kube.rs"));
+        assert!(discovery.has_group("kube.rs"), "missing group kube.rs");
         let (ar, _caps) = discovery.resolve_gvk(&gvk).unwrap();
-        assert_eq!(ar.group, gvk.group);
-        assert_eq!(ar.version, gvk.version);
-        assert_eq!(ar.kind, gvk.kind);
+        assert_eq!(ar.group, gvk.group, "unexpected discovered group");
+        assert_eq!(ar.version, gvk.version, "unexpected discovered ver");
+        assert_eq!(ar.kind, gvk.kind, "unexpected discovered kind");
 
         // check all non-excluded groups that are iterable
-        for group in discovery.groups() {
+        let mut groups = discovery.groups_alphabetical().into_iter();
+        let firstgroup = groups.next().unwrap();
+        assert_eq!(firstgroup.name(), ApiGroup::CORE_GROUP, "core not first");
+        for group in groups {
             for (ar, caps) in group.recommended_resources() {
                 if !caps.supports_operation(verbs::LIST) {
                     continue;
@@ -426,13 +473,13 @@ mod test {
     }
 
     #[tokio::test]
-    #[ignore] // needs cluster (will create await a pod)
-    #[cfg(all(feature = "runtime"))]
+    #[ignore = "needs cluster (will create await a pod)"]
+    #[cfg(feature = "runtime")]
     async fn pod_can_await_conditions() -> Result<(), Box<dyn std::error::Error>> {
         use crate::{
-            api::{DeleteParams, PostParams},
-            runtime::wait::{await_condition, conditions, delete::delete_and_finalize, Condition},
             Api, Client,
+            api::{DeleteParams, PostParams},
+            runtime::wait::{Condition, await_condition, conditions, delete::delete_and_finalize},
         };
         use k8s_openapi::api::core::v1::Pod;
         use std::time::Duration;
@@ -454,14 +501,17 @@ mod test {
                 "restartPolicy": "Never",
                 "containers": [{
                   "name": "busybox",
-                  "image": "busybox:1.34.1",
+                  "image": "busybox:stable",
                   "command": ["sh", "-c", "sleep 20"],
                 }],
             }
         }))?;
 
         let pp = PostParams::default();
-        assert_eq!(data.name(), pods.create(&pp, &data).await?.name());
+        assert_eq!(
+            data.name_unchecked(),
+            pods.create(&pp, &data).await?.name_unchecked()
+        );
 
         // Watch it phase for a few seconds
         let is_running = await_condition(pods.clone(), "busybox-kube4", conditions::is_pod_running());
@@ -475,14 +525,12 @@ mod test {
         // TODO: remove these once we can write these functions generically
         fn is_each_container_ready() -> impl Condition<Pod> {
             |obj: Option<&Pod>| {
-                if let Some(o) = obj {
-                    if let Some(s) = &o.status {
-                        if let Some(conds) = &s.conditions {
-                            if let Some(pcond) = conds.iter().find(|c| c.type_ == "ContainersReady") {
-                                return pcond.status == "True";
-                            }
-                        }
-                    }
+                if let Some(o) = obj
+                    && let Some(s) = &o.status
+                    && let Some(conds) = &s.conditions
+                    && let Some(pcond) = conds.iter().find(|c| c.type_ == "ContainersReady")
+                {
+                    return pcond.status == "True";
                 }
                 false
             }
@@ -505,7 +553,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[ignore] // needs cluster (lists cms)
+    #[ignore = "needs cluster (lists cms)"]
     async fn api_get_opt_handles_404() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::try_default().await?;
         let api = Api::<ConfigMap>::default_namespaced(client);

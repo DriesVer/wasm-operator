@@ -1,44 +1,49 @@
+use axum::{Json, Router, routing::post};
+use axum_server::tls_rustls::RustlsConfig;
+use json_patch::jsonptr::PointerBuf;
 use kube::core::{
+    DynamicObject, Resource, ResourceExt,
     admission::{AdmissionRequest, AdmissionResponse, AdmissionReview},
-    DynamicObject, ResourceExt,
 };
-use std::{convert::Infallible, error::Error};
-#[macro_use] extern crate log;
-use warp::{reply, Filter, Reply};
+use std::{error::Error, net::SocketAddr};
+use tower_http::trace::TraceLayer;
+use tracing::*;
 
 #[tokio::main]
 async fn main() {
-    std::env::set_var("RUST_LOG", "info,warp=warn,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
-    let routes = warp::path("mutate")
-        .and(warp::body::json())
-        .and_then(mutate_handler)
-        .with(warp::trace::request());
+    let app = Router::new().route("/mutate", post(mutate_handler)).layer(
+        TraceLayer::new_for_http()
+            .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(Level::INFO)),
+    );
 
     // You must generate a certificate for the service / url,
     // encode the CA in the MutatingWebhookConfiguration, and terminate TLS here.
     // See admission_setup.sh + admission_controller.yaml.tpl for how to do this.
     let addr = format!("{}:8443", std::env::var("ADMISSION_PRIVATE_IP").unwrap());
-    warp::serve(warp::post().and(routes))
-        .tls()
-        .cert_path("admission-controller-tls.crt")
-        .key_path("admission-controller-tls.key")
-        //.run(([0, 0, 0, 0], 8443)) // in-cluster
-        .run(addr.parse::<std::net::SocketAddr>().unwrap()) // local-dev
-        .await;
+    axum_server::bind_rustls(
+        // SocketAddr::from(([0, 0, 0, 0], 8443)), // in-cluster
+        addr.parse::<SocketAddr>().unwrap(), // local-dev
+        RustlsConfig::from_pem_file("admission-controller-tls.crt", "admission-controller-tls.key")
+            .await
+            .unwrap(),
+    )
+    .serve(app.into_make_service())
+    .await
+    .unwrap();
 }
 
 // A general /mutate handler, handling errors from the underlying business logic
-async fn mutate_handler(body: AdmissionReview<DynamicObject>) -> Result<impl Reply, Infallible> {
+async fn mutate_handler(
+    Json(body): Json<AdmissionReview<DynamicObject>>,
+) -> Json<AdmissionReview<DynamicObject>> {
     // Parse incoming webhook AdmissionRequest first
     let req: AdmissionRequest<_> = match body.try_into() {
         Ok(req) => req,
         Err(err) => {
             error!("invalid request: {}", err.to_string());
-            return Ok(reply::json(
-                &AdmissionResponse::invalid(err.to_string()).into_review(),
-            ));
+            return Json(AdmissionResponse::invalid(err.to_string()).into_review());
         }
     };
 
@@ -46,19 +51,21 @@ async fn mutate_handler(body: AdmissionReview<DynamicObject>) -> Result<impl Rep
     let mut res = AdmissionResponse::from(&req);
     // req.Object always exists for us, but could be None if extending to DELETE events
     if let Some(obj) = req.object {
+        let name = obj.name_any(); // apiserver may not have generated a name yet
+        let kind = obj.types.clone().unwrap_or_default().kind;
         res = match mutate(res.clone(), &obj) {
             Ok(res) => {
-                info!("accepted: {:?} on Foo {}", req.operation, obj.name());
+                info!("accepted: {:?} on {kind}/{name}", req.operation);
                 res
             }
             Err(err) => {
-                warn!("denied: {:?} on {} ({})", req.operation, obj.name(), err);
+                warn!("denied: {:?} on {kind}/{name} ({})", req.operation, err);
                 res.deny(err.to_string())
             }
         };
     };
     // Wrap the AdmissionResponse wrapped in an AdmissionReview
-    Ok(reply::json(&res.into_review()))
+    Json(res.into_review())
 }
 
 // The main handler and core business logic, failures here implies rejected applies
@@ -70,18 +77,20 @@ fn mutate(res: AdmissionResponse, obj: &DynamicObject) -> Result<AdmissionRespon
 
     // If the resource doesn't contain "admission", we add it to the resource.
     if !obj.labels().contains_key("admission") {
-        let patches = vec![
-            // Ensure labels exist before adding a key to it
-            json_patch::PatchOperation::Add(json_patch::AddOperation {
-                path: "/metadata/labels".into(),
+        let mut patches = Vec::new();
+
+        // Ensure labels exist before adding a key to it
+        if obj.meta().labels.is_none() {
+            patches.push(json_patch::PatchOperation::Add(json_patch::AddOperation {
+                path: PointerBuf::from_tokens(["metadata", "labels"]),
                 value: serde_json::json!({}),
-            }),
-            // Add our label
-            json_patch::PatchOperation::Add(json_patch::AddOperation {
-                path: "/metadata/labels/admission".into(),
-                value: serde_json::Value::String("modified-by-admission-controller".into()),
-            }),
-        ];
+            }));
+        }
+        // Add our label
+        patches.push(json_patch::PatchOperation::Add(json_patch::AddOperation {
+            path: PointerBuf::from_tokens(["metadata", "labels", "admission"]),
+            value: serde_json::Value::String("modified-by-admission-controller".into()),
+        }));
         Ok(res.with_patch(json_patch::Patch(patches))?)
     } else {
         Ok(res)

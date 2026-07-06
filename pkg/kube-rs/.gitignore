@@ -1,9 +1,10 @@
 .vscode/
 .idea/
-**/target
+/target
 **/*.rs.bk
 Cargo.lock
-integration/dapp
+e2e/boot
+e2e/job
 examples/admission-controller-tls*
 examples/admission_extfile.cnf
 examples/ca.*

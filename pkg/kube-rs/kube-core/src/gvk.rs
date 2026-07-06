@@ -1,12 +1,14 @@
 //! Type information structs for dynamic resources.
 use std::str::FromStr;
 
+use crate::TypeMeta;
+use k8s_openapi::{api::core::v1::ObjectReference, apimachinery::pkg::apis::meta::v1::OwnerReference};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 #[error("failed to parse group version: {0}")]
-/// Failed to parse group version.
+/// Failed to parse group version
 pub struct ParseGroupVersionError(pub String);
 
 /// Core information about an API Resource.
@@ -31,6 +33,50 @@ impl GroupVersionKind {
     }
 }
 
+impl TryFrom<&TypeMeta> for GroupVersionKind {
+    type Error = ParseGroupVersionError;
+
+    fn try_from(tm: &TypeMeta) -> Result<Self, Self::Error> {
+        Ok(GroupVersion::from_str(&tm.api_version)?.with_kind(&tm.kind))
+    }
+}
+impl TryFrom<TypeMeta> for GroupVersionKind {
+    type Error = ParseGroupVersionError;
+
+    fn try_from(tm: TypeMeta) -> Result<Self, Self::Error> {
+        Ok(GroupVersion::from_str(&tm.api_version)?.with_kind(&tm.kind))
+    }
+}
+
+impl From<OwnerReference> for GroupVersionKind {
+    fn from(value: OwnerReference) -> Self {
+        let (group, version) = match value.api_version.split_once("/") {
+            Some((group, version)) => (group, version),
+            None => ("", value.api_version.as_str()),
+        };
+        Self {
+            group: group.into(),
+            version: version.into(),
+            kind: value.kind,
+        }
+    }
+}
+
+impl From<ObjectReference> for GroupVersionKind {
+    fn from(value: ObjectReference) -> Self {
+        let api_version = value.api_version.unwrap_or_default();
+        let (group, version) = match api_version.split_once("/") {
+            Some((group, version)) => (group, version),
+            None => ("", api_version.as_str()),
+        };
+        Self {
+            group: group.into(),
+            version: version.into(),
+            kind: value.kind.unwrap_or_default(),
+        }
+    }
+}
+
 /// Core information about a family of API Resources
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GroupVersion {
@@ -46,6 +92,15 @@ impl GroupVersion {
         let version = version_.to_string();
         let group = group_.to_string();
         Self { group, version }
+    }
+
+    /// Upgrade a GroupVersion to a GroupVersionKind
+    pub fn with_kind(self, kind: &str) -> GroupVersionKind {
+        GroupVersionKind {
+            group: self.group,
+            version: self.version,
+            kind: kind.into(),
+        }
     }
 }
 
@@ -107,7 +162,7 @@ impl GroupVersionResource {
         let api_version = if group.is_empty() {
             version.to_string()
         } else {
-            format!("{}/{}", group, version)
+            format!("{group}/{version}")
         };
 
         Self {
@@ -116,5 +171,26 @@ impl GroupVersionResource {
             resource,
             api_version,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn gvk_yaml() {
+        use crate::{GroupVersionKind, TypeMeta};
+        let input = r#"---
+apiVersion: kube.rs/v1
+kind: Example
+metadata:
+  name: doc1
+"#;
+        let tm: TypeMeta = serde_saphyr::from_str(input).unwrap();
+        let gvk = GroupVersionKind::try_from(&tm).unwrap(); // takes ref
+        let gvk2: GroupVersionKind = tm.try_into().unwrap(); // takes value
+        assert_eq!(gvk.kind, "Example");
+        assert_eq!(gvk.group, "kube.rs");
+        assert_eq!(gvk.version, "v1");
+        assert_eq!(gvk.kind, gvk2.kind);
     }
 }

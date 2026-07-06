@@ -24,12 +24,26 @@ Conduct](https://github.com/cncf/foundation/blob/master/code-of-conduct.md).
 
 ## Rust Guidelines
 
-- **Channel**: Code is built and tested using the **stable** channel of Rust, but documented and formatted with **nightly** <sup>[*](https://github.com/kube-rs/kube-rs/issues/707)</sup>
-- **Formatting**: To format the codebase, run `make fmt`
-- **Documentation** To check documentation, run `make doc`
-- **Testing**: To run tests, run `make test` and see below.
+- **Channel**: Code is built and tested using the **stable** channel of Rust, but documented and formatted with **nightly** <sup>[*](https://github.com/kube-rs/kube/issues/707)</sup>
+- **Formatting**: To format the codebase, run `just fmt`
+- **Documentation** To check documentation, run `just doc`
+- **Testing**: To run tests, run `just test` and see below.
 
 For a list of tooling that we glue together everything see [TOOLS.md](https://kube.rs/tools/).
+
+## Pull Request Guidelines
+
+1. **Please try to keep each PR small, and minimal for the relevant change.**
+
+Each line has be reviewed, so unnecessary changes increase the difficulty threshold for maintainers (and decreases the likelihood that your PR will be expedited).
+
+I.e. try to not not move files, or reformat files while also changing the logic in those same files. Github does not highlight moved lines very well.
+
+2. **Please do not force-push**
+
+Github does not show history between force pushes very well, and if you rewrite commits that previously have been reviewed, those reviews will have to be re-verified.
+
+There's no need to force-push / squash / rebase internally within a branch because each PR is set to squash merge.
 
 ## Testing
 
@@ -41,13 +55,13 @@ We have 3 classes of tests.
 
 The last two will try to access the Kubernetes cluster that is your `current-context`; i.e. via your local `KUBECONFIG` evar or `~/.kube/config` file.
 
-The easiest way set up a minimal Kubernetes cluster for these is with [`k3d`](https://k3d.io/) (`make k3d`).
+The easiest way set up a minimal Kubernetes cluster for these is with [`k3d`](https://k3d.io/) (`just k3d`).
 
 ### Unit Tests & Documentation Tests
 
-**Most** unit/doc tests are run from `cargo test --lib --doc --all`, but because of feature-sets, and examples, you will need a couple of extra invocations to replicate our CI.
+Unit and doc tests are run against a particular crate with `cargo test -p KUBECRATE --lib --doc`, but because of feature-sets, you will need a couple of extra flags and invocations to replicate all our CI conditions.
 
-For the complete variations, run the `make test` target in the `Makefile`.
+To run **all** unit tests, call: `just test`
 
 All public interfaces must be documented, and most should have minor documentation examples to show usage.
 
@@ -57,15 +71,17 @@ Slower set of tests within the crates marked with an **`#[ignore]`** attribute.
 
 :warning: These  **WILL** try to modify resources in your current cluster :warning:
 
-Most integration tests are run with `cargo test --all --lib -- --ignored`, but because of feature-sets, you will need a few invocations of these to replicate our CI. See `make test-integration`
+Integration tests are run against a crate with `cargo test -p KUBECRATE --lib -- --ignored`, but because of feature-sets, you will need a few invocations of these to replicate our CI.
+
+To run **all** integration tests, call: `just test-integration`
 
 ### End to End Tests
 
-We have a small set of [e2e tests](https://github.com/kube-rs/kube-rs/tree/master/e2e) that tests difference between in-cluster and local configuration.
+We have a small set of [e2e tests](https://github.com/kube-rs/kube/tree/main/e2e) that tests difference between in-cluster and local configuration.
 
 These tests are the heaviest tests we have because they require a full `docker build`, image import (or push/pull flow), yaml construction, and `kubectl` usage to verify that the outcome was sufficient.
 
-To run E2E tests, use (or follow) `make e2e` as appropriate.
+To run E2E tests, use (or follow) `just e2e` as appropriate.
 
 ### Test Guidelines
 
@@ -75,7 +91,7 @@ All public interfaces should have doc tests with examples for [docs.rs](https://
 
 When adding new non-trivial pieces of logic that results in a drop in coverage you should add a test.
 
-Cross-reference with the coverage build [![coverage build](https://codecov.io/gh/kube-rs/kube-rs/branch/master/graph/badge.svg?token=9FCqEcyDTZ)](https://codecov.io/gh/kube-rs/kube-rs) and go to your branch. Coverage can also be run locally with [`cargo tarpaulin`](https://github.com/xd009642/tarpaulin) at project root. This will use our [tarpaulin.toml](https://github.com/kube-rs/kube-rs/blob/master/tarpaulin.toml) config, and **will run both unit and integration** tests.
+Cross-reference with the coverage build [![coverage build](https://codecov.io/gh/kube-rs/kube/branch/main/graph/badge.svg?token=9FCqEcyDTZ)](https://app.codecov.io/gh/kube-rs/kube/tree/main) and go to your branch. Coverage can also be run locally with [`cargo tarpaulin`](https://github.com/xd009642/tarpaulin) at project root. This will use our [tarpaulin.toml](https://github.com/kube-rs/kube/blob/main/tarpaulin.toml) config, and **will run both unit and integration** tests.
 
 #### What type of test
 
@@ -90,7 +106,7 @@ In general: **use the least powerful method** of testing available to you:
 
 - use unit tests in `kube-core`
 - use unit tests in `kube-client` (and in rare cases integration tests)
-- use unit tests in `kube-runtime` (and occassionally integration tests)
+- use unit tests in `kube-runtime` (and occasionally integration tests)
 - use e2e tests when testing differences between in-cluster and local configuration
 
 ## Support
@@ -98,5 +114,5 @@ In general: **use the least powerful method** of testing available to you:
 The [high-level architecture document](https://kube.rs/architecture/) is written for contributors.
 
 ### Contact
-You can ask general questions / share ideas / query the community at the [kube-rs discussions forum](https://github.com/kube-rs/kube-rs/discussions).
+You can ask general questions / share ideas / query the community at the [kube-rs discussions forum](https://github.com/kube-rs/kube/discussions).
 You can reach the maintainers of this project at [#kube](https://discord.gg/tokio) channel on the Tokio discord.

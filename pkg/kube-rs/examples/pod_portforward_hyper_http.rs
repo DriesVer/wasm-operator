@@ -1,19 +1,20 @@
+use bytes::Bytes;
+use hyper_util::rt::TokioIo;
 use k8s_openapi::api::core::v1::Pod;
-
 use kube::{
+    Client, ResourceExt,
     api::{Api, DeleteParams, PostParams},
     runtime::wait::{await_condition, conditions::is_pod_running},
-    Client, ResourceExt,
 };
+use tracing::*;
 
-use hyper::{body, Body, Request};
+use http::Request;
+use http_body_util::BodyExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    std::env::set_var("RUST_LOG", "info,kube=debug");
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
-    let namespace = std::env::var("NAMESPACE").unwrap_or_else(|_| "default".into());
 
     let p: Pod = serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
@@ -27,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }))?;
 
-    let pods: Api<Pod> = Api::namespaced(client, &namespace);
+    let pods: Api<Pod> = Api::default_namespaced(client);
     // Stop on error including a pod already exists or is still being deleted.
     pods.create(&PostParams::default(), &p).await?;
 
@@ -39,34 +40,32 @@ async fn main() -> anyhow::Result<()> {
     let port = pf.take_stream(80).unwrap();
 
     // let hyper drive the HTTP state in our DuplexStream via a task
-    let (mut sender, connection) = hyper::client::conn::handshake(port).await?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(port)).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("Error in connection: {}", e);
+            warn!("Error in connection: {}", e);
         }
     });
 
-    let http_req = Request::builder()
-        .uri("/")
+    let http_req = Request::get("/")
         .header("Connection", "close")
         .header("Host", "127.0.0.1")
-        .method("GET")
-        .body(Body::from(""))
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let (parts, body) = sender.send_request(http_req).await?.into_parts();
     assert!(parts.status == 200);
 
-    let body_bytes = body::to_bytes(body).await?;
+    let body_bytes = body.collect().await?.to_bytes();
     let body_str = std::str::from_utf8(&body_bytes)?;
     assert!(body_str.contains("Welcome to nginx!"));
 
     // Delete it
-    println!("deleting");
+    info!("deleting");
     pods.delete("example", &DeleteParams::default())
         .await?
         .map_left(|pdel| {
-            assert_eq!(pdel.name(), "example");
+            assert_eq!(pdel.name_any(), "example");
         });
 
     Ok(())

@@ -29,7 +29,7 @@ body:
       description: |
         What type of kubernetes cluster you are running aginst (k3s/eks/aks/gke/other) and what is OS in your `Dockerfile`?
       placeholder: |
-        Output of `kubectl version --short`
+        Output of `kubectl version`
         Dockerfile OS
     validations:
       required: true
@@ -45,6 +45,14 @@ body:
         kube = { version = "0.63.1", features = ["runtime"] }
         k8s-openapi = { version = "0.13.0", features = ["v1_21"], default-features = false }
         ```
+
+  - type: textarea
+    attributes:
+      label: YAML
+      description: |
+        Do you have resource YAML that would be relevant?
+    validations:
+      required: false
 
   - type: dropdown
     attributes:
