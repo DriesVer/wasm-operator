@@ -1,5 +1,0 @@
-error: Unknown field: `shortnames`. Did you mean `shortname`?
- --> tests/ui/fail_with_suggestion.rs:7:58
-  |
-7 | #[kube(group = "clux.dev", version = "v1", kind = "Foo", shortnames = "foo")]
-  |                                                          ^^^^^^^^^^

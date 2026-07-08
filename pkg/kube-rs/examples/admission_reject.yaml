@@ -1,9 +1,0 @@
-apiVersion: kube.rs/v1
-kind: AdmitTest
-metadata:
-  name: reject
-  labels:
-    illegal: "ohno"
-spec:
-  name: reject
-  info: this is rejected
