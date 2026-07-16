@@ -20,11 +20,9 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::Store;
-use wasmtime_wasi::p2::add_to_linker_async;
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::host::api::bindings;
-use crate::host::api::bindings::local::operator::types as wit_types;
 use crate::host::state::State;
 use crate::kubernetes::crd::{
     EnvironmentVariable, WasmOperator as WasmOperatorCR, WasmOperatorState, WasmOperatorStatus,
@@ -34,6 +32,7 @@ use crate::kubernetes::KubernetesService;
 use crate::runtime::stats::WasmOperatorStatisticsRecorder;
 use crate::runtime::CONTROLLER_UUID;
 use crate::runtime::{WasmEngineSingleton, WASMOP_CACHE_DIR};
+use wasmtime_wasi::p2::bindings::Command;
 
 const STATUS_PATCH_THROTTLE_DURATION: Duration = Duration::from_secs(5);
 
@@ -75,7 +74,7 @@ pub enum WORCommand {
 }
 
 struct LoadedState {
-    operator: bindings::KubeOperator,
+    operator: Command,
     store: Mutex<Store<State>>,
     last_active: Mutex<Instant>,
 }
@@ -360,7 +359,7 @@ impl WasmOperatorRuntime {
         });
     }
 
-    async fn load_wasm_instance(&self) -> Result<(bindings::KubeOperator, Store<State>)> {
+    async fn load_wasm_instance(&self) -> Result<(Command, Store<State>)> {
         let wasmtime_engine = wasmtime::Engine::global().await?;
 
         let target_arch = Triple::host();
@@ -428,6 +427,10 @@ impl WasmOperatorRuntime {
                     .map(|e| (e.name.as_str(), e.value.as_str()))
                     .collect::<Vec<_>>(),
             )
+            .inherit_network()
+            .allow_blocking_current_thread(true)
+            .inherit_network()
+            .allow_ip_name_lookup(true)
             .build();
 
         let k8s_service = KubernetesService::global().await?;
@@ -440,14 +443,29 @@ impl WasmOperatorRuntime {
         let mut store = Store::new(wasmtime_engine, state);
 
         let mut linker = Linker::new(wasmtime_engine);
-        add_to_linker_async(&mut linker)?;
 
-        bindings::KubeOperator::add_to_linker::<_, HasSelf<_>>(&mut linker, |ctx: &mut State| ctx)?;
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+        bindings::Kubernetes::add_to_linker::<_, HasSelf<_>>(&mut linker, |ctx| ctx)?;
 
-        let operator =
-            bindings::KubeOperator::instantiate_async(&mut store, &component, &linker).await?;
+        let operator = Command::instantiate_async(&mut store, &component, &linker).await?;
 
-        Ok((operator, store))
+        info!("Starting operator wasi p3 '{}'...", self.cr.name);
+        // let program_result = store
+        //     .run_concurrent(async move |accessor| operator.wasi_cli_run().call_run(accessor).await)
+        //     .await??;
+        let program_result = operator.wasi_cli_run().call_run(&mut store).await?;
+
+        info!("Operator '{}' started successfully.", self.cr.name);
+
+        if program_result.is_err() {
+            error!("WASI application exited with an error.");
+            std::process::exit(1);
+        }
+
+        let operator2 = Command::instantiate_async(&mut store, &component, &linker).await?;
+
+        Ok((operator2, store))
     }
 
     fn load_wasm_file(&self) -> Result<Vec<u8>> {
@@ -475,40 +493,47 @@ impl WasmOperatorRuntime {
             ));
         }
 
-        // Get the watch requests for the operator
-        let watch_requests = self
-            .execute_via_wit(|operator, store| {
-                Box::pin(async move {
-                    operator
-                        .call_get_watch_requests(store)
-                        .await
-                        .map_err(anyhow::Error::from)
-                })
-            })
-            .await?;
-
-        let client = KubernetesService::global().await.unwrap();
-        let mut watcher_streams = Vec::new();
-        for request in watch_requests {
-            let ar = client.find_api_resource(&request.kind).await?;
-            let k8s_watcher = watcher(
-                client.dynamic_api(ar, &request.namespace),
-                Default::default(),
-            )
-            .boxed();
-            watcher_streams.push(k8s_watcher);
-        }
-
-        let watcher_stream = stream::select_all(watcher_streams);
-
         let self_clone = self.clone();
         self.task_tracker.spawn_local(async move {
-            self_clone.watcher_loop(watcher_stream).await;
+            if let Err(err) = self_clone.run_operator_loop().await {
+                error!("Error running operator loop: {:?}", err);
+            }
         });
 
         Ok(())
     }
 
+    async fn run_operator_loop(self: Arc<Self>) -> Result<()> {
+        let mut state_guard = self.state.write().await;
+        if let OperatorState::Unloaded(_) = *state_guard {
+            drop(state_guard);
+            self.load().await?;
+            state_guard = self.state.write().await;
+        }
+
+        let loaded_state = if let OperatorState::Loaded(ref mut state) = *state_guard {
+            state.clone()
+        } else {
+            return Err(anyhow::anyhow!("Operator is not in a loaded state"));
+        };
+        drop(state_guard);
+
+        let mut store_guard = loaded_state.store.lock().await;
+
+        // let program_result = loaded_state
+        //     .operator
+        //     .wasi_cli_run()
+        //     .call_run(&mut *store_guard)
+        //     .await?;
+
+        todo!(
+            "run the operator loop, which should include starting the watcher and handling events"
+        );
+
+        Ok(())
+    }
+
+    /*
     async fn watcher_loop(
         self: Arc<Self>,
         mut watcher_stream: stream::SelectAll<BoxedWatcherStream>,
@@ -557,6 +582,7 @@ impl WasmOperatorRuntime {
             }
         }
     }
+    */
 
     async fn stop_execution(&self) {
         // Cancel all active loops including watchers
@@ -585,6 +611,7 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    /*
     async fn reconcile(
         self: Arc<Self>,
         event_type: wit_types::EventType,
@@ -635,7 +662,7 @@ impl WasmOperatorRuntime {
             wit_types::ReconcileResult::Ok => {}
             wit_types::ReconcileResult::Error(e) => {
                 let error = format!(
-                    "Reconcile error for resource '{}/{}' in namespace '{}': \n {}",
+                     "Reconcile error for resource '{}/{}' in namespace '{}': \n {}",
                     kind, &name, &namespace, e
                 );
                 self.stats.record_error(&error).await;
@@ -676,11 +703,12 @@ impl WasmOperatorRuntime {
             .ok();
         Ok(())
     }
+    */
 
     async fn execute_via_wit<F, T>(&self, f: F) -> Result<T>
     where
         for<'a> F: FnOnce(
-            &'a bindings::KubeOperator,
+            &'a Command,
             &'a mut Store<State>,
         ) -> Pin<Box<dyn Future<Output = Result<T>> + 'a>>,
     {

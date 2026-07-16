@@ -64,7 +64,7 @@ fn sanitize_patch_payload(resource: &mut Value) {
 /// methods to interact with them using dynamic objects, allowing it to work
 /// with any Kubernetes resource kind, including Custom Resources.
 pub struct KubernetesService {
-    client: Client,
+    pub client: Client,
     //discovery: Discovery,
     discovery: RwLock<Discovery>,
 }
@@ -101,6 +101,11 @@ impl KubernetesService {
 
         // Clone the Arc to return an owned handle with a 'static lifetime
         Ok(Arc::clone(instance))
+    }
+
+    pub async fn global_client() -> Result<Client> {
+        let service = Self::global().await?;
+        Ok(service.client.clone())
     }
 
     pub async fn refresh_discovery(&self) -> Result<()> {

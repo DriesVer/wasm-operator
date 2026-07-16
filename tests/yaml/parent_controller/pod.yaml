@@ -9,6 +9,7 @@ spec:
   containers:
     - name: controller
       image: "wasmoperator-controller:latest"
+      args: ["--debug", "--http_log=info", "--kube_log=info"]
       #command: ["sh", "-c", "sleep 3600"]
       imagePullPolicy: IfNotPresent
       resources:

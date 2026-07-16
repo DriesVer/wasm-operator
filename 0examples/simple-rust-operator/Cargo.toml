@@ -4,16 +4,42 @@
 name = "simple-rust-operator"
 version = "0.1.0"
 edition = "2024"
+resolver = "2"
 
 [lib]
+path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = { git = "https://github.com/bytecodealliance/wit-bindgen", tag = "v0.26.0" }
-chrono = { version = "0.4.10", features = ["serde"] }
-serde = { version = "1.0.111", features = ["derive"] }
-serde_json = "1.0.53"
-serde_yaml = "^0.8.23"
+# Async Runtime & Stream Management
+tokio = { version = "1.52.3", default-features = false, features = ["sync", "macros", "io-util", "rt", "time"] }
+futures = "0.3"
 
-[profile.release]
-opt-level = "s"
+# Lets every type be Send (no problem due to wasi being single threaded)
+send_wrapper = { version = "0.6.0", features = ["futures"] }
+
+# Core Kubernetes Framework
+#kube = { version = "4.0.0", features = ["client", "runtime", "derive"] }
+kube = { path = "../../pkg/kube-rs/kube", version = "4.0.0", default-features = false, features = [
+    "wasi-client",
+    "runtime",
+    "derive",
+] }
+k8s-openapi = { version = "0.28", features = ["latest", "schemars"] }
+schemars = { version = "1.2.1", features = ["chrono04"] }
+wasip3 = "0.7.0"
+wasip2 = "1.0.4"
+
+# Data Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error Handling & Logs
+thiserror = "2.0.18"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+#[[bin]]
+#name = "simple-rust-operator"
+#path = "src/main.rs"

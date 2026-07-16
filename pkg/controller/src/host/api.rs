@@ -5,15 +5,39 @@
 //! the host functions that Wasm modules can call, such as sending requests to the
 //! Kubernetes API and handling asynchronous responses.
 
-use crate::host::state::State;
-use std::future::Future;
+use std::pin::Pin;
+
+use futures::{Stream, StreamExt};
+use kube::{
+    api::{
+        ApiResource as KubeApiResource, DeleteParams as KubeDeleteParams,
+        EvictParams as KubeEvictParams, GetParams as KubeGetParams, ListParams as KubeListParams,
+        LogParams as KubeLogParams, Patch as KubePatch, PatchParams as KubePatchParams,
+        PostParams as KubePostParams, Preconditions as KubePreconditions,
+        PropagationPolicy as KubePropagationPolicy, ValidationDirective as KubeValidationDirective,
+        VersionMatch as KubeVersionMatch, WatchParams as KubeWatchParams,
+    },
+    core::{dynamic::DynamicObject, metadata::PartialObjectMeta, WatchEvent as KubeWatchEvent},
+    Api, Client,
+};
+
+use k8s_openapi::api::core::v1::Pod;
+
+use serde::Serialize;
+use tokio::sync::mpsc;
+use wasmtime::component::{Accessor, HasSelf};
+use wasmtime::component::{StreamProducer, StreamReader};
+
+use crate::{host::state::State, kubernetes::KubernetesService};
+use anyhow::Result;
 
 pub mod bindings {
     wasmtime::component::bindgen!({
-            path: "wit/",
-            world: "kube-operator",
+            path: "../wit",
+            world: "kubernetes",
             imports: {
-                default: async,
+            //     "local:kube/api": async | ignore_wit,
+                "local:kube/api": async,
             },
             exports: {
                 default: async,
@@ -21,93 +45,785 @@ pub mod bindings {
     });
 }
 
-impl bindings::local::operator::types::Host for State {}
+use bindings::local::kube::api::{
+    ApiCategory, ApiResource, CreateParams, DeleteParams, Error, EvictParams, Host, HostWithStore,
+    JsonValue, ListParams, LogParams, PatchParams, PatchType, Preconditions, PropagationPolicy,
+    Scope, ValidationDirective, VersionMatch, WatchEvent, WatchParams,
+};
 
-impl bindings::local::operator::kubernetes::Host for State {
-    fn log(
-        &mut self,
-        level: bindings::local::operator::types::LogLevel,
-        message: String,
-    ) -> impl Future<Output = ()> + Send {
-        async move {
-            match level {
-                bindings::local::operator::types::LogLevel::Trace => tracing::trace!(message),
-                bindings::local::operator::types::LogLevel::Debug => tracing::debug!(message),
-                bindings::local::operator::types::LogLevel::Info => tracing::info!(message),
-                bindings::local::operator::types::LogLevel::Warn => tracing::warn!(message),
-                bindings::local::operator::types::LogLevel::Error => tracing::error!(message),
+impl Host for State {}
+
+impl HostWithStore<State> for HasSelf<State> {
+    async fn get_resource(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
+        name: String,
+        resource_version: Option<String>,
+        scope: Scope,
+    ) -> Result<JsonValue, Error> {
+        let api_res = to_kube_api_resource(&api);
+        let gp = KubeGetParams { resource_version };
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        match scope {
+            Scope::Full => {
+                let kube_api = get_dynamic_api(k8s_client.clone(), &api, &api_res);
+                let obj = kube_api.get_with(&name, &gp).await.map_err(to_wit_error)?;
+                serde_json::to_string(&obj).map_err(to_serde_error)
+            }
+            Scope::MetadataOnly => {
+                let kube_api = get_meta_api(k8s_client.clone(), &api, &api_res);
+                let obj = kube_api
+                    .get_metadata_with(&name, &gp)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&obj).map_err(to_serde_error)
+            }
+            Scope::Subresource(sub) => {
+                let kube_api = get_dynamic_api(k8s_client.clone(), &api, &api_res);
+                let obj = kube_api
+                    .get_subresource(&sub, &name)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&obj).map_err(to_serde_error)
             }
         }
     }
 
-    fn get_resource(
-        &mut self,
-        kind: String,
+    async fn list_resources(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
+        params: ListParams,
+        scope: Scope,
+    ) -> Result<JsonValue, Error> {
+        let api_res = to_kube_api_resource(&api);
+        let lp = to_kube_list_params(params);
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        tracing::info!("[HOST] list_resources called for kind={:?}, namespace={:?}", api.kind, api.namespace);
+        match scope {
+            Scope::Full => {
+                let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                tracing::info!("[HOST] executing list on Kubernetes API server...");
+                let list = kube_api.list(&lp).await.map_err(to_wit_error)?;
+                tracing::info!("[HOST] list returned {} items", list.items.len());
+                serde_json::to_string(&list).map_err(to_serde_error)
+            }
+            Scope::MetadataOnly => {
+                let kube_api = get_meta_api(k8s_client, &api, &api_res);
+                let list = kube_api.list_metadata(&lp).await.map_err(to_wit_error)?;
+                serde_json::to_string(&list).map_err(to_serde_error)
+            }
+            Scope::Subresource(_) => Err(Error::Other(
+                "List operation is not supported on subresources".to_string(),
+            )),
+        }
+    }
+
+    async fn create_resource(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
+        body: JsonValue,
+        params: CreateParams,
+    ) -> Result<JsonValue, Error> {
+        let api_res = to_kube_api_resource(&api);
+        let pp = to_kube_post_params(params);
+        let data: DynamicObject = serde_json::from_str(&body).map_err(to_serde_error)?;
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+        let obj = kube_api.create(&pp, &data).await.map_err(to_wit_error)?;
+        serde_json::to_string(&obj).map_err(to_serde_error)
+    }
+
+    async fn create_subresource(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
+        main_resource: String,
+        subresource: String,
+        body: JsonValue,
+        params: CreateParams,
+    ) -> Result<JsonValue, Error> {
+        let api_res = to_kube_api_resource(&api);
+        let pp = to_kube_post_params(params);
+        let data: serde_json::Value = serde_json::from_str(&body).map_err(to_serde_error)?;
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+        let obj: serde_json::Value = kube_api
+            .create_subresource(&subresource, &main_resource, &pp, &data)
+            .await
+            .map_err(to_wit_error)?;
+        serde_json::to_string(&obj).map_err(to_serde_error)
+    }
+
+    async fn delete_resource(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
+        name: wasmtime::component::__internal::String,
+        params: DeleteParams,
+        scope: Scope,
+    ) -> std::prelude::v1::Result<JsonValue, Error> {
+        let api_res = to_kube_api_resource(&api);
+        let dp = to_kube_delete_params(params);
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        match scope {
+            Scope::Full | Scope::Subresource(_) => {
+                let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                let res = kube_api.delete(&name, &dp).await.map_err(to_wit_error)?;
+                let val = match res {
+                    either::Either::Left(obj) => {
+                        serde_json::to_value(&obj).map_err(to_serde_error)?
+                    }
+                    either::Either::Right(status) => {
+                        serde_json::to_value(&status).map_err(to_serde_error)?
+                    }
+                };
+                serde_json::to_string(&val).map_err(to_serde_error)
+            }
+            Scope::MetadataOnly => {
+                let kube_api = get_meta_api(k8s_client, &api, &api_res);
+                let res = kube_api.delete(&name, &dp).await.map_err(to_wit_error)?;
+                let val = match res {
+                    either::Either::Left(meta) => {
+                        serde_json::to_value(&meta).map_err(to_serde_error)?
+                    }
+                    either::Either::Right(status) => {
+                        serde_json::to_value(&status).map_err(to_serde_error)?
+                    }
+                };
+                serde_json::to_string(&val).map_err(to_serde_error)
+            }
+        }
+    }
+
+    async fn delete_collection(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
+        delete_params: DeleteParams,
+        list_params: ListParams,
+        scope: Scope,
+    ) -> std::prelude::v1::Result<JsonValue, Error> {
+        let api_res = to_kube_api_resource(&api);
+        let dp = to_kube_delete_params(delete_params);
+        let lp = to_kube_list_params(list_params);
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        match scope {
+            Scope::Full | Scope::Subresource(_) => {
+                let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                let res = kube_api
+                    .delete_collection(&dp, &lp)
+                    .await
+                    .map_err(to_wit_error)?;
+                let val = match res {
+                    either::Either::Left(list) => {
+                        serde_json::to_value(&list).map_err(to_serde_error)?
+                    }
+                    either::Either::Right(status) => {
+                        serde_json::to_value(&status).map_err(to_serde_error)?
+                    }
+                };
+                serde_json::to_string(&val).map_err(to_serde_error)
+            }
+            Scope::MetadataOnly => {
+                let kube_api = get_meta_api(k8s_client, &api, &api_res);
+                let res = kube_api
+                    .delete_collection(&dp, &lp)
+                    .await
+                    .map_err(to_wit_error)?;
+                let val = match res {
+                    either::Either::Left(list) => {
+                        serde_json::to_value(&list).map_err(to_serde_error)?
+                    }
+                    either::Either::Right(status) => {
+                        serde_json::to_value(&status).map_err(to_serde_error)?
+                    }
+                };
+                serde_json::to_string(&val).map_err(to_serde_error)
+            }
+        }
+    }
+
+    async fn patch_resource(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
+        name: wasmtime::component::__internal::String,
+        patch_type: PatchType,
+        body: JsonValue,
+        params: PatchParams,
+        scope: Scope,
+    ) -> std::prelude::v1::Result<JsonValue, Error> {
+        let api_res = to_kube_api_resource(&api);
+        let pp = to_kube_patch_params(params);
+        let kube_patch = to_kube_patch(patch_type, body)?;
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        match scope {
+            Scope::Full => {
+                let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                let obj = kube_api
+                    .patch(&name, &pp, &kube_patch)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&obj).map_err(to_serde_error)
+            }
+            Scope::MetadataOnly => {
+                let kube_api = get_meta_api(k8s_client, &api, &api_res);
+                let obj = kube_api
+                    .patch_metadata(&name, &pp, &kube_patch)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&obj).map_err(to_serde_error)
+            }
+            Scope::Subresource(sub) => {
+                let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                let obj = kube_api
+                    .patch_subresource(&sub, &name, &pp, &kube_patch)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&obj).map_err(to_serde_error)
+            }
+        }
+    }
+
+    async fn replace_resource(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
+        name: wasmtime::component::__internal::String,
+        body: JsonValue,
+        params: CreateParams,
+        scope: Scope,
+    ) -> std::prelude::v1::Result<JsonValue, Error> {
+        let api_res = to_kube_api_resource(&api);
+        let pp = to_kube_post_params(params);
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        match scope {
+            Scope::Full => {
+                let data: DynamicObject = serde_json::from_str(&body).map_err(to_serde_error)?;
+                let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                let obj = kube_api
+                    .replace(&name, &pp, &data)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&obj).map_err(to_serde_error)
+            }
+            Scope::MetadataOnly => {
+                let data: PartialObjectMeta<DynamicObject> =
+                    serde_json::from_str(&body).map_err(to_serde_error)?;
+                let kube_api = get_meta_api(k8s_client, &api, &api_res);
+                let obj = kube_api
+                    .replace(&name, &pp, &data)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&obj).map_err(to_serde_error)
+            }
+            Scope::Subresource(sub) => {
+                let data: serde_json::Value =
+                    serde_json::from_str(&body).map_err(to_serde_error)?;
+                let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                let obj = kube_api
+                    .replace_subresource(&sub, &name, &pp, &data)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&obj).map_err(to_serde_error)
+            }
+        }
+    }
+
+    async fn watch_resource(
+        accessor: &Accessor<State, Self>,
+        api: ApiResource,
+        version: String,
+        params: WatchParams,
+        scope: Scope,
+    ) -> Result<StreamReader<Result<WatchEvent, Error>>, Error> {
+        let api_res = to_kube_api_resource(&api);
+        let wp = to_kube_watch_params(params);
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        let kube_stream: std::pin::Pin<Box<dyn Stream<Item = Result<WatchEvent, Error>> + Send>> =
+            match scope {
+                Scope::Full => {
+                    let kube_api = get_dynamic_api(k8s_client.clone(), &api, &api_res);
+                    let stream = kube_api.watch(&wp, &version).await.map_err(to_wit_error)?;
+                    transform_watch_stream(stream).boxed()
+                }
+                Scope::MetadataOnly => {
+                    let kube_api = get_meta_api(k8s_client.clone(), &api, &api_res);
+                    let stream = kube_api
+                        .watch_metadata(&wp, &version)
+                        .await
+                        .map_err(to_wit_error)?;
+                    transform_watch_stream(stream).boxed()
+                }
+                Scope::Subresource(_) => {
+                    return Err(Error::Other(
+                        "Watch operation is not supported on subresources".to_string(),
+                    ));
+                }
+            };
+
+        let (tx, rx) = mpsc::channel::<Result<WatchEvent, Error>>(32);
+        let stream_reader = accessor
+            .with(|mut access| StreamReader::new(&mut access, HostWatchStreamProducer::new(rx)))
+            .map_err(|e| Error::Other(e.to_string()))?;
+
+        accessor.spawn(WatchTask { kube_stream, tx });
+
+        Ok(stream_reader)
+    }
+
+    async fn get_logs_string(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
         name: String,
-        namespace: String,
-    ) -> impl Future<Output = Result<String, String>> + Send {
-        async move {
-            self.kubernetes_service
-                .get_resource(&kind, &name, &namespace)
-                .await
-                .map_err(|e| e.to_string())
-        }
+        params: LogParams,
+    ) -> Result<String, Error> {
+        let namespace = api.namespace.as_deref();
+        let lp = to_kube_log_params(params);
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        let kube_api = if let Some(ns) = namespace {
+            Api::<Pod>::namespaced(k8s_client.clone(), ns)
+        } else {
+            Api::<Pod>::all(k8s_client.clone())
+        };
+
+        kube_api.logs(&name, &lp).await.map_err(to_wit_error)
     }
 
-    fn list_resources(
-        &mut self,
-        kind: String,
-        namespace: String,
-    ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
-        async move {
-            self.kubernetes_service
-                .list_resources(&kind, &namespace)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    }
-
-    fn create_resource(
-        &mut self,
-        kind: String,
-        namespace: String,
-        resource_json: String,
-    ) -> impl Future<Output = Result<(), String>> + Send {
-        async move {
-            self.kubernetes_service
-                .create_resource(&kind, &namespace, &resource_json)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    }
-
-    fn update_resource(
-        &mut self,
-        kind: String,
+    async fn evict_subresource(
+        _accessor: &Accessor<State, Self>,
+        api: ApiResource,
         name: String,
-        namespace: String,
-        resource_json: String,
-        sanitize: bool,
-    ) -> impl Future<Output = Result<(), String>> + Send {
-        async move {
-            self.kubernetes_service
-                .update_resource(&kind, &name, &namespace, &resource_json, sanitize)
-                .await
-                .map_err(|e| format!("{:#}", e))
+        params: EvictParams,
+    ) -> Result<JsonValue, Error> {
+        let namespace = api.namespace.as_deref();
+        let ep = to_kube_evict_params(params);
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        let kube_api = if let Some(ns) = namespace {
+            Api::<Pod>::namespaced(k8s_client.clone(), ns)
+        } else {
+            Api::<Pod>::all(k8s_client.clone())
+        };
+
+        let status = kube_api.evict(&name, &ep).await.map_err(to_wit_error)?;
+        serde_json::to_string(&status).map_err(to_serde_error)
+    }
+
+    async fn get_api_server_version(_accessor: &Accessor<State, Self>) -> Result<String, Error> {
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        let info = k8s_client.apiserver_version().await.map_err(to_wit_error)?;
+        serde_json::to_string(&info).map_err(to_serde_error)
+    }
+
+    async fn list_api_version(
+        _accessor: &Accessor<State, Self>,
+        category: ApiCategory,
+        aggregated: bool,
+    ) -> Result<String, Error> {
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        match (category, aggregated) {
+            (ApiCategory::Core, false) => {
+                let res = k8s_client
+                    .list_core_api_versions()
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&res).map_err(to_serde_error)
+            }
+            (ApiCategory::Core, true) => {
+                let res = k8s_client
+                    .list_core_api_versions_aggregated()
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&res).map_err(to_serde_error)
+            }
+            (ApiCategory::Named, false) => {
+                let res = k8s_client.list_api_groups().await.map_err(to_wit_error)?;
+                serde_json::to_string(&res).map_err(to_serde_error)
+            }
+            (ApiCategory::Named, true) => {
+                let res = k8s_client
+                    .list_api_groups_aggregated()
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&res).map_err(to_serde_error)
+            }
         }
     }
 
-    fn delete_resource(
-        &mut self,
-        kind: String,
-        name: String,
-        namespace: String,
-    ) -> impl Future<Output = Result<(), String>> + Send {
-        async move {
-            self.kubernetes_service
-                .delete_resource(&kind, &name, &namespace)
-                .await
-                .map_err(|e| e.to_string())
+    async fn list_api_resources(
+        _accessor: &Accessor<State, Self>,
+        category: ApiCategory,
+        version: String,
+    ) -> Result<String, Error> {
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        match category {
+            ApiCategory::Core => {
+                let res = k8s_client
+                    .list_core_api_resources(&version)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&res).map_err(to_serde_error)
+            }
+            ApiCategory::Named => {
+                let res = k8s_client
+                    .list_api_group_resources(&version)
+                    .await
+                    .map_err(to_wit_error)?;
+                serde_json::to_string(&res).map_err(to_serde_error)
+            }
         }
+    }
+
+    async fn get_default_namespace(_accessor: &Accessor<State, Self>) -> Result<String, Error> {
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+
+        let ns = k8s_client.default_namespace();
+        Ok(ns.to_string())
+    }
+}
+
+// // ==========================================
+// // Mappings & Helper Functions
+// // ==========================================
+
+fn to_kube_api_resource(api: &ApiResource) -> KubeApiResource {
+    let api_version = if api.group.is_empty() {
+        api.version.clone()
+    } else {
+        format!("{}/{}", api.group, api.version)
+    };
+    KubeApiResource {
+        group: api.group.clone(),
+        version: api.version.clone(),
+        api_version,
+        kind: api.kind.clone(),
+        plural: api.plural.clone(),
+    }
+}
+
+fn get_dynamic_api(
+    client: Client,
+    api: &ApiResource,
+    api_res: &KubeApiResource,
+) -> Api<DynamicObject> {
+    if let Some(ns) = &api.namespace {
+        Api::namespaced_with(client.clone(), ns, api_res)
+    } else {
+        Api::all_with(client.clone(), api_res)
+    }
+}
+
+fn get_meta_api(
+    client: Client,
+    api: &ApiResource,
+    api_res: &KubeApiResource,
+) -> Api<PartialObjectMeta<DynamicObject>> {
+    if let Some(ns) = &api.namespace {
+        Api::namespaced_with(client.clone(), ns, api_res)
+    } else {
+        Api::all_with(client.clone(), api_res)
+    }
+}
+
+fn to_kube_propagation_policy(policy: PropagationPolicy) -> KubePropagationPolicy {
+    match policy {
+        PropagationPolicy::Orphan => KubePropagationPolicy::Orphan,
+        PropagationPolicy::Background => KubePropagationPolicy::Background,
+        PropagationPolicy::Foreground => KubePropagationPolicy::Foreground,
+    }
+}
+
+fn to_kube_preconditions(p: Preconditions) -> KubePreconditions {
+    KubePreconditions {
+        uid: p.uid,
+        resource_version: p.resource_version,
+    }
+}
+
+fn to_kube_delete_params(dp: DeleteParams) -> KubeDeleteParams {
+    KubeDeleteParams {
+        dry_run: dp.dry_run,
+        grace_period_seconds: dp.grace_period_seconds,
+        propagation_policy: dp.propagation_policy.map(to_kube_propagation_policy),
+        preconditions: dp.preconditions.map(to_kube_preconditions),
+    }
+}
+
+fn to_kube_version_match(vm: VersionMatch) -> KubeVersionMatch {
+    match vm {
+        VersionMatch::Exact => KubeVersionMatch::Exact,
+        VersionMatch::NotLater => KubeVersionMatch::NotOlderThan,
+    }
+}
+
+fn to_kube_list_params(lp: ListParams) -> KubeListParams {
+    KubeListParams {
+        label_selector: lp.label_selector,
+        field_selector: lp.field_selector,
+        timeout: lp.timeout,
+        limit: lp.limit,
+        continue_token: lp.continue_token,
+        version_match: lp.version_match.map(to_kube_version_match),
+        resource_version: lp.resource_version,
+    }
+}
+
+fn to_kube_post_params(pp: CreateParams) -> KubePostParams {
+    KubePostParams {
+        dry_run: pp.dry_run,
+        field_manager: pp.field_manager,
+    }
+}
+
+fn to_kube_validation_directive(vd: ValidationDirective) -> KubeValidationDirective {
+    match vd {
+        ValidationDirective::Strict => KubeValidationDirective::Strict,
+        ValidationDirective::Warn => KubeValidationDirective::Warn,
+        ValidationDirective::Ignore => KubeValidationDirective::Ignore,
+    }
+}
+
+fn to_kube_patch_params(pp: PatchParams) -> KubePatchParams {
+    KubePatchParams {
+        dry_run: pp.dry_run,
+        force: pp.force,
+        field_manager: pp.field_manager,
+        field_validation: pp.field_validation.map(to_kube_validation_directive),
+    }
+}
+
+fn to_kube_patch(
+    patch_type: PatchType,
+    body: JsonValue,
+) -> Result<KubePatch<serde_json::Value>, Error> {
+    let parsed_value: serde_json::Value = serde_json::from_str(&body).map_err(to_serde_error)?;
+
+    let patch = match patch_type {
+        PatchType::Apply => KubePatch::Apply(parsed_value),
+        PatchType::Merge => KubePatch::Merge(parsed_value),
+        PatchType::Strategic => KubePatch::Strategic(parsed_value),
+        PatchType::Json => {
+            let patch_vec = serde_json::from_value(parsed_value).map_err(to_serde_error)?;
+            KubePatch::Json(patch_vec)
+        }
+    };
+
+    Ok(patch)
+}
+
+fn to_kube_watch_params(wp: WatchParams) -> KubeWatchParams {
+    KubeWatchParams {
+        label_selector: wp.label_selector,
+        field_selector: wp.field_selector,
+        timeout: wp.timeout,
+        bookmarks: wp.bookmark,
+        send_initial_events: wp.send_initial_events,
+    }
+}
+
+fn to_kube_log_params(lp: LogParams) -> KubeLogParams {
+    KubeLogParams {
+        container: lp.container,
+        follow: lp.follow,
+        limit_bytes: lp.limit_bytes.map(|x| x as i64),
+        pretty: lp.pretty,
+        previous: lp.previous,
+        since_seconds: lp.since_seconds.map(|x| x as i64),
+        since_time: lp.since_time.and_then(|t| t.parse().ok()),
+        tail_lines: lp.tail_lines.map(|x| x as i64),
+        timestamps: lp.timestamps,
+    }
+}
+
+fn to_kube_evict_params(ep: EvictParams) -> KubeEvictParams {
+    KubeEvictParams {
+        delete_options: ep.delete_options.map(to_kube_delete_params),
+        post_options: to_kube_post_params(ep.post_options),
+    }
+}
+
+fn to_wit_error<E>(err: E) -> Error
+where
+    E: Into<anyhow::Error>,
+{
+    let anyhow_err: anyhow::Error = err.into();
+
+    if let Some(kube_err) = anyhow_err.downcast_ref::<kube::Error>() {
+        match kube_err {
+            kube::Error::Api(status) if status.code == 404 => return Error::NotFound,
+            _ => {}
+        }
+    }
+
+    Error::Other(anyhow_err.to_string())
+}
+
+fn to_serde_error(err: serde_json::Error) -> Error {
+    Error::Other(err.to_string())
+}
+
+fn transform_watch_stream<T: Serialize>(
+    stream: impl Stream<Item = Result<KubeWatchEvent<T>, kube::Error>>,
+) -> impl Stream<Item = Result<WatchEvent, Error>> {
+    stream.map(|event| {
+        let watch_event = event.map_err(to_wit_error)?;
+
+        let stringify = |obj: &T| serde_json::to_string(obj).map_err(to_wit_error);
+
+        match watch_event {
+            KubeWatchEvent::Added(obj) => {
+                let s = stringify(&obj)?;
+                Ok(WatchEvent::Added(s))
+            }
+            KubeWatchEvent::Modified(obj) => {
+                let s = stringify(&obj)?;
+                Ok(WatchEvent::Modified(s))
+            }
+            KubeWatchEvent::Deleted(obj) => {
+                let s = stringify(&obj)?;
+                Ok(WatchEvent::Deleted(s))
+            }
+            KubeWatchEvent::Bookmark(bookmark) => {
+                let s = serde_json::to_string(&bookmark)
+                    .map_err(|e| todo!("Convert bookmark serialization error to Error: {:?}", e))?;
+                Ok(WatchEvent::Bookmark(s))
+            }
+            KubeWatchEvent::Error(status) => {
+                // The original function loses the original structure of `Error`
+                // by formatting it into a string inside the Status object.
+                // You will need to reconstruct a fallback `Error` here.
+                let wit_error = Error::Other(format!("Kubernetes API error: {}", status.message));
+                Ok(WatchEvent::Error(wit_error))
+            }
+        }
+    })
+}
+
+use std::task::{Context, Poll};
+use wasmtime::component::{Destination, StreamResult};
+use wasmtime::StoreContextMut;
+
+type WatchStreamItem = std::result::Result<WatchEvent, Error>;
+
+pub struct HostWatchStreamProducer {
+    pub rx: mpsc::Receiver<WatchStreamItem>,
+}
+
+impl HostWatchStreamProducer {
+    pub fn new(rx: mpsc::Receiver<WatchStreamItem>) -> Self {
+        Self { rx }
+    }
+}
+
+impl<State> StreamProducer<State> for HostWatchStreamProducer {
+    type Item = WatchStreamItem;
+    type Buffer = wasmtime::component::VecBuffer<Self::Item>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut store: StoreContextMut<'a, State>,
+        mut dst: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if finish {
+            return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+
+        let capacity = dst.remaining(&mut store).unwrap_or(16);
+        if capacity == 0 {
+            return Poll::Ready(Ok(StreamResult::Completed));
+        }
+        let this = self.get_mut();
+
+        let mut buffer = Vec::new();
+        let mut produced = 0;
+
+        while produced < capacity {
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(item)) => {
+                    buffer.push(item);
+                    produced += 1;
+                }
+                Poll::Ready(None) => {
+                    if produced > 0 {
+                        dst.set_buffer(buffer.into());
+                    }
+                    return Poll::Ready(Ok(StreamResult::Dropped));
+                }
+                Poll::Pending => {
+                    break;
+                }
+            }
+        }
+
+        if produced > 0 {
+            // We successfully pulled items; hand the populated buffer back to the guest
+            dst.set_buffer(buffer.into());
+            Poll::Ready(Ok(StreamResult::Completed))
+        } else {
+            // No items available right now, channel is pending
+            Poll::Pending
+        }
+    }
+}
+
+use wasmtime::component::AccessorTask;
+
+struct WatchTask {
+    kube_stream: std::pin::Pin<Box<dyn Stream<Item = Result<WatchEvent, Error>> + Send>>,
+    tx: mpsc::Sender<Result<WatchEvent, Error>>,
+}
+
+impl<D> AccessorTask<State, D> for WatchTask
+where
+    D: wasmtime::component::HasData + ?Sized,
+{
+    async fn run(mut self, _accessor: &Accessor<State, D>) -> wasmtime::Result<()> {
+        while let Some(event) = self.kube_stream.next().await {
+            if self.tx.send(event).await.is_err() {
+                break;
+            }
+        }
+        Ok(())
     }
 }

@@ -29,7 +29,7 @@ pub mod wasmengine;
 mod wasmoperator;
 
 // TODO: change back to 5 minutes in production, set to 5 seconds for testing purposes
-const IDLE_THRESHOLD: Duration = Duration::from_secs(5); // 5 minutes
+const IDLE_THRESHOLD: Duration = Duration::from_hours(5); // 5 minutes
 
 pub const WASMOP_CACHE_DIR: &str = match option_env!("WASMOP_CACHE_DIR") {
     Some(path) => path,

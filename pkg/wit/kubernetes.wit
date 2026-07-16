@@ -1,0 +1,227 @@
+package local:kube@0.3.0;
+
+interface api {
+
+    // General types and variants
+    type json-value = string;
+
+    record api-resource {
+        group: string,
+        version: string,
+        kind: string,
+        plural: string,
+        namespace: option<string>,
+    }
+
+    variant error {
+        not-found,
+        other(string),
+    }
+
+    variant scope {
+        full,
+        metadata-only,
+        subresource(string),
+    }
+
+    // Get k8s resource functions
+    get-resource: async func(
+        api: api-resource,
+        name: string,
+        resource-version: option<string>,
+        scope: scope,
+    ) -> result<json-value, error>;
+
+    // List k8s resource functions
+    enum version-match {
+        exact,
+        not-later,
+    }
+
+    record list-params {
+        label-selector: option<string>,
+        field-selector: option<string>,
+        timeout: option<u32>,
+        limit: option<u32>,
+        continue-token: option<string>,
+        version-match: option<version-match>,
+        resource-version: option<string>,
+    }
+
+    list-resources: async func(
+        api: api-resource,
+        params: list-params,
+        scope: scope,
+    ) -> result<json-value, error>;
+
+    // Create k8s resource functions
+    record create-params {
+        dry-run: bool,
+        field-manager: option<string>,
+    }
+
+    create-resource: async func(
+        api: api-resource,
+        body: json-value,
+        params: create-params,
+    ) -> result<json-value, error>;
+
+    create-subresource: async func(
+        api: api-resource,
+        main-resource: string,
+        subresource: string,
+        body: json-value,
+        params: create-params,
+    ) -> result<json-value, error>;
+
+    // Delete k8s resource
+    enum propagation-policy {
+        orphan,
+        background,
+        foreground,
+    }
+
+    record preconditions {
+        uid: option<string>,
+        resource-version: option<string>,
+    }
+
+    record delete-params {
+        dry-run: bool,
+        grace-period-seconds: option<u32>,
+        propagation-policy: option<propagation-policy>,
+        preconditions: option<preconditions>,
+    }
+
+    delete-resource: async func(
+        api: api-resource,
+        name: string,
+        params: delete-params,
+        scope: scope,
+    ) -> result<json-value, error>;
+
+    delete-collection: async func(
+        api: api-resource,
+        delete-params: delete-params,
+        list-params: list-params,
+        scope: scope,
+    ) -> result<json-value, error>;
+
+    // Patch k8s resource
+    enum patch-type {
+        apply,
+        json,
+        merge,
+        strategic,
+    }
+
+    enum validation-directive {
+        strict,
+        warn,
+        ignore,
+    }
+
+    record patch-params {
+        dry-run: bool,
+        force: bool,
+        field-manager: option<string>,
+        field-validation: option<validation-directive>,
+    }
+
+    patch-resource: async func(
+        api: api-resource,
+        name: string,
+        patch-type: patch-type,
+        body: json-value,
+        params: patch-params,
+        scope: scope,
+    ) -> result<json-value, error>;
+
+    // Replace k8s resource
+    replace-resource: async func(
+        api: api-resource,
+        name: string,
+        body: json-value,
+        params: create-params,
+        scope: scope,
+    ) -> result<json-value, error>;
+
+    // Watch k8s resource
+    record watch-params {
+        label-selector: option<string>,
+        field-selector: option<string>,
+        timeout: option<u32>,
+        bookmark: bool,
+        send-initial-events: bool,
+    }
+
+    variant watch-event {
+        added(json-value),
+        modified(json-value),
+        deleted(json-value),
+        bookmark(json-value),
+        error(error),
+    }
+
+    watch-resource: async func(
+        api: api-resource,
+        version: string,
+        params: watch-params,
+        scope: scope,
+    ) -> result<stream<result<watch-event, error>>, error>;
+
+    // Get logs of k8s subresource
+    record log-params {
+        container: option<string>,
+        follow: bool,
+        limit-bytes: option<u64>,
+        pretty: bool,
+        previous: bool,
+        since-seconds: option<u64>,
+        since-time: option<string>,
+        tail-lines: option<u64>,
+        timestamps: bool,
+    }
+
+    get-logs-string: async func(
+        api: api-resource,
+        name: string,
+        params: log-params,
+    ) -> result<string, error>;
+
+    // Evict k8s subresource
+    record evict-params {
+        delete-options: option<delete-params>,
+        post-options: create-params,
+    }
+
+    evict-subresource: async func(
+        api: api-resource,
+        name: string,
+        params: evict-params,
+    ) -> result<json-value, error>;
+
+    // Discovery of k8s API resources
+    enum api-category {
+        core,
+        named,
+    }
+
+    get-api-server-version: async func() -> result<json-value, error>;
+
+    list-api-version: async func(
+        category: api-category,
+        aggregated: bool,
+    ) -> result<json-value, error>;
+
+    list-api-resources: async func(
+        category: api-category,
+        version: string,
+    ) -> result<json-value, error>;
+
+    get-default-namespace: async func() -> result<string, error>;
+}
+
+world kubernetes {
+    import api;
+}

@@ -17,8 +17,8 @@ use runtime::MainController;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
-use tracing_subscriber::FmtSubscriber;
+use tracing::info;
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use crate::runtime::wasmengine::WasmEngineSingleton;
 
@@ -26,7 +26,6 @@ fn main() -> anyhow::Result<()> {
     let (config_path, debug) = parse_args()?;
 
     setup_logging(debug);
-    debug!("Config path: {}", config_path.display());
 
     // TODO: maybe go to a non local runtime
     // Create a tokio runtime to run the async code
@@ -74,33 +73,65 @@ async fn wait_for_shutdown(shutdown_token: CancellationToken) {
     shutdown_token.cancel();
 }
 
-fn setup_logging(debug: bool) {
-    let level = if debug {
-        tracing::Level::DEBUG
-    } else {
-        tracing::Level::INFO
-    };
+struct LoggingParams {
+    base_level: String,
+    http_level: Option<String>,
+    kube_level: Option<String>,
+}
+
+fn setup_logging(params: LoggingParams) {
+    let mut filter = EnvFilter::new(&params.base_level);
+
+    if let Some(http_level) = &params.http_level {
+        filter = filter
+            .add_directive(format!("hyper={}", http_level).parse().unwrap())
+            .add_directive(format!("hyper_util={}", http_level).parse().unwrap())
+            .add_directive(format!("tower={}", http_level).parse().unwrap());
+    }
+
+    if let Some(kube_level) = &params.kube_level {
+        filter = filter.add_directive(format!("kube={}", kube_level).parse().unwrap());
+    }
+
+    if let Ok(env_val) = std::env::var("RUST_LOG") {
+        if let Ok(env_filter) = EnvFilter::try_new(env_val) {
+            filter = env_filter;
+        }
+    }
 
     tracing::subscriber::set_global_default(
-        FmtSubscriber::builder().with_max_level(level).finish(),
+        FmtSubscriber::builder().with_env_filter(filter).finish(),
     )
     .expect("setting default subscriber failed");
 
-    if debug {
-        debug!("Debug logging enabled.");
-    } else {
-        info!("Running in normal mode, debug logging is disabled.");
+    info!(
+        "Logging initialized with base level: {}",
+        &params.base_level
+    );
+    if let Some(http_level) = &params.http_level {
+        info!("HTTP logging level set to: {}", http_level);
+    }
+    if let Some(kube_level) = &params.kube_level {
+        info!("Kubernetes logging level set to: {}", kube_level);
     }
 }
 
-fn parse_args() -> anyhow::Result<(PathBuf, bool)> {
+fn parse_args() -> anyhow::Result<(PathBuf, LoggingParams)> {
     let args: Vec<String> = env::args().collect();
-    let mut debug = false;
     let mut config_path: Option<PathBuf> = None;
+    let mut logging_params = LoggingParams {
+        base_level: "info".to_string(),
+        http_level: None,
+        kube_level: None,
+    };
 
     for arg in &args[1..] {
         if arg == "--debug" {
-            debug = true;
+            logging_params.base_level = "debug".to_string();
+        } else if let Some(val) = arg.strip_prefix("--http_log=") {
+            logging_params.http_level = Some(val.to_string());
+        } else if let Some(val) = arg.strip_prefix("--kube_log=") {
+            logging_params.kube_level = Some(val.to_string());
         } else if config_path.is_none() {
             config_path = Some(PathBuf::from(arg));
         } else {
@@ -112,5 +143,5 @@ fn parse_args() -> anyhow::Result<(PathBuf, bool)> {
         anyhow::anyhow!("Usage: {} [--debug] <path_to_wasm_config.yaml>", args[0])
     })?;
 
-    Ok((config_path, debug))
+    Ok((config_path, logging_params))
 }
