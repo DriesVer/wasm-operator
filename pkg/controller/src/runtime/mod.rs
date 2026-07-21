@@ -26,7 +26,7 @@ use crate::runtime::wasmoperator::{OperatorUid, WORCommand, WasmOperatorReduced,
 
 mod stats;
 pub mod wasmengine;
-mod wasmoperator;
+pub mod wasmoperator;
 
 // TODO: change back to 5 minutes in production, set to 5 seconds for testing purposes
 const IDLE_THRESHOLD: Duration = Duration::from_hours(5); // 5 minutes
@@ -108,7 +108,7 @@ impl MainController {
         let red_cr = WasmOperatorReduced::from(wasmop_cr);
         let op = WasmOperatorRuntime::new(red_cr, op_shutdown_tx.clone());
 
-        if let Err(e) = op.cmd_tx.send(WORCommand::StartWatching).await {
+        if let Err(e) = op.cmd_tx.send(WORCommand::StartOperator).await {
             self.crashed_operators
                 .insert(op_uid.clone(), op.cr.generation);
             error!(

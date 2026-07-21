@@ -1,0 +1,17 @@
+package local:kube@0.2.0;
+
+world kubernetes {
+    import api;
+
+    use api.{watch-id, watch-event};
+
+    export receive-watch-event: func(
+        watch-id: watch-id,
+        event: watch-event,
+    ) -> result;
+}
+
+world wasmoperator {
+    include kubernetes;
+    include wasi:cli/command@0.2.8;
+}

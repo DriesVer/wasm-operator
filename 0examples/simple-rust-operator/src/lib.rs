@@ -2,9 +2,8 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::ffi::c_void;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use thiserror::Error;
 use tracing::{error, info};
 
@@ -14,69 +13,17 @@ use kube::runtime::controller::Action;
 use kube::runtime::watcher::Config;
 use kube::{Client, CustomResource, Resource};
 
-use futures::executor::{LocalPool, LocalSpawner};
-use futures::task::SpawnExt;
-use send_wrapper::SendWrapper;
-use std::cell::RefCell;
-use std::mem;
-use std::ops::Deref;
-use std::rc::Rc;
-
 struct Component;
-
-static mut SPAWNER: Option<LocalSpawner> = None;
-
-pub fn get_mut_executor() -> Rc<RefCell<LocalPool>> {
-    // Initialize it to a null value
-    static mut SINGLETON: *const Rc<RefCell<LocalPool>> = 0 as *const Rc<RefCell<LocalPool>>;
-    static ONCE: Once = Once::new();
-
-    unsafe {
-        ONCE.call_once(|| {
-            // Make it
-            let singleton = Rc::new(RefCell::new(LocalPool::new()));
-
-            // Put it in the heap so it can outlive this call
-            SINGLETON = mem::transmute::<
-                Box<Rc<RefCell<LocalPool>>>,
-                *const Rc<RefCell<LocalPool>>,
-            >(Box::new(singleton));
-        });
-
-        let pool = (*SINGLETON).clone();
-        SPAWNER = Some(pool.borrow_mut().spawner());
-
-        pool
-    }
-}
 
 impl wasip2::exports::cli::run::Guest for Component {
     fn run() -> Result<(), ()> {
-        // WASI p3 try
-        // main_async().await.map_err(|_| ())?;
-
-        // WASI p2 try
-        // let rt = tokio::runtime::Builder::new_current_thread()
-        //     .enable_all()
-        //     .build()
-        //     .unwrap();
-
-        // //let local = tokio::task::LocalSet::new();
-        // rt.block_on(main_async()).map_err(|_| ())?;
-
-        let exec = get_mut_executor();
-
-        let local_future = main_async();
-        let send_safe_future = SendWrapper::new(local_future);
-
-        // Start the main
-        exec.deref()
-            .borrow_mut()
-            .spawner()
-            .spawn(send_safe_future)
+        info!("Starting the WASI operator runtime...");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap();
-        // Give a little push to the executor
-        exec.deref().borrow_mut().run_until_stalled();
+
+        rt.block_on(main_async());
         Ok(())
     }
 }
@@ -272,6 +219,9 @@ fn main() {
 
 async fn main_async() {
     tracing_subscriber::fmt::init();
+    info!("Testing tokio sleep...");
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    info!("Tokio sleep test passed!");
 
     // // Spawn the background poll loop
     // tokio::task::spawn_local(async {

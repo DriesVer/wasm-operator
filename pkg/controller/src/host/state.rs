@@ -8,13 +8,15 @@
 
 use std::sync::Arc;
 
-use crate::kubernetes::KubernetesService;
+use crate::runtime::wasmoperator::OperatorUid;
+use crate::{kubernetes::KubernetesService, runtime::wasmoperator::WasmOperatorRuntime};
+use anyhow::Result;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 pub struct State {
+    pub operator: Arc<WasmOperatorRuntime>,
     pub wasi_ctx: WasiCtx,
-    pub kubernetes_service: Arc<KubernetesService>,
     pub resources: ResourceTable,
 }
 

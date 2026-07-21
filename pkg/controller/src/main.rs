@@ -27,13 +27,11 @@ fn main() -> anyhow::Result<()> {
 
     setup_logging(debug);
 
-    // TODO: maybe go to a non local runtime
     // Create a tokio runtime to run the async code
     let global_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(3) // 3 threads: 2 global, one local
+        .worker_threads(3) // 3 threads
         .enable_all()
         .build()?;
-    let local = tokio::task::LocalSet::new();
 
     // Initialize global singletons before starting the main async block
     global_rt.block_on(async {
@@ -48,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         wait_for_shutdown(shutdown_token_clone).await;
     });
 
-    local.block_on(&global_rt, async {
+    global_rt.block_on(async {
         let main_controller = MainController::new(shutdown_token);
         main_controller.start().await?;
         Ok::<(), anyhow::Error>(())

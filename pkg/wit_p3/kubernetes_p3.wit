@@ -1,4 +1,4 @@
-package local:kube@0.2.0;
+package local:kube@0.3.0;
 
 interface api {
 
@@ -25,7 +25,7 @@ interface api {
     }
 
     // Get k8s resource functions
-    get-resource: func(
+    get-resource: async func(
         api: api-resource,
         name: string,
         resource-version: option<string>,
@@ -48,7 +48,7 @@ interface api {
         resource-version: option<string>,
     }
 
-    list-resources: func(
+    list-resources: async func(
         api: api-resource,
         params: list-params,
         scope: scope,
@@ -60,13 +60,13 @@ interface api {
         field-manager: option<string>,
     }
 
-    create-resource: func(
+    create-resource: async func(
         api: api-resource,
         body: json-value,
         params: create-params,
     ) -> result<json-value, error>;
 
-    create-subresource: func(
+    create-subresource: async func(
         api: api-resource,
         main-resource: string,
         subresource: string,
@@ -93,14 +93,14 @@ interface api {
         preconditions: option<preconditions>,
     }
 
-    delete-resource: func(
+    delete-resource: async func(
         api: api-resource,
         name: string,
         params: delete-params,
         scope: scope,
     ) -> result<json-value, error>;
 
-    delete-collection: func(
+    delete-collection: async func(
         api: api-resource,
         delete-params: delete-params,
         list-params: list-params,
@@ -128,7 +128,7 @@ interface api {
         field-validation: option<validation-directive>,
     }
 
-    patch-resource: func(
+    patch-resource: async func(
         api: api-resource,
         name: string,
         patch-type: patch-type,
@@ -138,7 +138,7 @@ interface api {
     ) -> result<json-value, error>;
 
     // Replace k8s resource
-    replace-resource: func(
+    replace-resource: async func(
         api: api-resource,
         name: string,
         body: json-value,
@@ -163,14 +163,12 @@ interface api {
         error(error),
     }
 
-    type watch-id = u32;
-
-    subscribe-watch-stream: func(
+    watch-resource: async func(
         api: api-resource,
         version: string,
         params: watch-params,
         scope: scope,
-    ) -> result<watch-id, error>;
+    ) -> result<stream<result<watch-event, error>>, error>;
 
     // Get logs of k8s subresource
     record log-params {
@@ -185,7 +183,7 @@ interface api {
         timestamps: bool,
     }
 
-    get-logs-string: func(
+    get-logs-string: async func(
         api: api-resource,
         name: string,
         params: log-params,
@@ -197,7 +195,7 @@ interface api {
         post-options: create-params,
     }
 
-    evict-subresource: func(
+    evict-subresource: async func(
         api: api-resource,
         name: string,
         params: evict-params,
@@ -209,17 +207,21 @@ interface api {
         named,
     }
 
-    get-api-server-version: func() -> result<json-value, error>;
+    get-api-server-version: async func() -> result<json-value, error>;
 
-    list-api-version: func(
+    list-api-version: async func(
         category: api-category,
         aggregated: bool,
     ) -> result<json-value, error>;
 
-    list-api-resources: func(
+    list-api-resources: async func(
         category: api-category,
         version: string,
     ) -> result<json-value, error>;
 
-    get-default-namespace: func() -> result<string, error>;
+    get-default-namespace: async func() -> result<string, error>;
+}
+
+world kubernetes {
+    import api;
 }
