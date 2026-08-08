@@ -170,7 +170,7 @@ interface api {
         error(error),
     }
 
-    type watch-id = u32;
+    type watch-id = u64;
 
     subscribe-watch-stream: func(
         api: api-resource,

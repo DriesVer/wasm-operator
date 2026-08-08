@@ -11,7 +11,8 @@ use std::{
 };
 
 use dashmap::DashMap;
-use futures::{Stream, StreamExt};
+use futures::{stream, Stream, StreamExt};
+use http::version;
 use kube::{
     api::{
         ApiResource as KubeApiResource, DeleteParams as KubeDeleteParams,
@@ -22,8 +23,11 @@ use kube::{
         VersionMatch as KubeVersionMatch, WatchParams as KubeWatchParams,
     },
     core::{dynamic::DynamicObject, metadata::PartialObjectMeta, WatchEvent as KubeWatchEvent},
-    Api, Client,
+    Api, Client, ResourceExt,
 };
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use k8s_openapi::api::core::v1::Pod;
 
@@ -75,7 +79,8 @@ impl Host for State {
 
                 let obj_str = match scope {
                     Scope::Full => {
-                        let kube_api = get_dynamic_api(k8s_client.clone(), &api, &api_res);
+                        let kube_api =
+                            get_dynamic_api(k8s_client.clone(), api.namespace.clone(), &api_res);
                         let obj = kube_api.get_with(&name, &gp).await.map_err(to_wit_error)?;
                         serde_json::to_string(&obj).map_err(to_serde_error)?
                     }
@@ -88,7 +93,8 @@ impl Host for State {
                         serde_json::to_string(&obj).map_err(to_serde_error)?
                     }
                     Scope::Subresource(sub) => {
-                        let kube_api = get_dynamic_api(k8s_client.clone(), &api, &api_res);
+                        let kube_api =
+                            get_dynamic_api(k8s_client.clone(), api.namespace.clone(), &api_res);
                         let obj = kube_api
                             .get_subresource(&sub, &name)
                             .await
@@ -129,7 +135,7 @@ impl Host for State {
                 );
                 match scope {
                     Scope::Full => {
-                        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                        let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                         tracing::info!("[HOST] executing list on Kubernetes API server...");
                         let list = kube_api.list(&lp).await.map_err(to_wit_error)?;
                         tracing::info!("[HOST] list returned {} items", list.items.len());
@@ -164,7 +170,7 @@ impl Host for State {
                     .await
                     .map_err(to_wit_error)?;
 
-                let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                 let obj = kube_api.create(&pp, &data).await.map_err(to_wit_error)?;
                 serde_json::to_string(&obj).map_err(to_serde_error)
             })
@@ -189,7 +195,7 @@ impl Host for State {
                     .await
                     .map_err(to_wit_error)?;
 
-                let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                 let obj: serde_json::Value = kube_api
                     .create_subresource(&subresource, &main_resource, &pp, &data)
                     .await
@@ -217,7 +223,7 @@ impl Host for State {
 
                 match scope {
                     Scope::Full | Scope::Subresource(_) => {
-                        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                        let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                         let res = kube_api.delete(&name, &dp).await.map_err(to_wit_error)?;
                         let val = match res {
                             either::Either::Left(obj) => {
@@ -266,7 +272,7 @@ impl Host for State {
 
                 match scope {
                     Scope::Full | Scope::Subresource(_) => {
-                        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                        let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                         let res = kube_api
                             .delete_collection(&dp, &lp)
                             .await
@@ -323,7 +329,7 @@ impl Host for State {
 
                 match scope {
                     Scope::Full => {
-                        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                        let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                         let obj = kube_api
                             .patch(&name, &pp, &kube_patch)
                             .await
@@ -339,7 +345,7 @@ impl Host for State {
                         serde_json::to_string(&obj).map_err(to_serde_error)
                     }
                     Scope::Subresource(sub) => {
-                        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                        let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                         let obj = kube_api
                             .patch_subresource(&sub, &name, &pp, &kube_patch)
                             .await
@@ -372,7 +378,7 @@ impl Host for State {
                     Scope::Full => {
                         let data: DynamicObject =
                             serde_json::from_str(&body).map_err(to_serde_error)?;
-                        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                        let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                         let obj = kube_api
                             .replace(&name, &pp, &data)
                             .await
@@ -392,7 +398,7 @@ impl Host for State {
                     Scope::Subresource(sub) => {
                         let data: serde_json::Value =
                             serde_json::from_str(&body).map_err(to_serde_error)?;
-                        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
+                        let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                         let obj = kube_api
                             .replace_subresource(&sub, &name, &pp, &data)
                             .await
@@ -411,24 +417,14 @@ impl Host for State {
         params: WatchParams,
         scope: Scope,
     ) -> Result<WatchId, Error> {
-        let api_res = to_kube_api_resource(&api);
-        let wp = to_kube_watch_params(params);
-
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                let k8s_client = KubernetesService::global_client()
-                    .await
-                    .map_err(to_wit_error)?;
-
                 let watch_id = match scope {
                     Scope::Full => {
-                        warn!("Subscribing to watch stream for resource kind: {}, namespace: {:?}, for operator {}", api.kind, api.namespace, &self.operator.cr.name);
-                        let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
-                        let stream = kube_api.watch(&wp, &version).await.map_err(to_wit_error)?;
-                        let stream = Box::pin(stream);
+                        debug!("Subscribing to watch stream for resource kind: {}, namespace: {:?}, for operator {}", api.kind, api.namespace, &self.operator.cr.name);
+                        let ws = WatchStreamSignature::from((api, version, params));
                         let watch_id = WatchStreamHandler::get_instance()
-                            .register_watch_stream(self.operator.clone(), stream)
-                            .map_err(|e| Error::Other(e.to_string()))?;
+                            .register_watch_stream(self.operator.clone(), ws).await?;
                         watch_id
                     }
                     Scope::MetadataOnly => {
@@ -673,11 +669,11 @@ fn to_kube_api_resource(api: &ApiResource) -> KubeApiResource {
 
 fn get_dynamic_api(
     client: Client,
-    api: &ApiResource,
+    namespace: Option<String>,
     api_res: &KubeApiResource,
 ) -> Api<DynamicObject> {
-    if let Some(ns) = &api.namespace {
-        Api::namespaced_with(client.clone(), ns, api_res)
+    if let Some(ns) = namespace {
+        Api::namespaced_with(client.clone(), &ns, api_res)
     } else {
         Api::all_with(client.clone(), api_res)
     }
@@ -846,11 +842,11 @@ use std::sync::{Arc, LazyLock};
 use tokio_stream::StreamMap;
 
 type WatcherResult = Result<KubeWatchEvent<DynamicObject>, KubeError>;
-type BoxedWatchStream = Pin<Box<dyn Stream<Item = WatcherResult> + Send>>;
+type BoxedWatchStream = Pin<Box<dyn Stream<Item = Option<WatcherResult>> + Send>>;
 
 enum StreamManagerCmd {
     Register {
-        id: WatchId,
+        signature: WatchStreamSignature,
         operator: Arc<WasmOperatorRuntime>,
         stream: BoxedWatchStream,
     },
@@ -861,6 +857,135 @@ struct WatchStreamHandler {
     next_id: AtomicU32,
 }
 
+#[derive(Clone, Debug)]
+pub struct WatchStreamSignature {
+    group: String,
+    api_version: String,
+    kind: String,
+    plural: String,
+    namespace: Option<String>,
+    cluster_version: String,
+    label_selector: Option<String>,
+    field_selector: Option<String>,
+    send_initial_events: bool,
+    timeout: Option<u32>, // Remove as option
+    bookmark: bool,       // Filter internally
+    hash: u64,            // Precomputed internal hash
+}
+
+impl WatchStreamSignature {
+    /// Returns the precomputed hash in O(1) time.
+    #[inline]
+    pub fn get_hash(&self) -> u64 {
+        self.hash
+    }
+}
+
+impl Hash for WatchStreamSignature {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl PartialEq for WatchStreamSignature {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast-path comparison using precomputed hash before comparing full fields
+        self.hash == other.hash
+            && self.group == other.group
+            && self.api_version == other.api_version
+            && self.kind == other.kind
+            && self.plural == other.plural
+            && self.namespace == other.namespace
+            && self.cluster_version == other.cluster_version
+            && self.label_selector == other.label_selector
+            && self.field_selector == other.field_selector
+            && self.send_initial_events == other.send_initial_events
+            && self.timeout == other.timeout
+            && self.bookmark == other.bookmark
+    }
+}
+
+impl Eq for WatchStreamSignature {}
+
+impl From<(ApiResource, String, WatchParams)> for WatchStreamSignature {
+    fn from((api, cluster_version, params): (ApiResource, String, WatchParams)) -> Self {
+        let group = api.group;
+        let api_version = api.version;
+        let kind = api.kind;
+        let plural = api.plural;
+        let namespace = api.namespace;
+        let label_selector = params.label_selector;
+        let field_selector = params.field_selector;
+        let send_initial_events = params.send_initial_events;
+        let timeout = params.timeout;
+        let bookmark = params.bookmark;
+
+        // Calculate internal hash once during construction
+        // Note: `timeout` and `bookmark` are omitted from signature calculation
+        let mut hasher = DefaultHasher::new();
+        group.hash(&mut hasher);
+        api_version.hash(&mut hasher);
+        kind.hash(&mut hasher);
+        plural.hash(&mut hasher);
+        namespace.hash(&mut hasher);
+        cluster_version.hash(&mut hasher);
+        label_selector.hash(&mut hasher);
+        field_selector.hash(&mut hasher);
+        send_initial_events.hash(&mut hasher);
+        timeout.hash(&mut hasher);
+        bookmark.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        WatchStreamSignature {
+            group,
+            api_version,
+            kind,
+            plural,
+            namespace,
+            cluster_version,
+            label_selector,
+            field_selector,
+            send_initial_events,
+            timeout,
+            bookmark,
+            hash,
+        }
+    }
+}
+
+impl From<&WatchStreamSignature> for KubeApiResource {
+    fn from(sig: &WatchStreamSignature) -> Self {
+        let api_version = if sig.group.is_empty() {
+            sig.api_version.clone()
+        } else {
+            format!("{}/{}", sig.group, sig.api_version)
+        };
+        KubeApiResource {
+            group: sig.group.clone(),
+            version: sig.api_version.clone(),
+            api_version,
+            kind: sig.kind.clone(),
+            plural: sig.plural.clone(),
+        }
+    }
+}
+
+impl From<&WatchStreamSignature> for KubeWatchParams {
+    fn from(sig: &WatchStreamSignature) -> Self {
+        KubeWatchParams {
+            label_selector: sig.label_selector.clone(),
+            field_selector: sig.field_selector.clone(),
+            timeout: sig.timeout,
+            bookmarks: sig.bookmark,
+            send_initial_events: sig.send_initial_events,
+        }
+    }
+}
+
+// TODO: let this loop react to SIGINT and SIGTERM signals to gracefully shutdown the stream handler and all associated streams.
+
+// One global stream handler, this reduces overhead in comparrison to spawning a new task for each operator.
+// This also creates an artificial bottleneck which is not bad because not all operators will be trying at the same time if watch events arive at the same time.
 static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|| {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<StreamManagerCmd>();
 
@@ -868,75 +993,81 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
     tokio::spawn(async move {
         let mut streams = StreamMap::new();
         let operators = DashMap::<WatchId, Arc<WasmOperatorRuntime>>::new();
+        let cluster_resource_versions = DashMap::<WatchId, String>::new();
 
         loop {
             tokio::select! {
                 // Handle new registrations
-                Some(cmd) = cmd_rx.recv() => {
+                cmd = cmd_rx.recv() => {
                     match cmd {
-                        StreamManagerCmd::Register { id, operator, stream } => {
-                            streams.insert(id, stream);
-                            operators.insert(id, operator);
+                        Some(StreamManagerCmd::Register { signature, operator, stream }) => {
+                            operators.insert(signature.get_hash(), operator);
+                            streams.insert(signature, stream);
+                        }
+                        None => {
+                            // Command channel was closed (WatchStreamHandler was dropped)
+                            warn!("Command channel closed for watch stream handler. Shutting down worker.");
+                            break;
                         }
                     }
                 }
 
                 // Handle next event from any registered stream
-                Some((id, event)) = streams.next(), if !streams.is_empty() => {
-                    let operator = operators.get(&id).expect("Operator should exist for registered stream");
+                Some((id, stream_event)) = streams.next(), if !streams.is_empty() => {
+                    let operator = operators.get(&id.get_hash()).expect("Operator should exist for registered stream");
 
-                    let stringify = |obj: &DynamicObject| {
-                        serde_json::to_string(obj).map_err(|e| Error::Other(e.to_string()))
-                    };
+                    warn!("Received event from stream {}: {:?}", id.get_hash(), stream_event);
 
-                    let watch_event: WatchEvent = match event {
-                        Ok(kube_event) => match kube_event {
-                            KubeWatchEvent::Added(obj) => match stringify(&obj) {
-                                Ok(s) => WatchEvent::Added(s),
-                                Err(e) => WatchEvent::Error(e),
-                            },
-                            KubeWatchEvent::Modified(obj) => match stringify(&obj) {
-                                Ok(s) => WatchEvent::Modified(s),
-                                Err(e) => WatchEvent::Error(e),
-                            },
-                            KubeWatchEvent::Deleted(obj) => match stringify(&obj) {
-                                Ok(s) => WatchEvent::Deleted(s),
-                                Err(e) => WatchEvent::Error(e),
-                            },
-                            KubeWatchEvent::Bookmark(bookmark) => {
-                                match serde_json::to_string(&bookmark) {
-                                    Ok(s) => WatchEvent::Bookmark(s),
-                                    Err(e) => WatchEvent::Error(Error::Other(format!("Bookmark serialization error: {}", e))),
+                    match stream_event {
+                        Some(event) => {
+                            let process_obj = |obj: &DynamicObject, constructor: fn(String) -> WatchEvent| {
+                                cluster_resource_versions.insert(id.get_hash(), obj.resource_version().unwrap_or_default());
+                                match serde_json::to_string(obj) {
+                                    Ok(json) => constructor(json),
+                                    Err(e) => WatchEvent::Error(Error::Other(e.to_string())),
                                 }
-                            }
-                            KubeWatchEvent::Error(status) => {
-                                let wit_error = Error::Http(HttpError {
+                            };
+
+                            let watch_event: WatchEvent = match event {
+                                Ok(KubeWatchEvent::Added(obj)) => process_obj(&obj, WatchEvent::Added),
+                                Ok(KubeWatchEvent::Modified(obj)) => process_obj(&obj, WatchEvent::Modified),
+                                Ok(KubeWatchEvent::Deleted(obj)) => process_obj(&obj, WatchEvent::Deleted),
+
+                                Ok(KubeWatchEvent::Bookmark(bookmark)) => {
+                                    cluster_resource_versions.insert(id.get_hash(), bookmark.metadata.resource_version.clone());
+                                    serde_json::to_string(&bookmark)
+                                        .map(WatchEvent::Bookmark)
+                                        .unwrap_or_else(|e| WatchEvent::Error(Error::Other(format!("Bookmark serialization error: {e}"))))
+                                }
+
+                                Ok(KubeWatchEvent::Error(status)) => WatchEvent::Error(Error::Http(HttpError {
                                     code: status.code,
                                     reason: status.reason,
                                     message: status.message,
-                                });
-                                WatchEvent::Error(wit_error)
+                                })),
+
+                                // Handle a stream transport error
+                                Err(e) => WatchEvent::Error(Error::Other(format!("Kubernetes watch stream error: {e}"))),
+                            };
+
+                            warn!("Currently {} streams are being watched", streams.len());
+                            warn!("The current operator has {} registered streams", operators.len());
+                            if let Err(e) = operator.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(id.get_hash(), watch_event)) {
+                                tracing::warn!("Failed to queue watch event for stream {}: {:?}", id.get_hash(), e);
                             }
-                        },
-                        Err(e) => {
-                            // Handle the stream transport error
-                            WatchEvent::Error(Error::Other(format!("Kubernetes watch stream error: {}", e)))
                         }
-                    };
-
-                    warn!("Currently {} streams are being watched", streams.len());
-                    warn!("The current operator has {} registered streams", operators.len());
-                    if let Err(e) = operator.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(id, watch_event)) {
-                        tracing::warn!("Failed to queue watch event for stream {}: {:?}", id, e);
+                        None => {
+                            // Stream hit EOF (closed). Attempt to recreate the stream.
+                            warn!("Stream {} closed (EOF). Cleaning up.", id.get_hash());
+                            match WatchStreamHandler::get_watch_stream_from_signature(&id).await {
+                                Ok(stream) => {streams.insert(id.clone(), stream);},
+                                Err(e) => {
+                                    warn!("Failed to recreate watch stream for signature {:?}: {}", id.get_hash(), e);
+                                    operators.remove(&id.get_hash());
+                                }
+                            }
+                        }
                     }
-                }
-
-                // Prevent hot-looping if there are no commands and no streams
-                else => {
-                    if cmd_rx.is_closed() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
                 }
             }
         }
@@ -953,24 +1084,47 @@ impl WatchStreamHandler {
         WATCH_STREAM_HANDLER.clone()
     }
 
-    fn register_watch_stream(
+    async fn get_watch_stream_from_signature(
+        signature: &WatchStreamSignature,
+    ) -> Result<BoxedWatchStream, Error> {
+        let api_res = KubeApiResource::from(signature);
+        let wp = KubeWatchParams::from(signature);
+
+        let k8s_client = KubernetesService::global_client()
+            .await
+            .map_err(to_wit_error)?;
+        let kube_api = get_dynamic_api(k8s_client, signature.namespace.clone(), &api_res);
+        let stream = kube_api
+            .watch(&wp, &signature.cluster_version)
+            .await
+            .map_err(to_wit_error)?;
+
+        let stream_with_eof = stream
+            .map(Some) // Wrap each event in Some to indicate it's a valid event
+            .chain(futures::stream::once(async { None })); // Indicate the end of the stream with None
+
+        Ok(Box::pin(stream_with_eof))
+    }
+
+    async fn register_watch_stream(
         &self,
         operator: Arc<WasmOperatorRuntime>,
-        stream: impl Stream<Item = WatcherResult> + Send + 'static,
+        signature: WatchStreamSignature,
     ) -> Result<WatchId, Error> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let boxed_stream: BoxedWatchStream = Box::pin(stream);
+        let stream = WatchStreamHandler::get_watch_stream_from_signature(&signature).await?;
+
+        //let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = StreamManagerCmd::Register {
-            id,
+            signature: signature.clone(),
             operator,
-            stream: boxed_stream,
+            stream,
         };
         self.cmd_tx
             .send(cmd)
             .map_err(|e| Error::Other(format!("Failed to send register command: {}", e)))?;
 
-        Ok(id)
+        Ok(signature.get_hash())
     }
 }
 
