@@ -29,14 +29,14 @@ use k8s_openapi::api::core::v1::Pod;
 
 use serde::Serialize;
 use tokio::{runtime::Handle, sync::mpsc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use wasmtime::component::{Accessor, HasSelf};
 use wasmtime::component::{StreamProducer, StreamReader};
 
 use crate::{
     host::state::State,
     kubernetes::KubernetesService,
-    runtime::wasmoperator::{OperatorUid, WasmOperatorRuntime},
+    runtime::wasmoperator::{OperatorState, OperatorUid, WasmOperatorRuntime},
 };
 use anyhow::Result;
 
@@ -49,8 +49,8 @@ pub mod bindings {
 
 use bindings::local::kube::api::{
     ApiCategory, ApiResource, CreateParams, DeleteParams, Error, EvictParams, Host, HostWithStore,
-    JsonValue, ListParams, LogParams, PatchParams, PatchType, Preconditions, PropagationPolicy,
-    Scope, ValidationDirective, VersionMatch, WatchEvent, WatchId, WatchParams,
+    HttpError, JsonValue, ListParams, LogParams, PatchParams, PatchType, Preconditions,
+    PropagationPolicy, Scope, ValidationDirective, VersionMatch, WatchEvent, WatchId, WatchParams,
 };
 
 //impl Host for State {}
@@ -422,6 +422,7 @@ impl Host for State {
 
                 let watch_id = match scope {
                     Scope::Full => {
+                        warn!("Subscribing to watch stream for resource kind: {}, namespace: {:?}, for operator {}", api.kind, api.namespace, &self.operator.cr.name);
                         let kube_api = get_dynamic_api(k8s_client, &api, &api_res);
                         let stream = kube_api.watch(&wp, &version).await.map_err(to_wit_error)?;
                         let stream = Box::pin(stream);
@@ -819,7 +820,16 @@ where
 
     if let Some(kube_err) = anyhow_err.downcast_ref::<kube::Error>() {
         match kube_err {
-            kube::Error::Api(status) if status.code == 404 => return Error::NotFound,
+            kube::Error::Api(status) => {
+                if status.code == 404 {
+                    return Error::NotFound;
+                }
+                return Error::Http(HttpError {
+                    code: status.code,
+                    reason: status.reason.clone(),
+                    message: status.message.clone(),
+                });
+            }
             _ => {}
         }
     }
@@ -900,7 +910,11 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                 }
                             }
                             KubeWatchEvent::Error(status) => {
-                                let wit_error = Error::Other(format!("Kubernetes API error: {}", status.message));
+                                let wit_error = Error::Http(HttpError {
+                                    code: status.code,
+                                    reason: status.reason,
+                                    message: status.message,
+                                });
                                 WatchEvent::Error(wit_error)
                             }
                         },
@@ -910,14 +924,10 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                         }
                     };
 
-                    let result = operator.clone().execute_via_wit(
-                        |operator, store| {
-                            operator.call_receive_watch_event(store, id, &watch_event).map_err(anyhow::Error::from)
-                        }
-                    ).await.expect("Failed to execute receive_watch_event");
-
-                    if let Err(e) = result {
-                        tracing::error!("Error sending watch event to operator: {:?}", e);
+                    warn!("Currently {} streams are being watched", streams.len());
+                    warn!("The current operator has {} registered streams", operators.len());
+                    if let Err(e) = operator.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(id, watch_event)) {
+                        tracing::warn!("Failed to queue watch event for stream {}: {:?}", id, e);
                     }
                 }
 

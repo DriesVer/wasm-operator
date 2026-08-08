@@ -16,7 +16,7 @@ impl WasmEngineSingleton for wasmtime::Engine {
                 config.wasm_component_model_async(false);
                 config.wasm_component_model(true);
 
-                config.epoch_interruption(true);
+                //config.epoch_interruption(true);
 
                 config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
                 config.cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize);

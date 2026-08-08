@@ -13,9 +13,16 @@ interface api {
         namespace: option<string>,
     }
 
+    record http-error {
+        code: u16,
+        reason: string,
+        message: string,
+    }
+
     variant error {
         not-found,
         other(string),
+        http(http-error),
     }
 
     variant scope {

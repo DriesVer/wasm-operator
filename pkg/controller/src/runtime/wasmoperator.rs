@@ -71,30 +71,36 @@ pub enum WORCommand {
     Unload,
     Pause,
     Shutdown,
+    ProcessWatchEvent(
+        u32,
+        crate::runtime::wasmoperator::bindings::local::kube::api::WatchEvent,
+    ),
 }
 
-struct LoadedState {
+// TODO: remove pub from LoadedState, UnloadedState, and OperatorState, debugging only
+pub struct LoadedState {
     operator: bindings::Wasmoperator,
     store: Mutex<Store<State>>,
     last_active: Mutex<Instant>,
 }
 
-struct UnloadedState {
+pub struct UnloadedState {
     // Path to the serialized memory file.
     state_path: PathBuf,
 }
 
 // Use boxed variants to reduce enum size
-enum OperatorState {
+pub enum OperatorState {
     Loaded(Arc<LoadedState>),
     Unloaded(Arc<UnloadedState>),
 }
 
 pub struct WasmOperatorRuntime {
     pub cr: WasmOperatorReduced,
-    pub cmd_tx: mpsc::Sender<WORCommand>, // Channel for sending commands to the operator's command handler
+    pub cmd_tx: mpsc::UnboundedSender<WORCommand>, // Channel for sending commands to the operator's command handler
 
-    state: RwLock<OperatorState>,
+    // TODO: remove pub from state, debugging only
+    pub state: RwLock<OperatorState>,
     task_tracker: TaskTracker,
     shutdown_token: CancellationToken,
     shutdown_tx: mpsc::Sender<OperatorUid>, // Channel to signal the operator is shutting down
@@ -107,7 +113,7 @@ impl WasmOperatorRuntime {
         wasmop_cr: WasmOperatorReduced,
         shutdown_tx: mpsc::Sender<OperatorUid>,
     ) -> Arc<Self> {
-        let (wasm_op_tx, wasm_op_rx) = mpsc::channel(10);
+        let (wasm_op_tx, wasm_op_rx) = mpsc::unbounded_channel();
 
         let self_ = Arc::new(Self {
             cr: wasmop_cr,
@@ -130,7 +136,7 @@ impl WasmOperatorRuntime {
         self_
     }
 
-    async fn handle_commands_loop(self: Arc<Self>, mut rx: mpsc::Receiver<WORCommand>) {
+    async fn handle_commands_loop(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<WORCommand>) {
         loop {
             tokio::select! {
                 biased;
@@ -173,6 +179,19 @@ impl WasmOperatorRuntime {
                                 if let Err(e) = self.shutdown().await {
                                     error!("Operator '{}' failed to shutdown properly: {}", self.cr.name, e);
                                     return;
+                                }
+                            },
+                            WORCommand::ProcessWatchEvent(id, watch_event) => {
+                                let result = self.clone().execute_via_wit(
+                                    |operator, store| {
+                                        // Call the WIT function to process the watch event (wakes up the operator if it was waiting for events)
+                                        let res = operator.call_receive_watch_event(&mut *store, id, &watch_event).map_err(anyhow::Error::from);
+                                        res
+                                    }
+                                ).await;
+
+                                if let Err(e) = result {
+                                    warn!("Failed to send watch event for stream {}, removing stream: {:?}", id, e);
                                 }
                             },
                         }
@@ -317,6 +336,10 @@ impl WasmOperatorRuntime {
         self.patch_k8s_status_throttled(WasmOperatorState::Running, true)
             .await?;
 
+        // Starting the operator's async runtime and running until first yield point
+        // When called again, the operator will continue from the last yield point and not restart from the beginning
+        let _ = tokio::task::block_in_place(|| operator.wasi_cli_run().call_run(&mut store))?;
+
         // Update the state to Loaded
         *state_guard = OperatorState::Loaded(Arc::new(LoadedState {
             operator,
@@ -326,6 +349,8 @@ impl WasmOperatorRuntime {
 
         let duration = start_load.elapsed().as_millis();
         self.stats.record_load_duration(duration as u32);
+
+        self.run_until_unloaded();
 
         Ok(())
     }
@@ -438,49 +463,15 @@ impl WasmOperatorRuntime {
             resources: Default::default(),
         };
         let mut store = Store::new(wasmtime_engine, state);
-        store.set_epoch_deadline(1);
 
         let mut linker = Linker::new(wasmtime_engine);
 
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
         bindings::Wasmoperator::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
 
-        info!(
-            "Linking WASI and Kubernetes API for operator '{}'...",
-            self.cr.name
-        );
         let operator = bindings::Wasmoperator::instantiate(&mut store, &component, &linker)?;
 
-        info!("Starting operator wasi '{}'...", self.cr.name);
-
-        // self.task_tracker.spawn(async move {
-        //     let _ = operator.wasi_cli_run().call_run(&mut store);
-        // });
-
-        // let program_result =
-        //     tokio::task::block_in_place(|| operator.wasi_cli_run().call_run(&mut store))?;
-        let program_result =
-            tokio::task::spawn_blocking(move || operator.wasi_cli_run().call_run(&mut store));
-
-        //operator.wasi_cli_run().call_run(&mut store);
-
-        info!("Operator '{}' started successfully.", self.cr.name);
-
-        // if program_result.is_err() {
-        //     error!("WASI application exited with an error.");
-        //     std::process::exit(1);
-        // }
-
-        //Debug code:
-        let state = State {
-            operator: self.clone(),
-            wasi_ctx: WasiCtxBuilder::new().build(),
-            resources: Default::default(),
-        };
-        let mut store2 = Store::new(wasmtime_engine, state);
-        let operator2 = bindings::Wasmoperator::instantiate(&mut store2, &component, &linker)?;
-
-        Ok((operator2, store2))
+        Ok((operator, store))
     }
 
     fn load_wasm_file(&self) -> Result<Vec<u8>> {
@@ -518,8 +509,52 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    fn run_until_unloaded(self: &Arc<Self>) {
+        let self_clone = self.clone();
+        self.task_tracker.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = self_clone.shutdown_token.cancelled() => {
+                        info!("Operator '{}' received shutdown signal, stopping operator loop.", self_clone.cr.name);
+                        return;
+                    }
+                    _ = tokio::task::yield_now() => {
+                        let state_guard = self_clone.state.read().await;
+                        if let OperatorState::Unloaded(_) = *state_guard {
+                            info!("Operator '{}' has been unloaded, stopping operator loop.", self_clone.cr.name);
+                            return;
+                        }
+                        if let OperatorState::Loaded(ref loaded_state) = *state_guard {
+                            let operator = &loaded_state.operator;
+                            let mut store = loaded_state.store.lock().await;
+                            let result = tokio::task::block_in_place(|| {
+                                let now = Instant::now();
+                                let result = operator.wasi_cli_run().call_run(&mut *store);
+                                let duration = now.elapsed().as_millis();
+                                if duration > 10 {
+                                    warn!("Operator '{}' run loop executed in {} ms", self_clone.cr.name, duration);
+                                }
+                                result
+                            });
+
+                            if let Err(e) = result {
+                                error!("Error running operator loop for '{}': {:?}", self_clone.cr.name, e);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     async fn start(self: Arc<Self>) -> Result<()> {
+        // This will load the operator and start the runtime until yield
         self.clone().load().await?;
+
+        // Start an operator loop to progress the operator's async runtime and handle events
+        self.run_until_unloaded();
+
         // let mut state_guard = self.state.write().await;
         // if let OperatorState::Unloaded(_) = *state_guard {
         //     drop(state_guard);
@@ -753,6 +788,10 @@ impl WasmOperatorRuntime {
 
         // Check if the operator is loaded, else load it before executing
         if let OperatorState::Unloaded(_) = *state_guard {
+            debug!(
+                "Operator '{}' is unloaded, loading before executing the WIT call...",
+                self.cr.name
+            );
             drop(state_guard);
             self.clone().load().await?;
             state_guard = self.state.write().await;
@@ -770,7 +809,7 @@ impl WasmOperatorRuntime {
 
         // Execute the function
         let mut store_guard = loaded_state.store.lock().await;
-        f(&loaded_state.operator, &mut store_guard)
+        tokio::task::block_in_place(|| f(&loaded_state.operator, &mut store_guard))
     }
 
     pub async fn is_idle(&self, threshold: Duration) -> bool {

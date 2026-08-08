@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use kube::api::{Api, Patch, PatchParams, ResourceExt};
 use kube::runtime::Controller;
@@ -13,17 +13,37 @@ use kube::runtime::controller::Action;
 use kube::runtime::watcher::Config;
 use kube::{Client, CustomResource, Resource};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 struct Component;
 
-impl wasip2::exports::cli::run::Guest for Component {
-    fn run() -> Result<(), ()> {
-        info!("Starting the WASI operator runtime...");
+// TODO move to imports instead of using the long tokio::runtime::Builder::... etc
+// TODO maybe move to a seperate crate for the wasm-operator runtime, so that it can be reused in other operators
+thread_local! {
+    static RUNTIME: (tokio::runtime::Runtime, tokio::task::LocalSet) = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        let local = tokio::task::LocalSet::new();
+        (rt, local)
+    };
+}
 
-        rt.block_on(main_async());
+static IS_MAIN_RUNNING: AtomicBool = AtomicBool::new(false);
+
+// Do we need a localset? Allesinds geen probleem want we zijn in een single-threaded runtime.
+impl wasip2::exports::cli::run::Guest for Component {
+    fn run() -> Result<(), ()> {
+        RUNTIME.with(|(rt, local)| {
+            if !IS_MAIN_RUNNING.swap(true, Ordering::SeqCst) {
+                // Start the main async function in the localset if it hasn't been started yet
+                local.spawn_local(main_async());
+            }
+            // Drive the async runtime to completion for a single tick
+            local.block_on(rt, async {
+                tokio::task::yield_now().await;
+            });
+        });
         Ok(())
     }
 }
@@ -70,12 +90,16 @@ enum Error {
 
 // --- 3. Reconciliation Loop ---
 async fn reconcile(resource: Arc<TestResource>, ctx: Arc<Data>) -> Result<Action, Error> {
+    warn!("Reconciling resource: {:?}", resource.name_any());
     let namespace = resource.namespace().ok_or(Error::NamespaceRequired)?;
     let api: Api<TestResource> = Api::namespaced(ctx.client.clone(), &namespace);
     let name = resource.name_any();
 
     if resource.meta().deletion_timestamp.is_some() {
-        info!(name, "Resource is being deleted, skipping reconciliation");
+        info!(
+            "Resource {} is being deleted, skipping reconciliation",
+            name
+        );
         return Ok(Action::await_change());
     }
 
@@ -85,7 +109,7 @@ async fn reconcile(resource: Arc<TestResource>, ctx: Arc<Data>) -> Result<Action
         }
     }
 
-    info!(name, "Reconciling resource");
+    //info!("Reconciling resource {}", &name);
 
     let current_counter = {
         let mut counter = ctx.counter.lock().unwrap();
@@ -111,8 +135,12 @@ async fn reconcile(resource: Arc<TestResource>, ctx: Arc<Data>) -> Result<Action
     Ok(Action::await_change())
 }
 
-fn error_policy(_resource: Arc<TestResource>, error: &Error, _ctx: Arc<Data>) -> Action {
-    error!(%error, "Reconciliation failed");
+fn error_policy(resource: Arc<TestResource>, error: &Error, _ctx: Arc<Data>) -> Action {
+    error!(
+        "Reconciliation failed for resource '{}': {:?}",
+        resource.name_any(),
+        error
+    );
     Action::requeue(std::time::Duration::from_secs(5))
 }
 
@@ -219,9 +247,6 @@ fn main() {
 
 async fn main_async() {
     tracing_subscriber::fmt::init();
-    info!("Testing tokio sleep...");
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    info!("Tokio sleep test passed!");
 
     // // Spawn the background poll loop
     // tokio::task::spawn_local(async {
@@ -265,16 +290,11 @@ async fn main_async() {
         counter: Arc::new(Mutex::new(0)),
     });
 
-    info!(namespace, "Starting TestResource controller loop...");
+    info!("Starting TestResource controller loop...");
 
     Controller::new(api, Config::default())
         //.shutdown_on_signal()
         .run(reconcile, error_policy, context)
-        .for_each(|res| async move {
-            match res {
-                Ok(o) => info!("Reconcile success: {:?}", o),
-                Err(e) => error!("Reconcile error: {:?}", e),
-            }
-        })
+        .for_each(|_| async {})
         .await;
 }

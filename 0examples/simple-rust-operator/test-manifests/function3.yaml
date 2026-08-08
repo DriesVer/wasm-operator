@@ -4,4 +4,4 @@ metadata:
   name: function3
   namespace: default
 spec:
-  factor: 1000
+  factor: 100

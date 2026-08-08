@@ -3,12 +3,12 @@ package local:kube@0.2.0;
 world kubernetes {
     import api;
 
-    use api.{watch-id, watch-event};
+    use api.{watch-id, watch-event, error};
 
     export receive-watch-event: func(
         watch-id: watch-id,
         event: watch-event,
-    ) -> result;
+    ) -> result<_, error>;
 }
 
 world wasmoperator {

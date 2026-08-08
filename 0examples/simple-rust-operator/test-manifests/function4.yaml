@@ -1,7 +1,7 @@
 apiVersion: test.dev/v1
 kind: TestResource
 metadata:
-  name: function1
+  name: function4
   namespace: default
 spec:
-  factor: 1
+  factor: 1000
