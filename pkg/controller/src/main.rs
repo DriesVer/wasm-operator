@@ -9,18 +9,18 @@ mod host;
 mod kubernetes;
 mod prediction;
 mod runtime;
+mod shutdown;
 
 use std::env;
 
 use kubernetes::KubernetesService;
 use runtime::MainController;
 #[cfg(unix)]
-use tokio::signal::unix::{signal, SignalKind};
-use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use crate::runtime::wasmengine::WasmEngineSingleton;
+use crate::shutdown::wait_for_shutdown;
 
 fn main() -> anyhow::Result<()> {
     let debug = parse_args()?;
@@ -28,8 +28,14 @@ fn main() -> anyhow::Result<()> {
     setup_logging(debug);
 
     // Create a tokio runtime to run the async code
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let worker_threads = cores.max(2); // Ensure at least 2 async threads for the runtime
+
     let global_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(3) // 3 threads
+        .worker_threads(worker_threads)
         .enable_all()
         .build()?;
 
@@ -40,14 +46,12 @@ fn main() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     })?;
 
-    let shutdown_token = CancellationToken::new();
-    let shutdown_token_clone = shutdown_token.clone();
     global_rt.spawn(async move {
-        wait_for_shutdown(shutdown_token_clone).await;
+        wait_for_shutdown().await;
     });
 
     global_rt.block_on(async {
-        let main_controller = MainController::new(shutdown_token);
+        let main_controller = MainController::new();
         main_controller.start().await?;
         Ok::<(), anyhow::Error>(())
     })?;
@@ -56,19 +60,6 @@ fn main() -> anyhow::Result<()> {
     info!("Exiting...");
 
     Ok(())
-}
-
-async fn wait_for_shutdown(shutdown_token: CancellationToken) {
-    let mut sigterm = signal(SignalKind::terminate()).unwrap();
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received SIGINT, initiating shutdown...");
-        },
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM from Kubernetes, initiating shutdown...");
-        }
-    }
-    shutdown_token.cancel();
 }
 
 struct LoggingParams {

@@ -67,19 +67,18 @@ pub enum WORCommand {
 
 type RunnerStopAck = oneshot::Sender<()>;
 
-// TODO: remove pub from LoadedState, UnloadedState, and OperatorState, debugging only
-pub struct LoadedState {
+struct LoadedState {
     operator: bindings::Wasmoperator,
     store: Mutex<Store<State>>,
 }
 
-pub struct UnloadedState {
+struct UnloadedState {
     // Path to the serialized memory file.
     state_path: PathBuf,
 }
 
 // Use boxed variants to reduce enum size
-pub enum OperatorState {
+enum OperatorState {
     Loaded(Arc<LoadedState>),
     Unloaded(Arc<UnloadedState>),
 }
@@ -88,8 +87,7 @@ pub struct WasmOperatorRuntime {
     pub cr: WasmOperatorReduced,
     pub cmd_tx: mpsc::UnboundedSender<WORCommand>, // Channel for sending commands to the operator's command handler
 
-    // TODO: remove pub from state, debugging only
-    pub state: RwLock<OperatorState>,
+    state: Arc<RwLock<OperatorState>>,
     task_tracker: TaskTracker,
     shutdown_token: CancellationToken,
     shutdown_tx: mpsc::Sender<OperatorUid>, // Channel to signal the operator is shutting down
@@ -114,9 +112,11 @@ impl WasmOperatorRuntime {
         let self_ = Arc::new(Self {
             cr: wasmop_cr,
             cmd_tx: wasm_op_tx,
-            state: RwLock::new(OperatorState::Unloaded(Arc::new(UnloadedState {
-                state_path: PathBuf::new(),
-            }))),
+            state: Arc::new(RwLock::new(OperatorState::Unloaded(Arc::new(
+                UnloadedState {
+                    state_path: PathBuf::new(),
+                },
+            )))),
             task_tracker: TaskTracker::new(),
             shutdown_token: CancellationToken::new(),
             shutdown_tx,
@@ -461,7 +461,6 @@ impl WasmOperatorRuntime {
             component
         };
 
-        // TODO maybe remove allow blocking current thread if possible (were debug things), do this as part of block_in_place conversion
         let wasi_ctx = WasiCtxBuilder::new()
             .inherit_stdio()
             .args(&self.cr.args)
@@ -473,7 +472,7 @@ impl WasmOperatorRuntime {
                     .map(|e| (e.name.as_str(), e.value.as_str()))
                     .collect::<Vec<_>>(),
             )
-            .allow_blocking_current_thread(true)
+            .allow_blocking_current_thread(true) // Operator is mostly ran from a blocking thread (spawn_blocking), so allow blocking current thread for wasi calls,
             .build();
 
         let state = State {
@@ -535,25 +534,62 @@ impl WasmOperatorRuntime {
                     }
 
                     _ = tokio::task::yield_now() => {
-                        let state_guard = self_clone.state.read().await;
-                        if let OperatorState::Unloaded(_) = *state_guard {
-                            info!("Operator '{}' has been unloaded, stopping operator loop.", self_clone.cr.name);
-                            return;
-                        }
-                        if let OperatorState::Loaded(ref loaded_state) = *state_guard {
-                            let operator = &loaded_state.operator;
-                            let mut store = loaded_state.store.lock().await;
-                            let result = tokio::task::block_in_place(|| {
-                                let result = operator.wasi_cli_run().call_run(&mut *store);
-                                result
-                            });
+                        // let state_guard = self_clone.state.read().await;
+                        // if let OperatorState::Unloaded(_) = *state_guard {
+                        //     info!("Operator '{}' has been unloaded, stopping operator loop.", self_clone.cr.name);
+                        //     return;
+                        // }
+                        // if let OperatorState::Loaded(ref loaded_state) = *state_guard {
+                        //     let operator = &loaded_state.operator;
+                        //     let mut store = loaded_state.store.lock().await;
+                        //     let result = tokio::task::block_in_place(|| {
+                        //         let result = operator.wasi_cli_run().call_run(&mut *store);
+                        //         result
+                        //     });
+                        // 
+                        //     if let Err(e) = result {
+                        //         let error = format!("Operator '{}' crashed during run loop: {}", self_clone.cr.name, e);
+                        //         let _ = self_clone.throw_fatal_error::<()>(&error).await;
+                        //         error!("{}", error);
+                        //         return;
+                        //     }
+                        // }
 
-                            if let Err(e) = result {
+                        let owned_state_guard = self_clone.state.clone().read_owned().await;
+                        let result = tokio::task::spawn_blocking(move || {
+                            match &*owned_state_guard {
+                                OperatorState::Unloaded(_) => None,
+                                OperatorState::Loaded(ref loaded_state) => {
+                                    let operator = &loaded_state.operator;
+                                    let mut store = loaded_state.store.blocking_lock();
+                                    let result = operator.wasi_cli_run().call_run(&mut *store);
+                                    Some(result)
+                                }
+                            }
+                        }).await;
+
+                        match result {
+                            // Operator was unloaded
+                            Ok(None) => {
+                                info!("Operator '{}' has been unloaded, stopping operator loop.", self_clone.cr.name);
+                                return;
+                            }
+                            // Operator execution failed
+                            Ok(Some(Err(e))) => {
                                 let error = format!("Operator '{}' crashed during run loop: {}", self_clone.cr.name, e);
                                 let _ = self_clone.throw_fatal_error::<()>(&error).await;
                                 error!("{}", error);
                                 return;
                             }
+                            // Tokio join error (e.g. thread panic)
+                            Err(join_err) => {
+                                let error = format!("Blocking task for operator '{}' panicked or failed: {}", self_clone.cr.name, join_err);
+                                let _ = self_clone.throw_fatal_error::<()>(&error).await;
+                                error!("{}", error);
+                                return;
+                            }
+                            // Successful execution
+                            Ok(Some(Ok(_))) => {}
                         }
                     }
                 }

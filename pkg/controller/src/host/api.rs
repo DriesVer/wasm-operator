@@ -31,7 +31,7 @@ use std::hash::{Hash, Hasher};
 use k8s_openapi::api::core::v1::Pod;
 
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     host::state::State, kubernetes::KubernetesService, runtime::wasmoperator::WasmOperatorRuntime,
@@ -865,7 +865,6 @@ impl From<&WatchStreamSignature> for KubeWatchParams {
     }
 }
 
-// TODO: let this loop react to SIGINT and SIGTERM signals to gracefully shutdown the stream handler and all associated streams.
 // One global stream handler, this reduces overhead in comparrison to spawning a new task for each operator.
 // This also creates an artificial bottleneck which is not bad because not all operators will be trying at the same time if watch events arive at the same time.
 static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|| {
@@ -878,6 +877,8 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
     });
     let self_clone = _self.clone();
 
+    let shutdown_token = crate::shutdown::shutdown_token();
+
     // Spawn the background worker that listens to all registered streams
     tokio::spawn(async move {
         let mut streams = StreamMap::new();
@@ -886,6 +887,12 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
 
         loop {
             tokio::select! {
+                biased;
+                _ = shutdown_token.cancelled() => {
+                    info!("Watch stream handler received shutdown signal. Closing all streams and exiting.");
+                    break;
+                }
+
                 // Handle new registrations
                 cmd = cmd_rx.recv() => {
                     match cmd {

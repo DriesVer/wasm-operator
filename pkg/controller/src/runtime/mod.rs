@@ -15,7 +15,6 @@ use futures::StreamExt;
 use kube::runtime::watcher::{self, Event};
 use kube::ResourceExt;
 use tokio::sync::{OnceCell, mpsc};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 
@@ -41,16 +40,14 @@ pub static CONTROLLER_UUID: OnceCell<String> = OnceCell::const_new();
 pub struct MainController {
     operators: DashMap<OperatorUid, Arc<WasmOperatorRuntime>>,
     crashed_operators: DashMap<OperatorUid, Option<i64>>,
-    shutdown_token: CancellationToken,
 }
 
 impl MainController {
-    pub fn new(shutdown_token: CancellationToken) -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         let _ = CONTROLLER_UUID.set(uuid::Uuid::new_v4().to_string());
         Arc::new(Self {
             operators: DashMap::new(),
             crashed_operators: DashMap::new(),
-            shutdown_token,
         })
     }
 
@@ -160,9 +157,10 @@ impl MainController {
     }
 
     async fn idle_check_loop(self: Arc<Self>) {
+        let shutdown_token = crate::shutdown::shutdown_token();
         loop {
             tokio::select! {
-                _ = self.shutdown_token.cancelled() => {
+                _ = shutdown_token.cancelled() => {
                     info!("Received shutdown signal, stopping idle check loop...");
                     return;
                 }
@@ -211,9 +209,10 @@ impl MainController {
         let mut control_restarted: Vec<OperatorUid> = Vec::new();
 
         // Watch for changes to WasmOperator CRs
+        let shutdown_token = crate::shutdown::shutdown_token();
         loop {
             tokio::select! {
-                _ = self.shutdown_token.cancelled() => {
+                _ = shutdown_token.cancelled() => {
                     info!("Received shutdown signal, stopping WasmOperator watcher loop and pausing all operators...");
                     let shutdown_futures = self.operators.iter().map(|entry| {
                         let op = entry.value().clone();
@@ -270,7 +269,7 @@ impl MainController {
                         }
                         Some(Err(e)) => {
                             error!("WasmOperator controller's watcher for 'WasmOperator' in namespace '{}' encountered a fatal error, exiting execution: {}", namespace, e);
-                            self.shutdown_token.cancel();
+                            crate::shutdown::shutdown_token().cancel();
                         }
                         None => {
                             info!(
