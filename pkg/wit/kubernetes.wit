@@ -157,7 +157,6 @@ interface api {
     record watch-params {
         label-selector: option<string>,
         field-selector: option<string>,
-        timeout: option<u32>,
         bookmark: bool,
         send-initial-events: bool,
     }

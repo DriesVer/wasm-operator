@@ -7,7 +7,7 @@
 
 use std::{
     pin::Pin,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use dashmap::DashMap;
@@ -422,9 +422,10 @@ impl Host for State {
                 let watch_id = match scope {
                     Scope::Full => {
                         debug!("Subscribing to watch stream for resource kind: {}, namespace: {:?}, for operator {}", api.kind, api.namespace, &self.operator.cr.name);
-                        let ws = WatchStreamSignature::from((api, version, params));
+                        let accept_bookmarks = params.bookmark;
+                        let ws = WatchStreamSignature::from((api, params));
                         let watch_id = WatchStreamHandler::get_instance()
-                            .register_watch_stream(self.operator.clone(), ws).await?;
+                            .register_watch_stream(self.operator.clone(), ws, version, accept_bookmarks).await?;
                         watch_id
                     }
                     Scope::MetadataOnly => {
@@ -777,16 +778,6 @@ fn to_kube_patch(
     Ok(patch)
 }
 
-fn to_kube_watch_params(wp: WatchParams) -> KubeWatchParams {
-    KubeWatchParams {
-        label_selector: wp.label_selector,
-        field_selector: wp.field_selector,
-        timeout: wp.timeout,
-        bookmarks: wp.bookmark,
-        send_initial_events: wp.send_initial_events,
-    }
-}
-
 fn to_kube_log_params(lp: LogParams) -> KubeLogParams {
     KubeLogParams {
         container: lp.container,
@@ -847,14 +838,16 @@ type BoxedWatchStream = Pin<Box<dyn Stream<Item = Option<WatcherResult>> + Send>
 enum StreamManagerCmd {
     Register {
         signature: WatchStreamSignature,
+        cluster_version: String,
+        bookmarks: bool,
         operator: Arc<WasmOperatorRuntime>,
-        stream: BoxedWatchStream,
     },
 }
 
 struct WatchStreamHandler {
     cmd_tx: mpsc::UnboundedSender<StreamManagerCmd>,
-    next_id: AtomicU32,
+    last_event_versions: DashMap<u64, String>, // Maps WatchStreamSignature hash to last seen resource version that was an actual event (not a bookmark)
+    next_temp_id: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -864,13 +857,12 @@ pub struct WatchStreamSignature {
     kind: String,
     plural: String,
     namespace: Option<String>,
-    cluster_version: String,
     label_selector: Option<String>,
     field_selector: Option<String>,
     send_initial_events: bool,
-    timeout: Option<u32>, // Remove as option
-    bookmark: bool,       // Filter internally
-    hash: u64,            // Precomputed internal hash
+
+    temporary: u64,
+    hash: u64, // Precomputed internal hash
 }
 
 impl WatchStreamSignature {
@@ -878,6 +870,26 @@ impl WatchStreamSignature {
     #[inline]
     pub fn get_hash(&self) -> u64 {
         self.hash
+    }
+
+    fn calculate_hash(&mut self) {
+        let mut hasher = DefaultHasher::new();
+        self.group.hash(&mut hasher);
+        self.api_version.hash(&mut hasher);
+        self.kind.hash(&mut hasher);
+        self.plural.hash(&mut hasher);
+        self.namespace.hash(&mut hasher);
+        self.label_selector.hash(&mut hasher);
+        self.field_selector.hash(&mut hasher);
+        self.send_initial_events.hash(&mut hasher);
+        self.temporary.hash(&mut hasher);
+        let hash = hasher.finish();
+        self.hash = hash;
+    }
+
+    pub fn set_temporary(&mut self, temporary: u64) {
+        self.temporary = temporary;
+        self.calculate_hash();
     }
 }
 
@@ -891,65 +903,37 @@ impl PartialEq for WatchStreamSignature {
     fn eq(&self, other: &Self) -> bool {
         // Fast-path comparison using precomputed hash before comparing full fields
         self.hash == other.hash
+            && self.temporary == other.temporary
             && self.group == other.group
             && self.api_version == other.api_version
             && self.kind == other.kind
             && self.plural == other.plural
             && self.namespace == other.namespace
-            && self.cluster_version == other.cluster_version
             && self.label_selector == other.label_selector
             && self.field_selector == other.field_selector
             && self.send_initial_events == other.send_initial_events
-            && self.timeout == other.timeout
-            && self.bookmark == other.bookmark
     }
 }
 
 impl Eq for WatchStreamSignature {}
 
-impl From<(ApiResource, String, WatchParams)> for WatchStreamSignature {
-    fn from((api, cluster_version, params): (ApiResource, String, WatchParams)) -> Self {
-        let group = api.group;
-        let api_version = api.version;
-        let kind = api.kind;
-        let plural = api.plural;
-        let namespace = api.namespace;
-        let label_selector = params.label_selector;
-        let field_selector = params.field_selector;
-        let send_initial_events = params.send_initial_events;
-        let timeout = params.timeout;
-        let bookmark = params.bookmark;
+impl From<(ApiResource, WatchParams)> for WatchStreamSignature {
+    fn from((api, params): (ApiResource, WatchParams)) -> Self {
+        let mut signature = WatchStreamSignature {
+            group: api.group,
+            api_version: api.version,
+            kind: api.kind,
+            plural: api.plural,
+            namespace: api.namespace,
+            label_selector: params.label_selector,
+            field_selector: params.field_selector,
+            send_initial_events: params.send_initial_events,
+            temporary: 0,
+            hash: 0, // Placeholder, will be calculated below
+        };
 
-        // Calculate internal hash once during construction
-        // Note: `timeout` and `bookmark` are omitted from signature calculation
-        let mut hasher = DefaultHasher::new();
-        group.hash(&mut hasher);
-        api_version.hash(&mut hasher);
-        kind.hash(&mut hasher);
-        plural.hash(&mut hasher);
-        namespace.hash(&mut hasher);
-        cluster_version.hash(&mut hasher);
-        label_selector.hash(&mut hasher);
-        field_selector.hash(&mut hasher);
-        send_initial_events.hash(&mut hasher);
-        timeout.hash(&mut hasher);
-        bookmark.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        WatchStreamSignature {
-            group,
-            api_version,
-            kind,
-            plural,
-            namespace,
-            cluster_version,
-            label_selector,
-            field_selector,
-            send_initial_events,
-            timeout,
-            bookmark,
-            hash,
-        }
+        signature.calculate_hash();
+        signature
     }
 }
 
@@ -975,24 +959,30 @@ impl From<&WatchStreamSignature> for KubeWatchParams {
         KubeWatchParams {
             label_selector: sig.label_selector.clone(),
             field_selector: sig.field_selector.clone(),
-            timeout: sig.timeout,
-            bookmarks: sig.bookmark,
+            timeout: None, // Timout is managed by the stream handler, not the operators
+            bookmarks: true, // Always request bookmarks from the API server to track resource versions
             send_initial_events: sig.send_initial_events,
         }
     }
 }
 
 // TODO: let this loop react to SIGINT and SIGTERM signals to gracefully shutdown the stream handler and all associated streams.
-
 // One global stream handler, this reduces overhead in comparrison to spawning a new task for each operator.
 // This also creates an artificial bottleneck which is not bad because not all operators will be trying at the same time if watch events arive at the same time.
 static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|| {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<StreamManagerCmd>();
 
+    let _self = Arc::new(WatchStreamHandler {
+        cmd_tx,
+        last_event_versions: DashMap::new(),
+        next_temp_id: AtomicU64::new(1),
+    });
+    let self_clone = _self.clone();
+
     // Spawn the background worker that listens to all registered streams
     tokio::spawn(async move {
         let mut streams = StreamMap::new();
-        let operators = DashMap::<WatchId, Arc<WasmOperatorRuntime>>::new();
+        let operators = DashMap::<WatchId, Vec<(Arc<WasmOperatorRuntime>, bool)>>::new();
         let cluster_resource_versions = DashMap::<WatchId, String>::new();
 
         loop {
@@ -1000,9 +990,55 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                 // Handle new registrations
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(StreamManagerCmd::Register { signature, operator, stream }) => {
-                            operators.insert(signature.get_hash(), operator);
-                            streams.insert(signature, stream);
+                        Some(StreamManagerCmd::Register { signature, cluster_version, bookmarks, operator }) => {
+                            let watch_id = signature.get_hash();
+                            if signature.temporary > 0 {
+                                let stream_res = if signature.send_initial_events {
+                                    WatchStreamHandler::get_watch_stream_from_signature(&signature, &cluster_version).await
+                                } else {
+                                    // Requested watch stream is behind the current streams, registering a temporary stream with 410 Gone error
+                                    let s: BoxedWatchStream = futures::stream::once(async {
+                                        Some(Err(KubeError::Api(Box::new(kube::core::Status {
+                                            status: Some(kube::core::response::StatusSummary::Failure),
+                                            message: "Requested watch stream is behind the current streams".to_string(),
+                                            reason: "Gone".to_string(),
+                                            code: 1410,
+                                            ..Default::default()
+                                        }))))
+                                    })
+                                    .chain(futures::stream::once(async { None }))
+                                    .boxed();
+                                    Ok(s)
+                                };
+
+                                match stream_res {
+                                    Ok(stream) => {
+                                        cluster_resource_versions.insert(watch_id, cluster_version);
+                                        operators.entry(watch_id).or_default().push((operator, bookmarks));
+                                        streams.insert(signature, stream);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to create temporary watch stream for signature {:?}: {}", watch_id, e);
+                                    }
+                                }
+                            } else {
+                                if streams.contains_key(&signature) {
+                                    // Watch stream is already active. Share it with the new operator.
+                                    operators.entry(watch_id).or_default().push((operator, bookmarks));
+                                } else {
+                                    // Watch stream is not active yet, open a new connection to API server
+                                    match WatchStreamHandler::get_watch_stream_from_signature(&signature, &cluster_version).await {
+                                        Ok(stream) => {
+                                            cluster_resource_versions.insert(watch_id, cluster_version);
+                                            operators.entry(watch_id).or_default().push((operator, bookmarks));
+                                            streams.insert(signature, stream);
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to create watch stream for signature {:?}: {}", watch_id, e);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         None => {
                             // Command channel was closed (WatchStreamHandler was dropped)
@@ -1013,15 +1049,19 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                 }
 
                 // Handle next event from any registered stream
-                Some((id, stream_event)) = streams.next(), if !streams.is_empty() => {
-                    let operator = operators.get(&id.get_hash()).expect("Operator should exist for registered stream");
+                Some((mut id, stream_event)) = streams.next(), if !streams.is_empty() => {
+                    let op_list = operators
+                        .get(&id.get_hash())
+                        .map(|entry| entry.value().clone())
+                        .unwrap_or_default();
 
                     warn!("Received event from stream {}: {:?}", id.get_hash(), stream_event);
 
                     match stream_event {
                         Some(event) => {
-                            let process_obj = |obj: &DynamicObject, constructor: fn(String) -> WatchEvent| {
+                            let process_event = |obj: &DynamicObject, constructor: fn(String) -> WatchEvent| {
                                 cluster_resource_versions.insert(id.get_hash(), obj.resource_version().unwrap_or_default());
+                                _self.last_event_versions.insert(id.get_hash(), obj.resource_version().unwrap_or_default());
                                 match serde_json::to_string(obj) {
                                     Ok(json) => constructor(json),
                                     Err(e) => WatchEvent::Error(Error::Other(e.to_string())),
@@ -1029,11 +1069,42 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                             };
 
                             let watch_event: WatchEvent = match event {
-                                Ok(KubeWatchEvent::Added(obj)) => process_obj(&obj, WatchEvent::Added),
-                                Ok(KubeWatchEvent::Modified(obj)) => process_obj(&obj, WatchEvent::Modified),
-                                Ok(KubeWatchEvent::Deleted(obj)) => process_obj(&obj, WatchEvent::Deleted),
+                                Ok(KubeWatchEvent::Added(obj)) => process_event(&obj, WatchEvent::Added),
+                                Ok(KubeWatchEvent::Modified(obj)) => process_event(&obj, WatchEvent::Modified),
+                                Ok(KubeWatchEvent::Deleted(obj)) => process_event(&obj, WatchEvent::Deleted),
 
                                 Ok(KubeWatchEvent::Bookmark(bookmark)) => {
+                                    if id.temporary > 0 {
+                                        // If the stream is temporary and sends bookmark, it means initial events are done and we can switch to the main stream.
+                                        warn!("Temporary stream {} (temp_id {}) received a bookmark event. Removing stream.", id.get_hash(), id.temporary);
+                                        streams.remove(&id);
+                                        let old_ops = operators.remove(&id.get_hash());
+                                        cluster_resource_versions.remove(&id.get_hash());
+
+                                        let cv: String = bookmark.metadata.resource_version.clone();
+                                        id.set_temporary(0);
+                                        id.send_initial_events = false;
+                                        id.calculate_hash();
+                                        let norm_hash = id.get_hash();
+
+                                        if let Some((_, ops)) = old_ops {
+                                            if streams.contains_key(&id) {
+                                                operators.entry(norm_hash).or_default().extend(ops);
+                                            } else {
+                                                match WatchStreamHandler::get_watch_stream_from_signature(&id, &cv).await {
+                                                    Ok(stream) => {
+                                                        streams.insert(id.clone(), stream);
+                                                        cluster_resource_versions.insert(norm_hash, cv);
+                                                        operators.entry(norm_hash).or_default().extend(ops);
+                                                    },
+                                                    Err(e) => {
+                                                        warn!("Failed to recreate watch stream for signature {:?}: {}", norm_hash, e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     cluster_resource_versions.insert(id.get_hash(), bookmark.metadata.resource_version.clone());
                                     serde_json::to_string(&bookmark)
                                         .map(WatchEvent::Bookmark)
@@ -1050,17 +1121,33 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                 Err(e) => WatchEvent::Error(Error::Other(format!("Kubernetes watch stream error: {e}"))),
                             };
 
-                            warn!("Currently {} streams are being watched", streams.len());
-                            warn!("The current operator has {} registered streams", operators.len());
-                            if let Err(e) = operator.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(id.get_hash(), watch_event)) {
-                                tracing::warn!("Failed to queue watch event for stream {}: {:?}", id.get_hash(), e);
+                            for (operator, op_accepts_bookmarks) in &op_list {
+                                if let WatchEvent::Bookmark(_) = &watch_event {
+                                    if !op_accepts_bookmarks {
+                                        continue;
+                                    }
+                                }
+                                if let Err(e) = operator.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(id.get_hash(), watch_event.clone())) {
+                                    tracing::warn!("Failed to queue watch event for stream {}: {:?}", id.get_hash(), e);
+                                }
                             }
                         }
                         None => {
                             // Stream hit EOF (closed). Attempt to recreate the stream.
                             warn!("Stream {} closed (EOF). Cleaning up.", id.get_hash());
-                            match WatchStreamHandler::get_watch_stream_from_signature(&id).await {
-                                Ok(stream) => {streams.insert(id.clone(), stream);},
+                            if id.temporary > 0 {
+                                // If the stream is temporary, we can just remove it and not recreate it.
+                                streams.remove(&id);
+                                operators.remove(&id.get_hash());
+                                cluster_resource_versions.remove(&id.get_hash());
+                                continue;
+                            }
+                            let cv: String = cluster_resource_versions.get(&id.get_hash())
+                                .expect("Cluster version option should exist for registered stream")
+                                .value()
+                                .clone();
+                            match WatchStreamHandler::get_watch_stream_from_signature(&id, &cv).await {
+                                Ok(stream) => { streams.insert(id.clone(), stream); },
                                 Err(e) => {
                                     warn!("Failed to recreate watch stream for signature {:?}: {}", id.get_hash(), e);
                                     operators.remove(&id.get_hash());
@@ -1073,10 +1160,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
         }
     });
 
-    Arc::new(WatchStreamHandler {
-        cmd_tx,
-        next_id: AtomicU32::new(1),
-    })
+    self_clone
 });
 
 impl WatchStreamHandler {
@@ -1086,6 +1170,7 @@ impl WatchStreamHandler {
 
     async fn get_watch_stream_from_signature(
         signature: &WatchStreamSignature,
+        cluster_version: &str,
     ) -> Result<BoxedWatchStream, Error> {
         let api_res = KubeApiResource::from(signature);
         let wp = KubeWatchParams::from(signature);
@@ -1094,8 +1179,9 @@ impl WatchStreamHandler {
             .await
             .map_err(to_wit_error)?;
         let kube_api = get_dynamic_api(k8s_client, signature.namespace.clone(), &api_res);
+
         let stream = kube_api
-            .watch(&wp, &signature.cluster_version)
+            .watch(&wp, cluster_version)
             .await
             .map_err(to_wit_error)?;
 
@@ -1109,22 +1195,45 @@ impl WatchStreamHandler {
     async fn register_watch_stream(
         &self,
         operator: Arc<WasmOperatorRuntime>,
-        signature: WatchStreamSignature,
+        mut signature: WatchStreamSignature,
+        cluster_version: String,
+        bookmarks: bool,
     ) -> Result<WatchId, Error> {
-        let stream = WatchStreamHandler::get_watch_stream_from_signature(&signature).await?;
+        let is_behind = match self.last_event_versions.get(&signature.get_hash()) {
+            Some(last_version) if !cluster_version.as_str().is_empty() => {
+                // IMPORTANT: comparing resource versions is only valid if in a cluster with monotonic resource versions.
+                let last_event_version: u64 = last_version.as_str().parse().map_err(|e| {
+                    Error::Other(format!("Failed to parse last event version: {e}"))
+                })?;
 
-        //let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+                let req_cluster_version: u64 = cluster_version
+                    .as_str()
+                    .parse()
+                    .map_err(|e| Error::Other(format!("Failed to parse cluster version: {e}")))?;
+
+                last_event_version > req_cluster_version
+            }
+            _ => false, // Either no last version, or requested version is empty (treat as latest)
+        };
+
+        if signature.send_initial_events || is_behind {
+            let temp_id = self.next_temp_id.fetch_add(1, Ordering::SeqCst);
+            signature.set_temporary(temp_id);
+        }
+
+        let watch_id = signature.get_hash();
 
         let cmd = StreamManagerCmd::Register {
-            signature: signature.clone(),
+            signature,
+            cluster_version,
+            bookmarks,
             operator,
-            stream,
         };
         self.cmd_tx
             .send(cmd)
             .map_err(|e| Error::Other(format!("Failed to send register command: {}", e)))?;
 
-        Ok(signature.get_hash())
+        Ok(watch_id)
     }
 }
 

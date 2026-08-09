@@ -90,7 +90,6 @@ enum Error {
 
 // --- 3. Reconciliation Loop ---
 async fn reconcile(resource: Arc<TestResource>, ctx: Arc<Data>) -> Result<Action, Error> {
-    warn!("Reconciling resource: {:?}", resource.name_any());
     let namespace = resource.namespace().ok_or(Error::NamespaceRequired)?;
     let api: Api<TestResource> = Api::namespaced(ctx.client.clone(), &namespace);
     let name = resource.name_any();
@@ -109,7 +108,7 @@ async fn reconcile(resource: Arc<TestResource>, ctx: Arc<Data>) -> Result<Action
         }
     }
 
-    //info!("Reconciling resource {}", &name);
+    info!("Reconciling resource {}: {:?}", &name, resource);
 
     let current_counter = {
         let mut counter = ctx.counter.lock().unwrap();

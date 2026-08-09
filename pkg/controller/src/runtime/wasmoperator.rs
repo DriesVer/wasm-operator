@@ -65,7 +65,6 @@ impl From<&WasmOperatorCR> for WasmOperatorReduced {
     }
 }
 
-// maybe replace long strings
 pub enum WORCommand {
     StartOperator,
     LoadAt(DateTime<Utc>),
@@ -73,8 +72,8 @@ pub enum WORCommand {
     Pause,
     Shutdown,
     ProcessWatchEvent(
-        crate::runtime::wasmoperator::bindings::local::kube::api::WatchId,
-        crate::runtime::wasmoperator::bindings::local::kube::api::WatchEvent,
+        bindings::local::kube::api::WatchId,
+        bindings::local::kube::api::WatchEvent,
     ),
 }
 
