@@ -230,18 +230,24 @@ impl MainController {
                                 error!("Failed to send unload command to operator '{}': {}", op.cr.name, e);
                                 continue;
                             }
-                            let history = op.get_reconcile_history().await;
-                            let wake_up_time = match get_next_reconcile_prediction(history, PredictionModel::AutoReg).await {
-                                Ok(prediction) => prediction,
-                                Err(e) => {
-                                    error!("Failed to get reconcile prediction for operator '{}': {}", op.cr.name, e);
-                                    continue;
-                                }
-                            };
-                            debug!("Next reconcile prediction for operator '{}' is in {:?}, sending LoadAt command.", op.cr.name, wake_up_time);
-                            op.cmd_tx.send(WORCommand::LoadAt(wake_up_time)).unwrap_or_else(|e| {
-                                error!("Failed to send LoadAt command to operator '{}': {}", op.cr.name, e);
-                            });
+                            let use_prediction = matches!(
+                                option_env!("WASMOP_USE_RECONCILE_PREDICTION"),
+                                Some("true" | "TRUE" | "1")
+                            );
+                            if use_prediction {
+                                let history = op.get_reconcile_history().await;
+                                let wake_up_time = match get_next_reconcile_prediction(history, PredictionModel::AutoReg).await {
+                                    Ok(prediction) => prediction,
+                                    Err(e) => {
+                                        error!("Failed to get reconcile prediction for operator '{}': {}", op.cr.name, e);
+                                        continue;
+                                    }
+                                };
+                                debug!("Next reconcile prediction for operator '{}' is in {:?}, sending LoadAt command.", op.cr.name, wake_up_time);
+                                op.cmd_tx.send(WORCommand::LoadAt(wake_up_time)).unwrap_or_else(|e| {
+                                    error!("Failed to send LoadAt command to operator '{}': {}", op.cr.name, e);
+                                });
+                            }
                         }
                     }
                 }
