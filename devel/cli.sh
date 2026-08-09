@@ -18,12 +18,12 @@ CONFIG_FILE="${SOURCE_ROOT}/wasmop_config.sh"
 
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
-    ARCH="amd64"
+    ARCH="x86_64"
 elif [[ "$ARCH" == armv* ]] || [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
     ARCH="aarch64"
 else
-    echo "Unknown architecture: $ARCH. Defaulting to amd64."
-    ARCH="amd64"
+    echo "Unknown architecture: $ARCH. Defaulting to x86_64."
+    ARCH="x86_64"
 fi
 OS=$(uname -s)
 
