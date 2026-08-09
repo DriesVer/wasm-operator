@@ -27,13 +27,66 @@ mod stats;
 pub mod wasmengine;
 pub mod wasmoperator;
 
-// TODO: change back to 5 minutes in production, set to 5 seconds for testing purposes
-const IDLE_THRESHOLD: Duration = Duration::from_secs(5); // 5 minutes
+// TODO: move all environment variable parsing into a single file
 
 pub const WASMOP_CACHE_DIR: &str = match option_env!("WASMOP_CACHE_DIR") {
     Some(path) => path,
     None => "/tmp/wasmop-cache",
 };
+
+/// Parses a duration string (e.g. "300", "300s", "5m", "2h", "1d") at compile time.
+/// Defaults to 300 seconds if the environment variable is missing or invalid.
+const fn parse_duration(s: Option<&'static str>) -> Duration {
+    const DEFAULT_SECS: u64 = 300;
+
+    // Convert to character bytes for easier manipulation
+    let s = match s {
+        Some(val) => val.as_bytes(),
+        None => return Duration::from_secs(DEFAULT_SECS),
+    };
+
+    if s.is_empty() {
+        return Duration::from_secs(DEFAULT_SECS);
+    }
+
+    // Determine unit multiplier based on suffix
+    let len = s.len();
+    if len == 0 {
+        return Duration::from_secs(DEFAULT_SECS);
+    }
+    let last_byte = s[len - 1];
+    let (digits_len, multiplier) = match last_byte {
+        b's' | b'S' => (len - 1, 1),
+        b'm' | b'M' => (len - 1, 60),
+        b'h' | b'H' => (len - 1, 3600),
+        b'd' | b'D' => (len - 1, 86400),
+        b'0'..=b'9' => (len, 1),
+        _ => return Duration::from_secs(DEFAULT_SECS),
+    };
+
+    if digits_len == 0 {
+        return Duration::from_secs(DEFAULT_SECS);
+    }
+
+    // Parse ascii digits manually for const context
+    let mut num: u64 = 0;
+    let mut i = 0;
+    while i < digits_len {
+        let byte = s[i];
+        match byte {
+            b'0'..=b'9' => {
+                let digit = (byte - b'0') as u64; // Convert ASCII to numeric value
+                num = num * 10 + digit;
+            }
+            _ => return Duration::from_secs(DEFAULT_SECS), // Invalid character, fallback to default
+        }
+        i += 1;
+    }
+
+    Duration::from_secs(num * multiplier)
+}
+
+pub const IDLE_THRESHOLD: Duration = parse_duration(option_env!("WASMOP_IDLE_THRESHOLD"));
 
 pub static CONTROLLER_UUID: OnceCell<String> = OnceCell::const_new();
 
