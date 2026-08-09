@@ -1,23 +1,15 @@
-use crate::runtime::watcher::watcher;
-use std::future::Future;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
-use futures::{stream, Stream};
-use kube::api::DynamicObject;
-use kube::runtime::watcher::{Error as WatcherError, Event};
 use kube::{Resource, ResourceExt};
 use serde_json;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use target_lexicon::Triple;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::Store;
 use wasmtime_wasi::WasiCtxBuilder;
@@ -32,15 +24,10 @@ use crate::kubernetes::KubernetesService;
 use crate::runtime::stats::WasmOperatorStatisticsRecorder;
 use crate::runtime::CONTROLLER_UUID;
 use crate::runtime::{WasmEngineSingleton, WASMOP_CACHE_DIR};
-use wasmtime_wasi::p2::bindings::Command;
 
 const STATUS_PATCH_THROTTLE_DURATION: Duration = Duration::from_secs(5);
 
 pub type OperatorUid = String;
-
-// Type wrappers to make the watcher stream more human readable
-type WatcherResult = Result<Event<DynamicObject>, WatcherError>;
-type BoxedWatcherStream = Pin<Box<dyn Stream<Item = WatcherResult> + Send>>;
 
 // This struct is a reduced version of the WasmOperator CRD that only contains the fields relevant for the runtime, this way we can reduce the memory usage of one WasmOperatorRuntime instance by not storing the entire CRD spec in memory.
 pub struct WasmOperatorReduced {
@@ -159,7 +146,7 @@ impl WasmOperatorRuntime {
                     if let Some(command) = command {
                         match command {
                             WORCommand::StartOperator => {
-                                if let Err(e) = self.clone().start().await {
+                                if let Err(e) = self.clone().load().await {
                                     let error = format!("Failed to start operator: {}", e);
                                     let _ = self.throw_fatal_error::<()>(&error).await;
                                     error!("Operator '{}' failed to start operator: {}", self.cr.name, e);
@@ -520,25 +507,6 @@ impl WasmOperatorRuntime {
         }
     }
 
-    async fn start_watching(self: Arc<Self>) -> Result<()> {
-        // If task tracker is closed, we cannot start new tasks, the operator is dead.
-        if self.task_tracker.is_closed() {
-            return Err(anyhow::anyhow!(
-                "Cannot start watchers for operator '{}' because task tracker is closed.",
-                self.cr.name
-            ));
-        }
-
-        let self_clone = self.clone();
-        self.task_tracker.spawn(async move {
-            if let Err(err) = self_clone.run_operator_loop().await {
-                error!("Error running operator loop: {:?}", err);
-            }
-        });
-
-        Ok(())
-    }
-
     fn run_until_unloaded(self: &Arc<Self>) {
         let self_clone = self.clone();
         self.task_tracker.spawn(async move {
@@ -591,117 +559,6 @@ impl WasmOperatorRuntime {
         });
     }
 
-    async fn start(self: Arc<Self>) -> Result<()> {
-        // This will load the operator and start the runtime until yield
-        self.clone().load().await?;
-
-        // Start an operator loop to progress the operator's async runtime and handle events --> already done in load()
-        //self.run_until_unloaded();
-
-        // let mut state_guard = self.state.write().await;
-        // if let OperatorState::Unloaded(_) = *state_guard {
-        //     drop(state_guard);
-        //     self.clone().load().await?;
-        //     state_guard = self.state.write().await;
-        // }
-
-        // let loaded_state = if let OperatorState::Loaded(ref mut state) = *state_guard {
-        //     state.clone()
-        // } else {
-        //     return Err(anyhow::anyhow!("Operator is not in a loaded state"));
-        // };
-        // drop(state_guard);
-
-        // let mut store_guard = loaded_state.store.lock().await;
-        // loaded_state
-        //     .operator
-        //     .wasi_cli_run()
-        //     .call_run(*store_guard)?;
-
-        Ok(())
-    }
-
-    async fn run_operator_loop(self: Arc<Self>) -> Result<()> {
-        let mut state_guard = self.state.write().await;
-        if let OperatorState::Unloaded(_) = *state_guard {
-            drop(state_guard);
-            self.clone().load().await?;
-            state_guard = self.state.write().await;
-        }
-
-        let loaded_state = if let OperatorState::Loaded(ref mut state) = *state_guard {
-            state.clone()
-        } else {
-            return Err(anyhow::anyhow!("Operator is not in a loaded state"));
-        };
-        drop(state_guard);
-
-        let mut store_guard = loaded_state.store.lock().await;
-
-        // let program_result = loaded_state
-        //     .operator
-        //     .wasi_cli_run()
-        //     .call_run(&mut *store_guard)
-        //     .await?;
-
-        todo!(
-            "run the operator loop, which should include starting the watcher and handling events"
-        );
-
-        Ok(())
-    }
-
-    /*
-    async fn watcher_loop(
-        self: Arc<Self>,
-        mut watcher_stream: stream::SelectAll<BoxedWatcherStream>,
-    ) {
-        loop {
-            tokio::select! {
-                biased;
-                _ = self.shutdown_token.cancelled() => {
-                    info!("Watcher loop for operator '{}' received shutdown signal, stopping watcher.", self.cr.name);
-                    return;
-                }
-
-                watcher_event = watcher_stream.next() => {
-                    // Extract the event itself
-                    let event = match watcher_event {
-                        Some(Ok(e)) => e,
-                        Some(Err(e)) => {
-                            self.throw_fatal_error::<()>(&format!("Watcher stream error: {}", e)).await.ok();
-                            error!("Operator '{}' had watch stream error: {}", self.cr.name, e);
-                            return;
-                        },
-                        None => {
-                            warn!("Watcher stream for operator '{}' ended unexpectedly.", self.cr.name);
-                            // TODO: we might want to restart the watcher here instead of exiting the loop, but we need to be careful to not end in a restart loop if the watcher keeps failing immediately
-                            return;
-                        }
-                    };
-
-                    // Map the event on WIT event types and extract the K8S object
-                    let (event_type, k8s_obj) = match event {
-                        Event::Apply(obj) | Event::InitApply(obj) => (wit_types::EventType::Applied, obj),
-                        Event::Delete(obj) => (wit_types::EventType::Deleted, obj),
-                        Event::Init => continue,
-                        Event::InitDone => {
-                            // Clear the reconcile history to not polute the prediction models
-                            self.stats.clear_recent_reconcile_history().await;
-                            continue
-                        },
-                    };
-
-                    // Call reconcile for the event
-                    if let Err(e) = self.clone().reconcile(event_type, &k8s_obj).await {
-                        error!("Failed to reconcile '{:?}' event for operator '{}': {}", event_type, self.cr.name, e);
-                    }
-                }
-            }
-        }
-    }
-    */
-
     async fn stop_execution(&self) {
         // Cancel all active loops including watchers
         self.shutdown_token.cancel();
@@ -728,100 +585,6 @@ impl WasmOperatorRuntime {
             .await?;
         Ok(())
     }
-
-    /*
-    async fn reconcile(
-        self: Arc<Self>,
-        event_type: wit_types::EventType,
-        k8s_object: &kube::api::DynamicObject,
-    ) -> Result<()> {
-        let start_reconcile = Instant::now();
-
-        let name = k8s_object.name_any();
-        let namespace = k8s_object.namespace().unwrap_or_default();
-        let kind = k8s_object
-            .types
-            .as_ref()
-            .map(|t| t.kind.as_str())
-            .unwrap_or("Unknown kind");
-        let resource_json = serde_json::to_string(k8s_object)?;
-
-        info!(
-            "Dispatching reconcile for event '{:?}' on resource '{}/{}' in namespace '{}'",
-            event_type, kind, &name, &namespace
-        );
-
-        let reconcile_request = wit_types::ReconcileRequest {
-            event_type,
-            name: name.clone(),
-            namespace: namespace.clone(),
-            resource_json,
-        };
-
-        let reconcile_result = match self
-            .execute_via_wit(|operator, store| {
-                Box::pin(async move {
-                    operator
-                        .call_reconcile(store, &reconcile_request)
-                        .await
-                        .map_err(anyhow::Error::from)
-                })
-            })
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                let error = format!("Reconciliation crashed: {}", e);
-                return self.throw_fatal_error(&error).await;
-            }
-        };
-
-        match reconcile_result {
-            wit_types::ReconcileResult::Ok => {}
-            wit_types::ReconcileResult::Error(e) => {
-                let error = format!(
-                     "Reconcile error for resource '{}/{}' in namespace '{}': \n {}",
-                    kind, &name, &namespace, e
-                );
-                self.stats.record_error(&error).await;
-                error!("Operator '{}' threw error: {}", self.cr.name, error);
-            }
-            wit_types::ReconcileResult::Requeue(milis) => {
-                let self_clone = self.clone();
-                let event_type_clone = event_type.clone();
-                let k8s_object_clone = k8s_object.clone();
-
-                self.task_tracker.spawn(async move {
-                    tokio::select! {
-                        biased;
-                        _ = self_clone.shutdown_token.cancelled() => {
-                            return;
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(milis as u64)) => {},
-                    }
-                    if let Err(e) = self_clone
-                        .clone()
-                        .reconcile(event_type_clone, &k8s_object_clone)
-                        .await
-                    {
-                        error!(
-                            "Failed to reconcile '{:?}' requeued event for operator '{}': {}",
-                            event_type, self_clone.cr.name, e
-                        );
-                    }
-                });
-            }
-        }
-
-        let duration = start_reconcile.elapsed().as_millis();
-        self.stats.record_reconcile(duration as u32).await;
-
-        self.patch_k8s_status_throttled(WasmOperatorState::Running, false)
-            .await
-            .ok();
-        Ok(())
-    }
-    */
 
     pub async fn execute_via_wit<F, T>(self: Arc<Self>, f: F) -> Result<T>
     where

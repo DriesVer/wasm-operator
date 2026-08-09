@@ -7,12 +7,11 @@
 
 use std::{
     pin::Pin,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use dashmap::DashMap;
-use futures::{stream, Stream, StreamExt};
-use http::version;
+use futures::{Stream, StreamExt};
 use kube::{
     api::{
         ApiResource as KubeApiResource, DeleteParams as KubeDeleteParams,
@@ -31,16 +30,11 @@ use std::hash::{Hash, Hasher};
 
 use k8s_openapi::api::core::v1::Pod;
 
-use serde::Serialize;
-use tokio::{runtime::Handle, sync::mpsc};
-use tracing::{debug, error, info, warn};
-use wasmtime::component::{Accessor, HasSelf};
-use wasmtime::component::{StreamProducer, StreamReader};
+use tokio::sync::mpsc;
+use tracing::{debug, error, warn};
 
 use crate::{
-    host::state::State,
-    kubernetes::KubernetesService,
-    runtime::wasmoperator::{OperatorState, OperatorUid, WasmOperatorRuntime},
+    host::state::State, kubernetes::KubernetesService, runtime::wasmoperator::WasmOperatorRuntime,
 };
 use anyhow::Result;
 
@@ -52,14 +46,11 @@ pub mod bindings {
 }
 
 use bindings::local::kube::api::{
-    ApiCategory, ApiResource, CreateParams, DeleteParams, Error, EvictParams, Host, HostWithStore,
-    HttpError, JsonValue, ListParams, LogParams, PatchParams, PatchType, Preconditions,
-    PropagationPolicy, Scope, ValidationDirective, VersionMatch, WatchEvent, WatchId, WatchParams,
+    ApiCategory, ApiResource, CreateParams, DeleteParams, Error, EvictParams, Host, HttpError,
+    JsonValue, ListParams, LogParams, PatchParams, PatchType, Preconditions, PropagationPolicy,
+    Scope, ValidationDirective, VersionMatch, WatchEvent, WatchId, WatchParams,
 };
 
-//impl Host for State {}
-
-//impl HostWithStore<State> for HasSelf<State> {
 impl Host for State {
     fn get_resource(
         &mut self,
@@ -432,56 +423,6 @@ impl Host for State {
             })
         })
     }
-
-    // fn watch_resource(
-    //     accessor: &Accessor<State, Self>,
-    //     api: ApiResource,
-    //     version: String,
-    //     params: WatchParams,
-    //     scope: Scope,
-    // ) -> Result<StreamReader<Result<WatchEvent, Error>>, Error> {
-    //     let api_res = to_kube_api_resource(&api);
-    //     let wp = to_kube_watch_params(params);
-
-    //     tokio::task::block_in_place(|| {
-    //         tokio::runtime::Handle::current().block_on(async move {
-    //             let k8s_client = KubernetesService::global_client()
-    //         .await
-    //         .map_err(to_wit_error)?;
-
-    //     let kube_stream: std::pin::Pin<Box<dyn Stream<Item = Result<WatchEvent, Error>> + Send>> =
-    //         match scope {
-    //             Scope::Full => {
-    //                 let kube_api = get_dynamic_api(k8s_client.clone(), &api, &api_res);
-    //                 let stream = kube_api.watch(&wp, &version).await.map_err(to_wit_error)?;
-    //                 transform_watch_stream(stream).boxed()
-    //             }
-    //             Scope::MetadataOnly => {
-    //                 let kube_api = get_meta_api(k8s_client.clone(), &api, &api_res);
-    //                 let stream = kube_api
-    //                     .watch_metadata(&wp, &version)
-    //                     .await
-    //                     .map_err(to_wit_error)?;
-    //                 transform_watch_stream(stream).boxed()
-    //             }
-    //             Scope::Subresource(_) => {
-    //                 return Err(Error::Other(
-    //                     "Watch operation is not supported on subresources".to_string(),
-    //                 ));
-    //             }
-    //         };
-
-    //     let (tx, rx) = mpsc::channel::<Result<WatchEvent, Error>>(32);
-    //     let stream_reader = accessor
-    //         .with(|mut access| StreamReader::new(&mut access, HostWatchStreamProducer::new(rx)))
-    //         .map_err(|e| Error::Other(e.to_string()))?;
-
-    //     accessor.spawn(WatchTask { kube_stream, tx });
-
-    //     Ok(stream_reader)
-    // })
-    //     })
-    // }
 
     fn get_logs_string(
         &mut self,
@@ -1226,130 +1167,3 @@ impl WatchStreamHandler {
         Ok(watch_id)
     }
 }
-
-// fn transform_watch_stream<T: Serialize>(
-//     stream: impl Stream<Item = Result<KubeWatchEvent<T>, kube::Error>>,
-// ) -> impl Stream<Item = Result<WatchEvent, Error>> {
-//     stream.map(|event| {
-//         let watch_event = event.map_err(to_wit_error)?;
-
-//         let stringify = |obj: &T| serde_json::to_string(obj).map_err(to_wit_error);
-
-//         match watch_event {
-//             KubeWatchEvent::Added(obj) => {
-//                 let s = stringify(&obj)?;
-//                 Ok(WatchEvent::Added(s))
-//             }
-//             KubeWatchEvent::Modified(obj) => {
-//                 let s = stringify(&obj)?;
-//                 Ok(WatchEvent::Modified(s))
-//             }
-//             KubeWatchEvent::Deleted(obj) => {
-//                 let s = stringify(&obj)?;
-//                 Ok(WatchEvent::Deleted(s))
-//             }
-//             KubeWatchEvent::Bookmark(bookmark) => {
-//                 let s = serde_json::to_string(&bookmark)
-//                     .map_err(|e| todo!("Convert bookmark serialization error to Error: {:?}", e))?;
-//                 Ok(WatchEvent::Bookmark(s))
-//             }
-//             KubeWatchEvent::Error(status) => {
-//                 // The original function loses the original structure of `Error`
-//                 // by formatting it into a string inside the Status object.
-//                 // You will need to reconstruct a fallback `Error` here.
-//                 let wit_error = Error::Other(format!("Kubernetes API error: {}", status.message));
-//                 Ok(WatchEvent::Error(wit_error))
-//             }
-//         }
-//     })
-// }
-
-// use std::task::{Context, Poll};
-// use wasmtime::component::{Destination, StreamResult};
-// use wasmtime::StoreContextMut;
-
-// type WatchStreamItem = std::result::Result<WatchEvent, Error>;
-
-// pub struct HostWatchStreamProducer {
-//     pub rx: mpsc::Receiver<WatchStreamItem>,
-// }
-
-// impl HostWatchStreamProducer {
-//     pub fn new(rx: mpsc::Receiver<WatchStreamItem>) -> Self {
-//         Self { rx }
-//     }
-// }
-
-// impl<State> StreamProducer<State> for HostWatchStreamProducer {
-//     type Item = WatchStreamItem;
-//     type Buffer = wasmtime::component::VecBuffer<Self::Item>;
-
-//     fn poll_produce<'a>(
-//         self: Pin<&mut Self>,
-//         cx: &mut Context<'_>,
-//         mut store: StoreContextMut<'a, State>,
-//         mut dst: Destination<'a, Self::Item, Self::Buffer>,
-//         finish: bool,
-//     ) -> Poll<wasmtime::Result<StreamResult>> {
-//         if finish {
-//             return Poll::Ready(Ok(StreamResult::Cancelled));
-//         }
-
-//         let capacity = dst.remaining(&mut store).unwrap_or(16);
-//         if capacity == 0 {
-//             return Poll::Ready(Ok(StreamResult::Completed));
-//         }
-//         let this = self.get_mut();
-
-//         let mut buffer = Vec::new();
-//         let mut produced = 0;
-
-//         while produced < capacity {
-//             match this.rx.poll_recv(cx) {
-//                 Poll::Ready(Some(item)) => {
-//                     buffer.push(item);
-//                     produced += 1;
-//                 }
-//                 Poll::Ready(None) => {
-//                     if produced > 0 {
-//                         dst.set_buffer(buffer.into());
-//                     }
-//                     return Poll::Ready(Ok(StreamResult::Dropped));
-//                 }
-//                 Poll::Pending => {
-//                     break;
-//                 }
-//             }
-//         }
-
-//         if produced > 0 {
-//             // We successfully pulled items; hand the populated buffer back to the guest
-//             dst.set_buffer(buffer.into());
-//             Poll::Ready(Ok(StreamResult::Completed))
-//         } else {
-//             // No items available right now, channel is pending
-//             Poll::Pending
-//         }
-//     }
-// }
-
-// use wasmtime::component::AccessorTask;
-
-// struct WatchTask {
-//     kube_stream: std::pin::Pin<Box<dyn Stream<Item = Result<WatchEvent, Error>> + Send>>,
-//     tx: mpsc::Sender<Result<WatchEvent, Error>>,
-// }
-
-// impl<D> AccessorTask<State, D> for WatchTask
-// where
-//     D: wasmtime::component::HasData + ?Sized,
-// {
-//     async fn run(mut self, _accessor: &Accessor<State, D>) -> wasmtime::Result<()> {
-//         while let Some(event) = self.kube_stream.next().await {
-//             if self.tx.send(event).await.is_err() {
-//                 break;
-//             }
-//         }
-//         Ok(())
-//     }
-// }

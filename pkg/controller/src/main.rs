@@ -10,7 +10,7 @@ mod kubernetes;
 mod prediction;
 mod runtime;
 
-use std::{env, path::PathBuf};
+use std::env;
 
 use kubernetes::KubernetesService;
 use runtime::MainController;
@@ -23,7 +23,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use crate::runtime::wasmengine::WasmEngineSingleton;
 
 fn main() -> anyhow::Result<()> {
-    let (config_path, debug) = parse_args()?;
+    let debug = parse_args()?;
 
     setup_logging(debug);
 
@@ -114,9 +114,8 @@ fn setup_logging(params: LoggingParams) {
     }
 }
 
-fn parse_args() -> anyhow::Result<(PathBuf, LoggingParams)> {
+fn parse_args() -> anyhow::Result<LoggingParams> {
     let args: Vec<String> = env::args().collect();
-    let mut config_path: Option<PathBuf> = None;
     let mut logging_params = LoggingParams {
         base_level: "info".to_string(),
         http_level: None,
@@ -130,16 +129,10 @@ fn parse_args() -> anyhow::Result<(PathBuf, LoggingParams)> {
             logging_params.http_level = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--kube_log=") {
             logging_params.kube_level = Some(val.to_string());
-        } else if config_path.is_none() {
-            config_path = Some(PathBuf::from(arg));
         } else {
             anyhow::bail!("Unexpected argument: {}", arg);
         }
     }
 
-    let config_path = config_path.ok_or_else(|| {
-        anyhow::anyhow!("Usage: {} [--debug] <path_to_wasm_config.yaml>", args[0])
-    })?;
-
-    Ok((config_path, logging_params))
+    Ok(logging_params)
 }

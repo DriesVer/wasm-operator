@@ -8,9 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::runtime::wasmoperator::OperatorUid;
-use crate::{kubernetes::KubernetesService, runtime::wasmoperator::WasmOperatorRuntime};
-use anyhow::Result;
+use crate::runtime::wasmoperator::WasmOperatorRuntime;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
