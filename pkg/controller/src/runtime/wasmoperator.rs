@@ -201,7 +201,7 @@ impl WasmOperatorRuntime {
                                 ).await;
 
                                 if let Err(e) = result {
-                                    let error = format!("Operator '{}' crashed during watch event processing: {}", self.cr.name, e);
+                                    let error = format!("Operator '{}' crashed during watch event processing: {:?}", self.cr.name, e);
                                     let _ = self.throw_fatal_error::<()>(&error).await;
                                     error!("{}", error);
                                     return;
@@ -546,12 +546,10 @@ impl WasmOperatorRuntime {
                 Ok(guard) => guard,
                 // There was already a runner loop running, we don't need to start another one
                 Err(e) => {
-                    error!("{}", e);
-                    error!("Operator '{}' already has a runner loop running, not starting another one.", self_clone.cr.name);
+                    error!("Operator '{}' already has a runner loop running, not starting another one: {}", self_clone.cr.name, e);
                     return;
                 },
             };
-            warn!("Starting operator loop for operator '{}'", self_clone.cr.name);
             loop {
                 tokio::select! {
                     biased;
@@ -576,12 +574,7 @@ impl WasmOperatorRuntime {
                             let operator = &loaded_state.operator;
                             let mut store = loaded_state.store.lock().await;
                             let result = tokio::task::block_in_place(|| {
-                                let now = Instant::now();
                                 let result = operator.wasi_cli_run().call_run(&mut *store);
-                                let duration = now.elapsed().as_millis();
-                                if duration > 10 {
-                                    warn!("Operator '{}' run loop executed in {} ms", self_clone.cr.name, duration);
-                                }
                                 result
                             });
 

@@ -114,11 +114,6 @@ impl Host for State {
         params: ListParams,
         scope: Scope,
     ) -> Result<JsonValue, Error> {
-        debug!(
-            "[HOST] list_resources called for kind={:?}, namespace={:?}",
-            api.kind, api.namespace
-        );
-
         let api_res = to_kube_api_resource(&api);
         let lp = to_kube_list_params(params);
 
@@ -127,18 +122,10 @@ impl Host for State {
                 let k8s_client = KubernetesService::global_client()
                     .await
                     .map_err(to_wit_error)?;
-
-                tracing::info!(
-                    "[HOST] list_resources called for kind={:?}, namespace={:?}",
-                    api.kind,
-                    api.namespace
-                );
                 match scope {
                     Scope::Full => {
                         let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
-                        tracing::info!("[HOST] executing list on Kubernetes API server...");
                         let list = kube_api.list(&lp).await.map_err(to_wit_error)?;
-                        tracing::info!("[HOST] list returned {} items", list.items.len());
                         serde_json::to_string(&list).map_err(to_serde_error)
                     }
                     Scope::MetadataOnly => {
@@ -1121,7 +1108,6 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                             for (operator, op_accepts_bookmarks) in &op_list {
                                 if let WatchEvent::Bookmark(_) = &watch_event {
                                     if !op_accepts_bookmarks || !operator.is_loaded().await {
-                                        warn!("Operator {} blocked bookmark: loaded={}", operator.cr.name, operator.is_loaded().await);
                                         continue;
                                     }
                                 }

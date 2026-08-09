@@ -18,15 +18,21 @@ struct Component;
 
 // TODO move to imports instead of using the long tokio::runtime::Builder::... etc
 // TODO maybe move to a seperate crate for the wasm-operator runtime, so that it can be reused in other operators
-thread_local! {
-    static RUNTIME: (tokio::runtime::Runtime, tokio::task::LocalSet) = {
+use send_wrapper::SendWrapper;
+use std::sync::OnceLock;
+
+static RUNTIME: OnceLock<Mutex<SendWrapper<(tokio::runtime::Runtime, tokio::task::LocalSet)>>> =
+    OnceLock::new();
+
+fn get_runtime() -> &'static Mutex<SendWrapper<(tokio::runtime::Runtime, tokio::task::LocalSet)>> {
+    RUNTIME.get_or_init(|| {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
-        (rt, local)
-    };
+        Mutex::new(SendWrapper::new((rt, local)))
+    })
 }
 
 static IS_MAIN_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -34,15 +40,21 @@ static IS_MAIN_RUNNING: AtomicBool = AtomicBool::new(false);
 // Do we need a localset? Allesinds geen probleem want we zijn in een single-threaded runtime.
 impl wasip2::exports::cli::run::Guest for Component {
     fn run() -> Result<(), ()> {
-        RUNTIME.with(|(rt, local)| {
-            if !IS_MAIN_RUNNING.swap(true, Ordering::SeqCst) {
-                // Start the main async function in the localset if it hasn't been started yet
-                local.spawn_local(main_async());
-            }
-            // Drive the async runtime to completion for a single tick
-            local.block_on(rt, async {
-                tokio::task::yield_now().await;
-            });
+        let _ = tracing_subscriber::fmt()
+            .with_writer(CustomStdout)
+            .try_init();
+
+        let rt_mutex = get_runtime();
+        let mut rt_guard = rt_mutex.lock().unwrap();
+        let (rt, local) = &mut **rt_guard;
+
+        if !IS_MAIN_RUNNING.swap(true, Ordering::SeqCst) {
+            // Start the main async function in the localset if it hasn't been started yet
+            local.spawn_local(main_async());
+        }
+        // Drive the async runtime to completion for a single tick
+        local.block_on(rt, async {
+            tokio::task::yield_now().await;
         });
         Ok(())
     }
@@ -112,7 +124,7 @@ async fn reconcile(resource: Arc<TestResource>, ctx: Arc<Data>) -> Result<Action
 
     let current_counter = {
         let mut counter = ctx.counter.lock().unwrap();
-        *counter += 3;
+        *counter += 1;
         *counter
     };
 
@@ -244,10 +256,33 @@ fn main() {
     local.block_on(&rt, main_async());
 }
 
-async fn main_async() {
-    tracing_subscriber::fmt::init();
+// Custom stdout writer that fetchs the stdout stream from the WASI environment and writes to it
+// Needed because stdout stream changes on each wake up of the operator
+struct CustomStdout;
 
+impl std::io::Write for CustomStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let stdout = wasip2::cli::stdout::get_stdout();
+        stdout
+            .blocking_write_and_flush(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CustomStdout {
+    type Writer = CustomStdout;
+    fn make_writer(&'a self) -> Self::Writer {
+        CustomStdout
+    }
+}
+
+async fn main_async() {
     // // Spawn the background poll loop
+
     // tokio::task::spawn_local(async {
     //     eprintln!("[WASM-OP] Background poll loop spawned!");
     //     loop {

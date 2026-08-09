@@ -16,7 +16,7 @@ use kube::runtime::watcher::{self, Event};
 use kube::ResourceExt;
 use tokio::sync::{OnceCell, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 
 use crate::kubernetes::crd::WasmOperator as WasmOperatorCRD;
@@ -187,7 +187,7 @@ impl MainController {
                                     continue;
                                 }
                             };
-                            info!("Next reconcile prediction for operator '{}' is in {:?}, sending LoadAt command.", op.cr.name, wake_up_time);
+                            debug!("Next reconcile prediction for operator '{}' is in {:?}, sending LoadAt command.", op.cr.name, wake_up_time);
                             op.cmd_tx.send(WORCommand::LoadAt(wake_up_time)).unwrap_or_else(|e| {
                                 error!("Failed to send LoadAt command to operator '{}': {}", op.cr.name, e);
                             });
