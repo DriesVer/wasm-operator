@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use kube::{Resource, ResourceExt};
 use serde_json;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use target_lexicon::Triple;
@@ -70,7 +71,6 @@ type RunnerStopAck = oneshot::Sender<()>;
 pub struct LoadedState {
     operator: bindings::Wasmoperator,
     store: Mutex<Store<State>>,
-    last_active: Mutex<Instant>,
 }
 
 pub struct UnloadedState {
@@ -93,6 +93,7 @@ pub struct WasmOperatorRuntime {
     task_tracker: TaskTracker,
     shutdown_token: CancellationToken,
     shutdown_tx: mpsc::Sender<OperatorUid>, // Channel to signal the operator is shutting down
+    last_active: AtomicI64,
 
     runner_tx: mpsc::Sender<RunnerStopAck>,
     runner_rx: Mutex<mpsc::Receiver<RunnerStopAck>>,
@@ -119,6 +120,7 @@ impl WasmOperatorRuntime {
             task_tracker: TaskTracker::new(),
             shutdown_token: CancellationToken::new(),
             shutdown_tx,
+            last_active: AtomicI64::new(0),
             runner_tx,
             runner_rx: Mutex::new(runner_rx),
             stats: WasmOperatorStatisticsRecorder::new(),
@@ -362,8 +364,8 @@ impl WasmOperatorRuntime {
         *state_guard = OperatorState::Loaded(Arc::new(LoadedState {
             operator,
             store: Mutex::new(store),
-            last_active: Mutex::new(Instant::now()),
         }));
+        self.update_last_active();
 
         let duration = start_load.elapsed().as_millis();
         self.stats.record_load_duration(duration as u32);
@@ -586,6 +588,11 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    pub fn update_last_active(&self) {
+        let now_ms: i64 = Utc::now().timestamp_millis();
+        self.last_active.store(now_ms, Ordering::SeqCst);
+    }
+
     pub async fn execute_via_wit<F, T>(self: Arc<Self>, f: F) -> Result<T>
     where
         for<'a> F: FnOnce(&'a bindings::Wasmoperator, &'a mut Store<State>) -> Result<T>,
@@ -609,9 +616,7 @@ impl WasmOperatorRuntime {
             return Err(anyhow::anyhow!("Operator is not in a loaded state"));
         };
 
-        // Update the last active time
-        let mut last_active_guard = loaded_state.last_active.lock().await;
-        *last_active_guard = Instant::now();
+        self.update_last_active();
 
         // Execute the function
         let mut store_guard = loaded_state.store.lock().await;
@@ -619,12 +624,13 @@ impl WasmOperatorRuntime {
     }
 
     pub async fn is_idle(&self, threshold: Duration) -> bool {
-        if let OperatorState::Loaded(state) = &*self.state.read().await {
-            let last_active_guard = state.last_active.lock().await;
-            last_active_guard.elapsed() > threshold
-        } else {
-            false
+        if !self.is_loaded().await {
+            return false;
         }
+        let now = Utc::now().timestamp_millis();
+        let last_active = self.last_active.load(Ordering::SeqCst);
+        let elapsed = now - last_active;
+        return elapsed > threshold.as_millis() as i64;
     }
 
     pub async fn get_reconcile_history(&self) -> Vec<DateTime<Utc>> {

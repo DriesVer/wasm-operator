@@ -26,3 +26,18 @@ impl WasiView for State {
         }
     }
 }
+
+impl State {
+    /// Common runner executed for every WIT host call
+    pub fn execute_host_function<F, Fut, T, E>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        // Update the last active timestamp for the operator
+        self.operator.update_last_active();
+
+        // Do async task
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f()))
+    }
+}
