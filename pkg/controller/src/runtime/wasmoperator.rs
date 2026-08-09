@@ -14,7 +14,7 @@ use kube::runtime::watcher::{Error as WatcherError, Event};
 use kube::{Resource, ResourceExt};
 use serde_json;
 use target_lexicon::Triple;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -77,6 +77,8 @@ pub enum WORCommand {
     ),
 }
 
+type RunnerStopAck = oneshot::Sender<()>;
+
 // TODO: remove pub from LoadedState, UnloadedState, and OperatorState, debugging only
 pub struct LoadedState {
     operator: bindings::Wasmoperator,
@@ -104,6 +106,10 @@ pub struct WasmOperatorRuntime {
     task_tracker: TaskTracker,
     shutdown_token: CancellationToken,
     shutdown_tx: mpsc::Sender<OperatorUid>, // Channel to signal the operator is shutting down
+
+    runner_tx: mpsc::Sender<RunnerStopAck>,
+    runner_rx: Mutex<mpsc::Receiver<RunnerStopAck>>,
+
     stats: WasmOperatorStatisticsRecorder,
     last_patch_time: Mutex<Instant>,
 }
@@ -115,6 +121,8 @@ impl WasmOperatorRuntime {
     ) -> Arc<Self> {
         let (wasm_op_tx, wasm_op_rx) = mpsc::unbounded_channel();
 
+        let (runner_tx, runner_rx) = mpsc::channel(1);
+
         let self_ = Arc::new(Self {
             cr: wasmop_cr,
             cmd_tx: wasm_op_tx,
@@ -124,6 +132,8 @@ impl WasmOperatorRuntime {
             task_tracker: TaskTracker::new(),
             shutdown_token: CancellationToken::new(),
             shutdown_tx,
+            runner_tx,
+            runner_rx: Mutex::new(runner_rx),
             stats: WasmOperatorStatisticsRecorder::new(),
             last_patch_time: Mutex::new(Instant::now() - STATUS_PATCH_THROTTLE_DURATION * 2),
         });
@@ -151,7 +161,7 @@ impl WasmOperatorRuntime {
                             WORCommand::StartOperator => {
                                 if let Err(e) = self.clone().start().await {
                                     let error = format!("Failed to start operator: {}", e);
-                                    let _ = self.throw_fatal_error::<()>(&error);
+                                    let _ = self.throw_fatal_error::<()>(&error).await;
                                     error!("Operator '{}' failed to start operator: {}", self.cr.name, e);
                                     return;
                                 }
@@ -162,7 +172,7 @@ impl WasmOperatorRuntime {
                             WORCommand::Unload => {
                                 if let Err(e) = self.unload().await {
                                     let error = format!("Failed to unload: {}", e);
-                                    let _ = self.throw_fatal_error::<()>(&error);
+                                    let _ = self.throw_fatal_error::<()>(&error).await;
                                     error!("Operator '{}' failed to unload: {}", self.cr.name, e);
                                     return;
                                 }
@@ -170,7 +180,7 @@ impl WasmOperatorRuntime {
                             WORCommand::Pause => {
                                 if let Err(e) = self.pause().await {
                                     let error = format!("Failed to pause: {}", e);
-                                    let _ = self.throw_fatal_error::<()>(&error);
+                                    let _ = self.throw_fatal_error::<()>(&error).await;
                                     error!("Operator '{}' failed to pause: {}", self.cr.name, e);
                                     return;
                                 }
@@ -191,7 +201,10 @@ impl WasmOperatorRuntime {
                                 ).await;
 
                                 if let Err(e) = result {
-                                    warn!("Failed to send watch event for stream {}, removing stream: {:?}", id, e);
+                                    let error = format!("Operator '{}' crashed during watch event processing: {}", self.cr.name, e);
+                                    let _ = self.throw_fatal_error::<()>(&error).await;
+                                    error!("{}", error);
+                                    return;
                                 }
                             },
                         }
@@ -201,6 +214,11 @@ impl WasmOperatorRuntime {
                 }
             }
         }
+    }
+
+    pub async fn is_loaded(&self) -> bool {
+        let state_guard = self.state.read().await;
+        matches!(*state_guard, OperatorState::Loaded(_))
     }
 
     async fn patch_k8s_status(&self, state: WasmOperatorState) -> Result<()> {
@@ -273,10 +291,21 @@ impl WasmOperatorRuntime {
             return Ok(());
         };
 
+        // Stop the operator's async runtime and wait for it to finish
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let runner_tx = self.runner_tx.clone();
+        runner_tx
+            .send(ack_tx)
+            .await
+            .context("Failed to send stop signal to operator loop")?;
+        ack_rx
+            .await
+            .context("Failed to receive acknowledgment from operator loop")?;
+
         let mut store_guard = loaded_state.store.lock().await;
 
         // Serialize the linear memory of the WASM component
-        let memory_data = store_guard.get_linear_memory()?;
+        let memory_data = store_guard.get_snapshot()?;
 
         self.stats.record_memory_usage(memory_data.len() as u32);
 
@@ -301,6 +330,8 @@ impl WasmOperatorRuntime {
 
         self.stats.record_unloading_operation();
 
+        debug!("Unload completed for operator {}", self.cr.name);
+
         Ok(())
     }
 
@@ -323,7 +354,7 @@ impl WasmOperatorRuntime {
         // Restore the memory of the operator if a save file exists
         if unloaded_state.state_path.exists() {
             let saved_state = tokio::fs::read(&unloaded_state.state_path).await?;
-            store.set_linear_memory(&saved_state)?;
+            store.set_snapshot(&saved_state)?;
 
             info!(
                 "Successfully restored memory state for operator {}",
@@ -441,6 +472,7 @@ impl WasmOperatorRuntime {
             component
         };
 
+        // TODO maybe remove allow blocking current thread if possible (were debug things), do this as part of block_in_place conversion
         let wasi_ctx = WasiCtxBuilder::new()
             .inherit_stdio()
             .args(&self.cr.args)
@@ -452,9 +484,7 @@ impl WasmOperatorRuntime {
                     .map(|e| (e.name.as_str(), e.value.as_str()))
                     .collect::<Vec<_>>(),
             )
-            .inherit_network()
             .allow_blocking_current_thread(true)
-            .allow_ip_name_lookup(true)
             .build();
 
         let state = State {
@@ -512,6 +542,16 @@ impl WasmOperatorRuntime {
     fn run_until_unloaded(self: &Arc<Self>) {
         let self_clone = self.clone();
         self.task_tracker.spawn(async move {
+            let mut runner_rx_guard = match self_clone.runner_rx.try_lock() {
+                Ok(guard) => guard,
+                // There was already a runner loop running, we don't need to start another one
+                Err(e) => {
+                    error!("{}", e);
+                    error!("Operator '{}' already has a runner loop running, not starting another one.", self_clone.cr.name);
+                    return;
+                },
+            };
+            warn!("Starting operator loop for operator '{}'", self_clone.cr.name);
             loop {
                 tokio::select! {
                     biased;
@@ -519,6 +559,13 @@ impl WasmOperatorRuntime {
                         info!("Operator '{}' received shutdown signal, stopping operator loop.", self_clone.cr.name);
                         return;
                     }
+
+                    Some(ack_tx) = runner_rx_guard.recv() => {
+                        debug!("Operator '{}' received stop signal for operator loop to unload", self_clone.cr.name);
+                        let _ = ack_tx.send(());
+                        return;
+                    }
+
                     _ = tokio::task::yield_now() => {
                         let state_guard = self_clone.state.read().await;
                         if let OperatorState::Unloaded(_) = *state_guard {
@@ -539,7 +586,10 @@ impl WasmOperatorRuntime {
                             });
 
                             if let Err(e) = result {
-                                error!("Error running operator loop for '{}': {:?}", self_clone.cr.name, e);
+                                let error = format!("Operator '{}' crashed during run loop: {}", self_clone.cr.name, e);
+                                let _ = self_clone.throw_fatal_error::<()>(&error).await;
+                                error!("{}", error);
+                                return;
                             }
                         }
                     }
@@ -552,8 +602,8 @@ impl WasmOperatorRuntime {
         // This will load the operator and start the runtime until yield
         self.clone().load().await?;
 
-        // Start an operator loop to progress the operator's async runtime and handle events
-        self.run_until_unloaded();
+        // Start an operator loop to progress the operator's async runtime and handle events --> already done in load()
+        //self.run_until_unloaded();
 
         // let mut state_guard = self.state.write().await;
         // if let OperatorState::Unloaded(_) = *state_guard {

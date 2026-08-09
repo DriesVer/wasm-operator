@@ -1055,8 +1055,6 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                         .map(|entry| entry.value().clone())
                         .unwrap_or_default();
 
-                    warn!("Received event from stream {}: {:?}", id.get_hash(), stream_event);
-
                     match stream_event {
                         Some(event) => {
                             let process_event = |obj: &DynamicObject, constructor: fn(String) -> WatchEvent| {
@@ -1076,7 +1074,6 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                 Ok(KubeWatchEvent::Bookmark(bookmark)) => {
                                     if id.temporary > 0 {
                                         // If the stream is temporary and sends bookmark, it means initial events are done and we can switch to the main stream.
-                                        warn!("Temporary stream {} (temp_id {}) received a bookmark event. Removing stream.", id.get_hash(), id.temporary);
                                         streams.remove(&id);
                                         let old_ops = operators.remove(&id.get_hash());
                                         cluster_resource_versions.remove(&id.get_hash());
@@ -1123,18 +1120,25 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
 
                             for (operator, op_accepts_bookmarks) in &op_list {
                                 if let WatchEvent::Bookmark(_) = &watch_event {
-                                    if !op_accepts_bookmarks {
+                                    if !op_accepts_bookmarks || !operator.is_loaded().await {
+                                        warn!("Operator {} blocked bookmark: loaded={}", operator.cr.name, operator.is_loaded().await);
                                         continue;
                                     }
                                 }
                                 if let Err(e) = operator.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(id.get_hash(), watch_event.clone())) {
-                                    tracing::warn!("Failed to queue watch event for stream {}: {:?}", id.get_hash(), e);
+                                    warn!("Failed to queue watch event for stream {} and operator {}, removing the operator as listener: {:?}", id.get_hash(), operator.cr.name, e);
+                                    let mut ops = operators.entry(id.get_hash()).or_default();
+                                    ops.retain(|(op, _)| !Arc::ptr_eq(op, operator));
+                                    if ops.is_empty() {
+                                        operators.remove(&id.get_hash());
+                                        streams.remove(&id);
+                                        cluster_resource_versions.remove(&id.get_hash());
+                                    }
                                 }
                             }
                         }
                         None => {
                             // Stream hit EOF (closed). Attempt to recreate the stream.
-                            warn!("Stream {} closed (EOF). Cleaning up.", id.get_hash());
                             if id.temporary > 0 {
                                 // If the stream is temporary, we can just remove it and not recreate it.
                                 streams.remove(&id);
