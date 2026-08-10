@@ -199,18 +199,15 @@ impl WasmOperatorRuntime {
                                 }
                             },
                             WORCommand::CheckIdle(threshold, reply_tx) => {
-                                tracing::warn!("Checking if operator '{}' is idle with threshold {:?}", self.cr.name, threshold);
                                 if !self.is_loaded() {
                                     let _ = reply_tx.send(false);
                                     continue;
                                 }
-                                tracing::warn!("Operator '{}' is loaded, checking last active timestamp...", self.cr.name);
                                 let last_active = self.last_active.load(Ordering::SeqCst);
                                 let now = Utc::now().timestamp_millis();
                                 let diff = now - last_active;
                                 let is_idle = diff > threshold.as_millis() as i64;
                                 let _ = reply_tx.send(is_idle);
-                                tracing::warn!("Operator '{}' idle check: last_active={}, now={}, diff={}ms, threshold={}ms, is_idle={}", self.cr.name, last_active, now, diff, threshold.as_millis(), is_idle);
                             },
                         }
                     } else {
@@ -230,7 +227,7 @@ impl WasmOperatorRuntime {
         }
     }
 
-    pub fn is_loaded(&self) -> bool {
+    fn is_loaded(&self) -> bool {
         if let Ok(state_guard) = self.state.try_read() {
             matches!(*state_guard, OperatorState::Loaded(_))
         } else {
@@ -309,17 +306,6 @@ impl WasmOperatorRuntime {
     }
 
     async fn unload(&self) -> Result<()> {
-        // Stop the operator's async runtime and wait for it to finish
-        // let (ack_tx, ack_rx) = oneshot::channel();
-        // let runner_tx = self.runner_tx.clone();
-        // runner_tx
-        //     .send(ack_tx)
-        //     .await
-        //     .context("Failed to send stop signal to operator loop")?;
-        // ack_rx
-        //     .await
-        //     .context("Failed to receive acknowledgment from operator loop")?;
-
         // Acquire write lock and extract the loaded state
         let mut state_guard = self.state.write().await;
         let loaded_state = if let OperatorState::Loaded(ref state) = *state_guard {
@@ -330,14 +316,7 @@ impl WasmOperatorRuntime {
         let mut store_guard = loaded_state.store.lock().await;
 
         // Serialize the linear memory of the WASM component
-        let now = Instant::now();
         let memory_data = store_guard.get_snapshot()?;
-        tracing::warn!(
-            "Serialized {} bytes of memory for operator '{}' in {:?}",
-            memory_data.len(),
-            self.cr.name,
-            now.elapsed()
-        );
 
         self.stats.record_memory_usage(memory_data.len() as u32);
 
@@ -387,15 +366,8 @@ impl WasmOperatorRuntime {
 
         // Restore the memory of the operator if a save file exists
         if unloaded_state.state_path.exists() {
-            let now = Instant::now();
             let saved_state = tokio::fs::read(&unloaded_state.state_path).await?;
             store.set_snapshot(&saved_state)?;
-            tracing::warn!(
-                "Restored {} bytes of memory for operator '{}' in {:?}",
-                saved_state.len(),
-                self.cr.name,
-                now.elapsed()
-            );
 
             info!(
                 "Successfully restored memory state for operator {}",
@@ -473,7 +445,7 @@ impl WasmOperatorRuntime {
         }
     }
 
-    pub async fn get_or_compile_component(&self) -> Result<Component> {
+    async fn get_or_compile_component(&self) -> Result<Component> {
         // Get hash or compute it if not present
         let mut wasm_hash_guard = self.cr.wasm_hash.lock().await;
         let wasm_bytes = if wasm_hash_guard.is_none() {
