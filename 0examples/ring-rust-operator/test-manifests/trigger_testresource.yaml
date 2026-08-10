@@ -1,0 +1,12 @@
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-1
+spec:
+  nonce: 1
+# This should be the same as the following command:
+# kubectl patch ring-testresource test-function \
+#   -n wasmop-1 \
+#   --type=merge \
+#   -p '{"spec":{"nonce":1}}'

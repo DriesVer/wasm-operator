@@ -1,0 +1,15 @@
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-1"
+    - name: OUT_NAMESPACE
+      value: "wasmop-2"

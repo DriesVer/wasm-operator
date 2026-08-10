@@ -1,9 +1,10 @@
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [package]
-name = "simple-rust-operator"
+name = "ring-rust-operator"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 resolver = "2"
 
 [lib]
@@ -38,6 +39,7 @@ thiserror = "2.0.18"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-#[[bin]]
-#name = "simple-rust-operator"
-#path = "src/main.rs"
+[profile.release]
+opt-level = 0            # Disables LLVM optimizations that collapse dummy functions
+lto = false              # Prevents cross-crate/module dead code elimination
+codegen-units = 16       # Reduces merging across translation units

@@ -1,0 +1,179 @@
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-0
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-0"
+    - name: OUT_NAMESPACE
+      value: "wasmop-1"
+    - name: HEAP_MEM_SIZE
+      value: "0"
+---
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-1
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-1"
+    - name: OUT_NAMESPACE
+      value: "wasmop-2"
+    - name: HEAP_MEM_SIZE
+      value: "0"
+---
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-2
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-2"
+    - name: OUT_NAMESPACE
+      value: "wasmop-3"
+    - name: HEAP_MEM_SIZE
+      value: "0"
+---
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-3
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-3"
+    - name: OUT_NAMESPACE
+      value: "wasmop-4"
+    - name: HEAP_MEM_SIZE
+      value: "0"
+---
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-4
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-4"
+    - name: OUT_NAMESPACE
+      value: "wasmop-5"
+    - name: HEAP_MEM_SIZE
+      value: "0"
+---
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-5
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-5"
+    - name: OUT_NAMESPACE
+      value: "wasmop-6"
+    - name: HEAP_MEM_SIZE
+      value: "0"
+---
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-6
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-6"
+    - name: OUT_NAMESPACE
+      value: "wasmop-7"
+    - name: HEAP_MEM_SIZE
+      value: "0"
+---
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-7
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-7"
+    - name: OUT_NAMESPACE
+      value: "wasmop-8"
+    - name: HEAP_MEM_SIZE
+      value: "0"
+---
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-8
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-8"
+    - name: OUT_NAMESPACE
+      value: "wasmop-9"
+    - name: HEAP_MEM_SIZE
+      value: "0"
+---
+apiVersion: "test.dev/v1"
+kind: WasmOperator
+metadata:
+  name: ring-rust-operator-9
+  namespace: default
+spec:
+  wasm:
+    pvc:
+      path: "/wasm-source-pvc"
+      file: "ring_rust_operator.wasm"
+  env:
+    - name: IN_NAMESPACE
+      value: "wasmop-9"
+    - name: OUT_NAMESPACE
+      value: "wasmop-0"
+    - name: HEAP_MEM_SIZE
+      value: "0"

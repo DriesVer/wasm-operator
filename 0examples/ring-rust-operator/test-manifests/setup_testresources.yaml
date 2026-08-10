@@ -1,0 +1,142 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-0
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-0
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-1
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-1
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-2
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-2
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-3
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-3
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-4
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-4
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-5
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-5
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-6
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-6
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-6
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-6
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-7
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-7
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-8
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-8
+spec:
+  nonce: 0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wasmop-9
+---
+apiVersion: test.dev/v1
+kind: RingTestResource
+metadata:
+  name: test-function
+  namespace: wasmop-9
+spec:
+  nonce: 0

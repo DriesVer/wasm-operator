@@ -93,7 +93,7 @@ impl Host for State {
                 }
             };
 
-            serde_json::from_str(&obj_str).map_err(to_serde_error)
+            Ok(obj_str)
         })
     }
 

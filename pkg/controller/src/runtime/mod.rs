@@ -38,7 +38,7 @@ pub const WASMOP_CACHE_DIR: &str = match option_env!("WASMOP_CACHE_DIR") {
 /// Parses a duration string (e.g. "300", "300s", "5m", "2h", "1d") at compile time.
 /// Defaults to 300 seconds if the environment variable is missing or invalid.
 const fn parse_duration(s: Option<&'static str>) -> Duration {
-    const DEFAULT_SECS: u64 = 300;
+    const DEFAULT_SECS: u64 = 5;
 
     // Convert to character bytes for easier manipulation
     let s = match s {

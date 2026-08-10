@@ -3,9 +3,8 @@ use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use kube::api::{Api, Patch, PatchParams, ResourceExt};
 use kube::runtime::Controller;
@@ -13,13 +12,13 @@ use kube::runtime::controller::Action;
 use kube::runtime::watcher::Config;
 use kube::{Client, CustomResource, Resource};
 
-use std::sync::atomic::{AtomicBool, Ordering};
 struct Component;
 
 // TODO move to imports instead of using the long tokio::runtime::Builder::... etc
 // TODO maybe move to a seperate crate for the wasm-operator runtime, so that it can be reused in other operators
 use send_wrapper::SendWrapper;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static RUNTIME: OnceLock<Mutex<SendWrapper<(tokio::runtime::Runtime, tokio::task::LocalSet)>>> =
     OnceLock::new();
@@ -61,6 +60,30 @@ impl wasip2::exports::cli::run::Guest for Component {
 }
 
 wasip2::cli::command::export!(Component);
+
+// Custom stdout writer that fetchs the stdout stream from the WASI environment and writes to it
+// Needed because stdout stream changes on each wake up of the operator
+struct CustomStdout;
+
+impl std::io::Write for CustomStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let stdout = wasip2::cli::stdout::get_stdout();
+        stdout
+            .blocking_write_and_flush(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CustomStdout {
+    type Writer = CustomStdout;
+    fn make_writer(&'a self) -> Self::Writer {
+        CustomStdout
+    }
+}
 
 // --- 1. Custom Resource Definition ---
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -254,30 +277,6 @@ fn main() {
 
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, main_async());
-}
-
-// Custom stdout writer that fetchs the stdout stream from the WASI environment and writes to it
-// Needed because stdout stream changes on each wake up of the operator
-struct CustomStdout;
-
-impl std::io::Write for CustomStdout {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let stdout = wasip2::cli::stdout::get_stdout();
-        stdout
-            .blocking_write_and_flush(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CustomStdout {
-    type Writer = CustomStdout;
-    fn make_writer(&'a self) -> Self::Writer {
-        CustomStdout
-    }
 }
 
 async fn main_async() {
