@@ -34,10 +34,16 @@ impl State {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        // Update the last active timestamp for the operator
+        // Update the last active timestamp for the operator (before to account for long blocks)
         self.operator.update_last_active();
 
         // Do async task
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f()))
+        let result =
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f()));
+
+        // Update the last active timestamp for the operator
+        self.operator.update_last_active();
+
+        result
     }
 }

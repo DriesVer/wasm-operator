@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use target_lexicon::Triple;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info};
@@ -67,9 +67,8 @@ pub enum WORCommand {
         bindings::local::kube::api::WatchId,
         bindings::local::kube::api::WatchEvent,
     ),
+    CheckIdle(Duration, tokio::sync::oneshot::Sender<bool>),
 }
-
-type RunnerStopAck = oneshot::Sender<()>;
 
 struct LoadedState {
     operator: bindings::Wasmoperator,
@@ -97,9 +96,6 @@ pub struct WasmOperatorRuntime {
     shutdown_tx: mpsc::Sender<OperatorUid>, // Channel to signal the operator is shutting down
     last_active: AtomicI64,
 
-    runner_tx: mpsc::Sender<RunnerStopAck>,
-    runner_rx: Mutex<mpsc::Receiver<RunnerStopAck>>,
-
     stats: WasmOperatorStatisticsRecorder,
     last_patch_time: Mutex<Instant>,
 }
@@ -110,8 +106,6 @@ impl WasmOperatorRuntime {
         shutdown_tx: mpsc::Sender<OperatorUid>,
     ) -> Arc<Self> {
         let (wasm_op_tx, wasm_op_rx) = mpsc::unbounded_channel();
-
-        let (runner_tx, runner_rx) = mpsc::channel(1);
 
         let self_ = Arc::new(Self {
             cr: wasmop_cr,
@@ -125,8 +119,6 @@ impl WasmOperatorRuntime {
             shutdown_token: CancellationToken::new(),
             shutdown_tx,
             last_active: AtomicI64::new(0),
-            runner_tx,
-            runner_rx: Mutex::new(runner_rx),
             stats: WasmOperatorStatisticsRecorder::new(),
             last_patch_time: Mutex::new(Instant::now() - STATUS_PATCH_THROTTLE_DURATION * 2),
         });
@@ -185,6 +177,12 @@ impl WasmOperatorRuntime {
                                 }
                             },
                             WORCommand::ProcessWatchEvent(id, watch_event) => {
+                                if let bindings::local::kube::api::WatchEvent::Bookmark(_) = &watch_event {
+                                    if !self.is_loaded() {
+                                        continue;
+                                    }
+                                }
+
                                 let result = self.clone().execute_via_wit(
                                     |operator, store| {
                                         // Call the WIT function to process the watch event (wakes up the operator if it was waiting for events)
@@ -200,16 +198,39 @@ impl WasmOperatorRuntime {
                                     return;
                                 }
                             },
+                            WORCommand::CheckIdle(threshold, reply_tx) => {
+                                tracing::warn!("Checking if operator '{}' is idle with threshold {:?}", self.cr.name, threshold);
+                                if !self.is_loaded() {
+                                    let _ = reply_tx.send(false);
+                                    continue;
+                                }
+                                tracing::warn!("Operator '{}' is loaded, checking last active timestamp...", self.cr.name);
+                                let last_active = self.last_active.load(Ordering::SeqCst);
+                                let now = Utc::now().timestamp_millis();
+                                let diff = now - last_active;
+                                let is_idle = diff > threshold.as_millis() as i64;
+                                let _ = reply_tx.send(is_idle);
+                                tracing::warn!("Operator '{}' idle check: last_active={}, now={}, diff={}ms, threshold={}ms, is_idle={}", self.cr.name, last_active, now, diff, threshold.as_millis(), is_idle);
+                            },
                         }
                     } else {
                         info!("Command channel for operator '{}' was closed, shutting down command handler.", self.cr.name);
+                    }
+                }
+
+                _ = tokio::task::yield_now(), if self.is_loaded() => {
+                    // If no commands are received, yield to allow other tasks to run
+                    if let Err(e) = self.clone().run_until_stalled().await {
+                        let error = format!("Operator '{}' crashed during run loop: {}", self.cr.name, e);
+                        let _ = self.throw_fatal_error::<()>(&error).await;
+                        error!("{}", error);
                     }
                 }
             }
         }
     }
 
-    pub async fn is_loaded(&self) -> bool {
+    pub fn is_loaded(&self) -> bool {
         if let Ok(state_guard) = self.state.try_read() {
             matches!(*state_guard, OperatorState::Loaded(_))
         } else {
@@ -289,15 +310,15 @@ impl WasmOperatorRuntime {
 
     async fn unload(&self) -> Result<()> {
         // Stop the operator's async runtime and wait for it to finish
-        let (ack_tx, ack_rx) = oneshot::channel();
-        let runner_tx = self.runner_tx.clone();
-        runner_tx
-            .send(ack_tx)
-            .await
-            .context("Failed to send stop signal to operator loop")?;
-        ack_rx
-            .await
-            .context("Failed to receive acknowledgment from operator loop")?;
+        // let (ack_tx, ack_rx) = oneshot::channel();
+        // let runner_tx = self.runner_tx.clone();
+        // runner_tx
+        //     .send(ack_tx)
+        //     .await
+        //     .context("Failed to send stop signal to operator loop")?;
+        // ack_rx
+        //     .await
+        //     .context("Failed to receive acknowledgment from operator loop")?;
 
         // Acquire write lock and extract the loaded state
         let mut state_guard = self.state.write().await;
@@ -309,7 +330,14 @@ impl WasmOperatorRuntime {
         let mut store_guard = loaded_state.store.lock().await;
 
         // Serialize the linear memory of the WASM component
+        let now = Instant::now();
         let memory_data = store_guard.get_snapshot()?;
+        tracing::warn!(
+            "Serialized {} bytes of memory for operator '{}' in {:?}",
+            memory_data.len(),
+            self.cr.name,
+            now.elapsed()
+        );
 
         self.stats.record_memory_usage(memory_data.len() as u32);
 
@@ -359,8 +387,15 @@ impl WasmOperatorRuntime {
 
         // Restore the memory of the operator if a save file exists
         if unloaded_state.state_path.exists() {
+            let now = Instant::now();
             let saved_state = tokio::fs::read(&unloaded_state.state_path).await?;
             store.set_snapshot(&saved_state)?;
+            tracing::warn!(
+                "Restored {} bytes of memory for operator '{}' in {:?}",
+                saved_state.len(),
+                self.cr.name,
+                now.elapsed()
+            );
 
             info!(
                 "Successfully restored memory state for operator {}",
@@ -387,7 +422,7 @@ impl WasmOperatorRuntime {
         let duration = start_load.elapsed().as_millis();
         self.stats.record_load_duration(duration as u32);
 
-        self.run_until_unloaded();
+        //self.run_until_unloaded();
 
         Ok(())
     }
@@ -571,72 +606,45 @@ impl WasmOperatorRuntime {
         }
     }
 
-    fn run_until_unloaded(self: &Arc<Self>) {
-        let self_clone = self.clone();
-        self.task_tracker.spawn(async move {
-            let mut runner_rx_guard = match self_clone.runner_rx.try_lock() {
-                Ok(guard) => guard,
-                // There was already a runner loop running, we don't need to start another one
-                Err(e) => {
-                    error!("Operator '{}' already has a runner loop running, not starting another one: {}", self_clone.cr.name, e);
-                    return;
-                },
-            };
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = self_clone.shutdown_token.cancelled() => {
-                        info!("Operator '{}' received shutdown signal, stopping operator loop.", self_clone.cr.name);
-                        return;
-                    }
-
-                    Some(ack_tx) = runner_rx_guard.recv() => {
-                        debug!("Operator '{}' received stop signal for operator loop to unload", self_clone.cr.name);
-                        let _ = ack_tx.send(());
-                        return;
-                    }
-
-                    _ = tokio::task::yield_now() => {
-                        let owned_state_guard = self_clone.state.clone().read_owned().await;
-                        let result = tokio::task::spawn_blocking(move || {
-                            match &*owned_state_guard {
-                                OperatorState::Unloaded(_) => None,
-                                OperatorState::Loaded(ref loaded_state) => {
-                                    let operator = &loaded_state.operator;
-                                    let mut store = loaded_state.store.blocking_lock();
-                                    let result = operator.wasi_cli_run().call_run(&mut *store);
-                                    Some(result)
-                                }
-                            }
-                        }).await;
-
-                        match result {
-                            // Operator was unloaded
-                            Ok(None) => {
-                                info!("Operator '{}' has been unloaded, stopping operator loop.", self_clone.cr.name);
-                                return;
-                            }
-                            // Operator execution failed
-                            Ok(Some(Err(e))) => {
-                                let error = format!("Operator '{}' crashed during run loop: {}", self_clone.cr.name, e);
-                                let _ = self_clone.throw_fatal_error::<()>(&error).await;
-                                error!("{}", error);
-                                return;
-                            }
-                            // Tokio join error (e.g. thread panic)
-                            Err(join_err) => {
-                                let error = format!("Blocking task for operator '{}' panicked or failed: {}", self_clone.cr.name, join_err);
-                                let _ = self_clone.throw_fatal_error::<()>(&error).await;
-                                error!("{}", error);
-                                return;
-                            }
-                            // Successful execution
-                            Ok(Some(Ok(_))) => {}
-                        }
-                    }
-                }
+    async fn run_until_stalled(self: &Arc<Self>) -> Result<()> {
+        let owned_state_guard = self.state.clone().read_owned().await;
+        let result = tokio::task::spawn_blocking(move || match &*owned_state_guard {
+            OperatorState::Unloaded(_) => None,
+            OperatorState::Loaded(ref loaded_state) => {
+                let operator = &loaded_state.operator;
+                let mut store = loaded_state.store.blocking_lock();
+                let result = operator.wasi_cli_run().call_run(&mut *store);
+                Some(result)
             }
-        });
+        })
+        .await;
+
+        let out = match result {
+            // Operator was unloaded
+            Ok(None) => {
+                info!(
+                    "Operator '{}' has been unloaded, stopping operator loop.",
+                    self.cr.name
+                );
+                Ok(())
+            }
+            // Operator execution failed
+            Ok(Some(Err(e))) => {
+                let error = format!("Operator '{}' crashed during run loop: {}", self.cr.name, e);
+                Err(anyhow::anyhow!(error))
+            }
+            // Tokio join error (e.g. thread panic)
+            Err(join_err) => {
+                let error = format!(
+                    "Blocking task for operator '{}' panicked or failed: {}",
+                    self.cr.name, join_err
+                );
+                Err(anyhow::anyhow!(error))
+            }
+            // Successful execution
+            Ok(Some(Ok(_))) => Ok(()),
+        };
+        out
     }
 
     async fn stop_execution(&self) {
@@ -698,21 +706,24 @@ impl WasmOperatorRuntime {
             return Err(anyhow::anyhow!("Operator is not in a loaded state"));
         };
 
-        self.update_last_active();
-
         // Execute the function
         let mut store_guard = loaded_state.store.lock().await;
-        tokio::task::block_in_place(|| f(&loaded_state.operator, &mut store_guard))
+        let result = tokio::task::block_in_place(|| f(&loaded_state.operator, &mut store_guard));
+
+        self.update_last_active();
+        result
     }
 
     pub async fn is_idle(&self, threshold: Duration) -> bool {
-        if !self.is_loaded().await {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Err(e) = self.cmd_tx.send(WORCommand::CheckIdle(threshold, tx)) {
+            error!(
+                "Failed to send CheckIdle command to operator '{}': {}",
+                self.cr.name, e
+            );
             return false;
         }
-        let now = Utc::now().timestamp_millis();
-        let last_active = self.last_active.load(Ordering::SeqCst);
-        let elapsed = now - last_active;
-        return elapsed > threshold.as_millis() as i64;
+        rx.await.unwrap_or(false)
     }
 
     pub async fn get_reconcile_history(&self) -> Vec<DateTime<Utc>> {

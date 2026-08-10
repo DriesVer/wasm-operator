@@ -1026,7 +1026,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
 
                             for (operator, op_accepts_bookmarks) in &op_list {
                                 if let WatchEvent::Bookmark(_) = &watch_event {
-                                    if !op_accepts_bookmarks || !operator.is_loaded().await {
+                                    if !op_accepts_bookmarks {
                                         continue;
                                     }
                                 }
