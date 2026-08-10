@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use kube::{Resource, ResourceExt};
 use serde_json;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -132,6 +133,15 @@ impl WasmOperatorRuntime {
     }
 
     async fn handle_commands_loop(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<WORCommand>) {
+        let mut watch_events: VecDeque<(
+            bindings::local::kube::api::WatchId,
+            bindings::local::kube::api::WatchEvent,
+        )> = VecDeque::new();
+        let mut latest_bookmark: Option<(
+            bindings::local::kube::api::WatchId,
+            bindings::local::kube::api::WatchEvent,
+        )> = None;
+
         loop {
             tokio::select! {
                 biased;
@@ -155,6 +165,11 @@ impl WasmOperatorRuntime {
                                 self.clone().load_at(timestamp).await;
                             },
                             WORCommand::Unload => {
+                                // Prevent operator from unloading if there are pending watch events to process
+                                if !watch_events.is_empty() {
+                                    self.update_last_active();
+                                    continue;
+                                }
                                 if let Err(e) = self.unload().await {
                                     let error = format!("Failed to unload: {}", e);
                                     let _ = self.throw_fatal_error::<()>(&error).await;
@@ -163,6 +178,12 @@ impl WasmOperatorRuntime {
                                 }
                             },
                             WORCommand::Pause => {
+                                // Prevent operator from pasuing if there are pending watch events to process
+                                // TODO: change this to that the operator will take the unfinished watch events with it
+                                if !watch_events.is_empty() {
+                                    self.update_last_active();
+                                    continue;
+                                }
                                 if let Err(e) = self.pause().await {
                                     let error = format!("Failed to pause: {}", e);
                                     let _ = self.throw_fatal_error::<()>(&error).await;
@@ -178,28 +199,20 @@ impl WasmOperatorRuntime {
                             },
                             WORCommand::ProcessWatchEvent(id, watch_event) => {
                                 if let bindings::local::kube::api::WatchEvent::Bookmark(_) = &watch_event {
-                                    if !self.is_loaded() {
-                                        continue;
-                                    }
-                                }
-
-                                let result = self.clone().execute_via_wit(
-                                    |operator, store| {
-                                        // Call the WIT function to process the watch event (wakes up the operator if it was waiting for events)
-                                        let res = operator.call_receive_watch_event(&mut *store, id, &watch_event).map_err(anyhow::Error::from);
-                                        res
-                                    }
-                                ).await;
-
-                                if let Err(e) = result {
-                                    let error = format!("Operator '{}' crashed during watch event processing: {:?}", self.cr.name, e);
-                                    let _ = self.throw_fatal_error::<()>(&error).await;
-                                    error!("{}", error);
-                                    return;
+                                    latest_bookmark = Some((id, watch_event));
+                                } else {
+                                    watch_events.push_back((id, watch_event));
+                                    latest_bookmark = None; // Bookmark is not relevant if there is a newer normal event
                                 }
                             },
                             WORCommand::CheckIdle(threshold, reply_tx) => {
+                                if !watch_events.is_empty() {
+                                    // Operator still needs to process watch events
+                                    let _ = reply_tx.send(false);
+                                    continue;
+                                }
                                 if !self.is_loaded() {
+                                    // Operator is not loaded so cannot be idle
                                     let _ = reply_tx.send(false);
                                     continue;
                                 }
@@ -212,15 +225,45 @@ impl WasmOperatorRuntime {
                         }
                     } else {
                         info!("Command channel for operator '{}' was closed, shutting down command handler.", self.cr.name);
+                        return;
                     }
                 }
 
-                _ = tokio::task::yield_now(), if self.is_loaded() => {
-                    // If no commands are received, yield to allow other tasks to run
-                    if let Err(e) = self.clone().run_until_stalled().await {
-                        let error = format!("Operator '{}' crashed during run loop: {}", self.cr.name, e);
-                        let _ = self.throw_fatal_error::<()>(&error).await;
-                        error!("{}", error);
+                _ = tokio::task::yield_now(), if self.is_loaded() || !watch_events.is_empty() => {
+                    if let Some((id, watch_event)) = watch_events.pop_front() {
+                        let result = self.clone().execute_via_wit(
+                            |operator, store| {
+                                operator.call_receive_watch_event(&mut *store, id, &watch_event).map_err(anyhow::Error::from)
+                            }
+                        ).await;
+
+                        if let Err(e) = result {
+                            let error = format!("Operator '{}' crashed during watch event processing: {:?}", self.cr.name, e);
+                            let _ = self.throw_fatal_error::<()>(&error).await;
+                            error!("{}", error);
+                            return;
+                        }
+                    } else if self.is_loaded() && latest_bookmark.is_some() {
+                        let (id, watch_event) = latest_bookmark.take().unwrap();
+                        let result = self.clone().execute_via_wit(
+                            |operator, store| {
+                                operator.call_receive_watch_event(&mut *store, id, &watch_event).map_err(anyhow::Error::from)
+                            }
+                        ).await;
+
+                        if let Err(e) = result {
+                            let error = format!("Operator '{}' crashed during watch event processing: {:?}", self.cr.name, e);
+                            let _ = self.throw_fatal_error::<()>(&error).await;
+                            error!("{}", error);
+                            return;
+                        }
+                    } else {
+                        // If no commands are received, yield to allow other tasks to run
+                        if let Err(e) = self.clone().run_until_stalled().await {
+                            let error = format!("Operator '{}' crashed during run loop: {}", self.cr.name, e);
+                            let _ = self.throw_fatal_error::<()>(&error).await;
+                            error!("{}", error);
+                        }
                     }
                 }
             }
