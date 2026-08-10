@@ -29,6 +29,7 @@ pub mod wasmoperator;
 
 // TODO: move all environment variable parsing into a single file
 
+// TODO: split this env for cache and swap paths into separate env vars, so that they can be configured independently
 pub const WASMOP_CACHE_DIR: &str = match option_env!("WASMOP_CACHE_DIR") {
     Some(path) => path,
     None => "/tmp/wasmop-cache",

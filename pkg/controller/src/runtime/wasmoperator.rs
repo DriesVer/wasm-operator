@@ -30,6 +30,8 @@ const STATUS_PATCH_THROTTLE_DURATION: Duration = Duration::from_secs(5);
 
 pub type OperatorUid = String;
 
+// TODO: add wasm_hash to wasmoperator CRD
+
 // This struct is a reduced version of the WasmOperator CRD that only contains the fields relevant for the runtime, this way we can reduce the memory usage of one WasmOperatorRuntime instance by not storing the entire CRD spec in memory.
 pub struct WasmOperatorReduced {
     pub name: String,
@@ -37,6 +39,7 @@ pub struct WasmOperatorReduced {
     pub uid: OperatorUid,
 
     pub wasm: WasmSource,
+    pub wasm_hash: Mutex<Option<String>>,
     pub env: Vec<EnvironmentVariable>,
     pub args: Vec<String>,
 }
@@ -47,6 +50,7 @@ impl From<&WasmOperatorCR> for WasmOperatorReduced {
             generation: cr.metadata.generation,
             uid: cr.uid().unwrap(),
             wasm: cr.spec.wasm.clone(),
+            wasm_hash: Mutex::new(None),
             env: cr.spec.env.clone(),
             args: cr.spec.args.clone(),
         }
@@ -262,12 +266,21 @@ impl WasmOperatorRuntime {
         Err(anyhow::anyhow!(message.to_string()))
     }
 
-    fn get_cache_path(&self) -> PathBuf {
+    fn get_swap_path(&self) -> PathBuf {
         PathBuf::from(format!(
-            "{}/{}_{}",
+            "{}/memory/{}_{}.mem",
             WASMOP_CACHE_DIR,
             self.cr.uid,
             self.cr.generation.unwrap_or(0)
+        ))
+    }
+
+    async fn get_cache_path(&self) -> PathBuf {
+        let wasm_hash = self.cr.wasm_hash.lock().await.clone().unwrap_or_default();
+        let target_arch = Triple::host();
+        PathBuf::from(format!(
+            "{}/binaries/{}_{}.cwasm",
+            WASMOP_CACHE_DIR, wasm_hash, target_arch
         ))
     }
 
@@ -305,7 +318,9 @@ impl WasmOperatorRuntime {
         );
 
         // Write state to memory to a file
-        let state_path = self.get_cache_path().join("state.mem");
+        let state_path = self.get_swap_path();
+
+        // TODO: move this to a Lazy static or similar to avoid trying to create the directory every time
         if let Some(parent) = state_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -404,62 +419,108 @@ impl WasmOperatorRuntime {
         });
     }
 
-    async fn load_wasm_instance(self: Arc<Self>) -> Result<(bindings::Wasmoperator, Store<State>)> {
+    async fn load_cached_cwasm_file(&self, cache_path: &PathBuf) -> Result<Component> {
         let wasmtime_engine = wasmtime::Engine::global().await?;
+        let component_bytes = tokio::fs::read(cache_path).await?;
+        unsafe {
+            Component::deserialize(wasmtime_engine, &component_bytes).map_err(|e| {
+                let _ = std::fs::remove_file(cache_path);
+                anyhow::anyhow!(
+                    "Failed to deserialize cached component '{:?}': {}",
+                    cache_path,
+                    e
+                )
+            })
+        }
+    }
 
-        let target_arch = Triple::host();
-        let cache_path = self.get_cache_path().join(format!("{}.cwasm", target_arch));
-        let component = if cache_path.exists() {
-            info!(
-                "Found cached component for operator '{}', loading from cache...",
+    pub async fn get_or_compile_component(&self) -> Result<Component> {
+        // Get hash or compute it if not present
+        let mut wasm_hash_guard = self.cr.wasm_hash.lock().await;
+        let wasm_bytes = if wasm_hash_guard.is_none() {
+            debug!(
+                "No hash found for operator '{}', computing hash...",
                 self.cr.name
             );
-            let component_bytes = std::fs::read(&cache_path)?;
-            (unsafe {
-                Component::deserialize(&wasmtime_engine, &component_bytes).map_err(|e| {
-                    std::fs::remove_file(&cache_path).ok();
-                    anyhow::anyhow!(
-                        "Failed to deserialize cached component '{:?}': {}",
-                        cache_path,
-                        e
-                    )
-                })
-            })?
+            let bytes: Vec<u8> = self
+                .load_wasm_file()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            *wasm_hash_guard = Some(hash);
+            Some(bytes)
         } else {
-            info!(
-                "No cached component found for operator '{}', compiling from wasm...",
-                self.cr.name
-            );
-            let wasm_bytes = match self.load_wasm_file() {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    return self.throw_fatal_error(&e.to_string()).await;
+            None
+        };
+        drop(wasm_hash_guard);
+
+        let cache_path = self.get_cache_path().await;
+
+        if cache_path.exists() {
+            match self.load_cached_cwasm_file(&cache_path).await {
+                Ok(component) => {
+                    debug!(
+                        "Found cached component for operator '{}', loaded from cache.",
+                        self.cr.name
+                    );
+                    return Ok(component);
                 }
-            };
-            let component = match Component::new(&wasmtime_engine, &wasm_bytes) {
-                Ok(c) => c,
                 Err(e) => {
-                    let error = format!(
-                        "Failed to compile wasm for operator '{}': {}",
+                    error!(
+                        "Corrupt or invalid cache for operator '{}', recompiling: {}",
                         self.cr.name, e
                     );
-                    return self.throw_fatal_error(&error).await;
                 }
-            };
-            let component_bytes: Vec<u8> = component.serialize()?;
+            }
+        }
 
-            if let Some(parent) = cache_path.parent() {
-                std::fs::create_dir_all(parent).context(format!(
+        // Load bytes (if not loaded during hash generation) and compile
+        info!(
+            "No valid cached component found for operator '{}', compiling from WASM...",
+            self.cr.name
+        );
+        let wasm_bytes = match wasm_bytes {
+            Some(bytes) => bytes,
+            None => self
+                .load_wasm_file()
+                .map_err(|e| anyhow::anyhow!("{}", e))?,
+        };
+
+        let wasmtime_engine = wasmtime::Engine::global().await?;
+        let component = Component::new(wasmtime_engine, &wasm_bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to compile WASM for operator '{}': {}",
+                self.cr.name,
+                e
+            )
+        })?;
+
+        // Cache the compiled cwasm
+        let component_bytes = component.serialize()?;
+        if let Some(parent) = cache_path.parent() {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!(
                     "Failed to create cache directory structure for {}",
                     self.cr.name
-                ))?;
-            }
-            std::fs::write(cache_path, component_bytes).context(format!(
-                "Failed to write compiled cwasm for component {}",
-                self.cr.name
-            ))?;
-            component
-        };
+                )
+            })?;
+        }
+
+        tokio::fs::write(&cache_path, component_bytes)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to write compiled cwasm for component {}",
+                    self.cr.name
+                )
+            })?;
+
+        Ok(component)
+    }
+
+    async fn load_wasm_instance(self: Arc<Self>) -> Result<(bindings::Wasmoperator, Store<State>)> {
+        let component = self.get_or_compile_component().await?;
+
+        let wasmtime_engine = wasmtime::Engine::global().await?;
 
         let wasi_ctx = WasiCtxBuilder::new()
             .inherit_stdio()
@@ -480,10 +541,10 @@ impl WasmOperatorRuntime {
             wasi_ctx,
             resources: Default::default(),
         };
+
         let mut store = Store::new(wasmtime_engine, state);
 
         let mut linker = Linker::new(wasmtime_engine);
-
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
         bindings::Wasmoperator::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
 
@@ -609,9 +670,13 @@ impl WasmOperatorRuntime {
     async fn shutdown(&self) -> Result<()> {
         info!("Shutting down operator '{}'...", self.cr.name);
         self.stop_execution().await;
-        let cache_path = self.get_cache_path();
+        let cache_path = self.get_cache_path().await;
         if cache_path.exists() {
-            std::fs::remove_dir_all(&cache_path)?;
+            std::fs::remove_file(&cache_path).ok();
+        }
+        let state_path = self.get_swap_path();
+        if state_path.exists() {
+            std::fs::remove_file(&state_path).ok();
         }
         Ok(())
     }

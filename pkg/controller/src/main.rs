@@ -15,7 +15,6 @@ use std::env;
 
 use kubernetes::KubernetesService;
 use runtime::MainController;
-#[cfg(unix)]
 use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
