@@ -459,15 +459,17 @@ impl WasmOperatorRuntime {
     async fn load_cached_cwasm_file(&self, cache_path: &PathBuf) -> Result<Component> {
         let wasmtime_engine = wasmtime::Engine::global().await?;
         let component_bytes = tokio::fs::read(cache_path).await?;
-        unsafe {
-            Component::deserialize(wasmtime_engine, &component_bytes).map_err(|e| {
-                let _ = std::fs::remove_file(cache_path);
-                anyhow::anyhow!(
+        let res = unsafe { Component::deserialize(wasmtime_engine, &component_bytes) };
+        match res {
+            Ok(comp) => Ok(comp),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(cache_path).await;
+                Err(anyhow::anyhow!(
                     "Failed to deserialize cached component '{:?}': {}",
                     cache_path,
                     e
-                )
-            })
+                ))
+            }
         }
     }
 
@@ -479,9 +481,7 @@ impl WasmOperatorRuntime {
                 "No hash found for operator '{}', computing hash...",
                 self.cr.name
             );
-            let bytes: Vec<u8> = self
-                .load_wasm_file()
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let bytes: Vec<u8> = self.load_wasm_file().await?;
             let hash = blake3::hash(&bytes).to_hex().to_string();
             *wasm_hash_guard = Some(hash);
             Some(bytes)
@@ -517,9 +517,7 @@ impl WasmOperatorRuntime {
         );
         let wasm_bytes = match wasm_bytes {
             Some(bytes) => bytes,
-            None => self
-                .load_wasm_file()
-                .map_err(|e| anyhow::anyhow!("{}", e))?,
+            None => self.load_wasm_file().await?,
         };
 
         let wasmtime_engine = wasmtime::Engine::global().await?;
@@ -590,7 +588,7 @@ impl WasmOperatorRuntime {
         Ok((operator, store))
     }
 
-    fn load_wasm_file(&self) -> Result<Vec<u8>> {
+    async fn load_wasm_file(&self) -> Result<Vec<u8>> {
         match self.cr.wasm.clone() {
             WasmSource::Pvc { path, file } => {
                 debug!(
@@ -598,7 +596,7 @@ impl WasmOperatorRuntime {
                     path, file
                 );
                 let path = std::path::Path::new(&path).join(&file);
-                std::fs::read(&path).context(format!(
+                tokio::fs::read(&path).await.context(format!(
                     "Failed to read WASM file '{}' from PVC path '{:?}'",
                     &file, &path
                 ))
@@ -660,13 +658,15 @@ impl WasmOperatorRuntime {
         info!("Shutting down operator '{}'...", self.cr.name);
         self.stop_execution().await;
         let cache_path = self.get_cache_path().await;
-        if cache_path.exists() {
-            std::fs::remove_file(&cache_path).ok();
-        }
         let state_path = self.get_swap_path();
-        if state_path.exists() {
-            std::fs::remove_file(&state_path).ok();
-        }
+        tokio::join!(
+            async {
+                let _ = tokio::fs::remove_file(cache_path).await;
+            },
+            async {
+                let _ = tokio::fs::remove_file(state_path).await;
+            },
+        );
         Ok(())
     }
 

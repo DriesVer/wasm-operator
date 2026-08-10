@@ -33,6 +33,12 @@ fn main() -> anyhow::Result<()> {
 
     let worker_threads = cores.max(2); // Ensure at least 2 async threads for the runtime
 
+    tracing::info!(
+        "Detected {} CPU cores, using {} worker threads for the async runtime.",
+        cores,
+        worker_threads
+    );
+
     let global_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .enable_all()
