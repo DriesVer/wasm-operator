@@ -96,6 +96,7 @@ pub struct WasmOperatorRuntime {
     shutdown_token: CancellationToken,
     shutdown_tx: mpsc::Sender<OperatorUid>, // Channel to signal the operator is shutting down
     last_active: AtomicI64,
+    executed_idle: AtomicI64,
 
     stats: WasmOperatorStatisticsRecorder,
     last_patch_time: Mutex<Instant>,
@@ -120,6 +121,7 @@ impl WasmOperatorRuntime {
             shutdown_token: CancellationToken::new(),
             shutdown_tx,
             last_active: AtomicI64::new(0),
+            executed_idle: AtomicI64::new(0),
             stats: WasmOperatorStatisticsRecorder::new(),
             last_patch_time: Mutex::new(Instant::now() - STATUS_PATCH_THROTTLE_DURATION * 2),
         });
@@ -216,10 +218,21 @@ impl WasmOperatorRuntime {
                                     let _ = reply_tx.send(false);
                                     continue;
                                 }
+                                let threshold = threshold.as_millis() as i64;
+
+                                // Check if operator has been long enough in loaded state
                                 let last_active = self.last_active.load(Ordering::SeqCst);
                                 let now = Utc::now().timestamp_millis();
                                 let diff = now - last_active;
-                                let is_idle = diff > threshold.as_millis() as i64;
+                                let is_active_long = diff > threshold;
+
+                                // Check if operator has been executing for too long without yielding
+                                let executed_idle = self.executed_idle.load(Ordering::SeqCst);
+                                // TODO: make this maybe another configurable threshold, or maybe a percentage of the threshold
+                                let is_executing_idle = executed_idle > threshold/4;
+
+                                let is_idle = is_active_long && is_executing_idle;
+
                                 let _ = reply_tx.send(is_idle);
                             },
                         }
@@ -621,6 +634,8 @@ impl WasmOperatorRuntime {
 
     async fn run_until_stalled(self: &Arc<Self>) -> Result<()> {
         let owned_state_guard = self.state.clone().read_owned().await;
+
+        let start_time = Instant::now();
         let result = tokio::task::spawn_blocking(move || match &*owned_state_guard {
             OperatorState::Unloaded(_) => None,
             OperatorState::Loaded(ref loaded_state) => {
@@ -631,6 +646,9 @@ impl WasmOperatorRuntime {
             }
         })
         .await;
+
+        let elapsed_ms = start_time.elapsed().as_millis() as i64;
+        self.executed_idle.fetch_add(elapsed_ms, Ordering::SeqCst);
 
         let out = match result {
             // Operator was unloaded
@@ -696,6 +714,7 @@ impl WasmOperatorRuntime {
     pub fn update_last_active(&self) {
         let now_ms: i64 = Utc::now().timestamp_millis();
         self.last_active.store(now_ms, Ordering::SeqCst);
+        self.executed_idle.store(0, Ordering::SeqCst);
     }
 
     pub async fn execute_via_wit<F, T>(self: Arc<Self>, f: F) -> Result<T>
