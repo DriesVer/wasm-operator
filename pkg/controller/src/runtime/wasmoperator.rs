@@ -132,7 +132,7 @@ impl WasmOperatorRuntime {
         });
 
         let self_clone = self_.clone();
-        self_.task_tracker.spawn(async move {
+        tokio::spawn(async move {
             self_clone.handle_commands_loop(wasm_op_rx).await;
         });
 
@@ -210,8 +210,11 @@ impl WasmOperatorRuntime {
     }
 
     pub async fn is_loaded(&self) -> bool {
-        let state_guard = self.state.read().await;
-        matches!(*state_guard, OperatorState::Loaded(_))
+        if let Ok(state_guard) = self.state.try_read() {
+            matches!(*state_guard, OperatorState::Loaded(_))
+        } else {
+            false
+        }
     }
 
     async fn patch_k8s_status(&self, state: WasmOperatorState) -> Result<()> {
@@ -285,14 +288,6 @@ impl WasmOperatorRuntime {
     }
 
     async fn unload(&self) -> Result<()> {
-        // Acquire write lock and extract the loaded state
-        let mut state_guard = self.state.write().await;
-        let loaded_state = if let OperatorState::Loaded(ref state) = *state_guard {
-            state.clone()
-        } else {
-            return Ok(());
-        };
-
         // Stop the operator's async runtime and wait for it to finish
         let (ack_tx, ack_rx) = oneshot::channel();
         let runner_tx = self.runner_tx.clone();
@@ -304,6 +299,13 @@ impl WasmOperatorRuntime {
             .await
             .context("Failed to receive acknowledgment from operator loop")?;
 
+        // Acquire write lock and extract the loaded state
+        let mut state_guard = self.state.write().await;
+        let loaded_state = if let OperatorState::Loaded(ref state) = *state_guard {
+            state.clone()
+        } else {
+            return Ok(());
+        };
         let mut store_guard = loaded_state.store.lock().await;
 
         // Serialize the linear memory of the WASM component
@@ -595,27 +597,6 @@ impl WasmOperatorRuntime {
                     }
 
                     _ = tokio::task::yield_now() => {
-                        // let state_guard = self_clone.state.read().await;
-                        // if let OperatorState::Unloaded(_) = *state_guard {
-                        //     info!("Operator '{}' has been unloaded, stopping operator loop.", self_clone.cr.name);
-                        //     return;
-                        // }
-                        // if let OperatorState::Loaded(ref loaded_state) = *state_guard {
-                        //     let operator = &loaded_state.operator;
-                        //     let mut store = loaded_state.store.lock().await;
-                        //     let result = tokio::task::block_in_place(|| {
-                        //         let result = operator.wasi_cli_run().call_run(&mut *store);
-                        //         result
-                        //     });
-                        // 
-                        //     if let Err(e) = result {
-                        //         let error = format!("Operator '{}' crashed during run loop: {}", self_clone.cr.name, e);
-                        //         let _ = self_clone.throw_fatal_error::<()>(&error).await;
-                        //         error!("{}", error);
-                        //         return;
-                        //     }
-                        // }
-
                         let owned_state_guard = self_clone.state.clone().read_owned().await;
                         let result = tokio::task::spawn_blocking(move || {
                             match &*owned_state_guard {
