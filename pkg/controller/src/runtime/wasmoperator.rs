@@ -24,8 +24,9 @@ use crate::kubernetes::crd::{
 };
 use crate::kubernetes::KubernetesService;
 use crate::runtime::stats::WasmOperatorStatisticsRecorder;
-use crate::runtime::CONTROLLER_UUID;
-use crate::runtime::{WasmEngineSingleton, WASMOP_CACHE_DIR};
+use crate::runtime::{
+    GlobalMonotonicClock, WasmEngineSingleton, CONTROLLER_UUID, WASMOP_CACHE_DIR,
+};
 
 // TODO: make this configurable via env var
 const STATUS_PATCH_THROTTLE_DURATION: Duration = Duration::from_secs(5);
@@ -788,22 +789,5 @@ impl WasmOperatorRuntime {
 
     pub async fn get_reconcile_history(&self) -> Vec<DateTime<Utc>> {
         self.stats.get_recent_reconcile_history().await
-    }
-}
-
-// TODO: move to wasmengine.rs
-use std::sync::OnceLock;
-static HOST_MONOTONIC_START: OnceLock<Instant> = OnceLock::new();
-
-struct GlobalMonotonicClock;
-
-impl wasmtime_wasi::HostMonotonicClock for GlobalMonotonicClock {
-    fn resolution(&self) -> u64 {
-        1_000_000 // 1ms resolution, safe bet for most systems, (Most systems are ns, even browsers are couple microseconds)
-    }
-
-    fn now(&self) -> u64 {
-        let start = HOST_MONOTONIC_START.get_or_init(Instant::now);
-        start.elapsed().as_nanos() as u64
     }
 }

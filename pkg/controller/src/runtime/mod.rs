@@ -4,23 +4,21 @@
 //! It manages the Wasmtime engine and orchestrates the execution of individual Wasm components,
 //! ensuring they can interact with the Kubernetes API and other host functionalities.
 
-use crate::prediction::{get_next_reconcile_prediction, PredictionModel};
-use crate::runtime::watcher::watcher;
 use std::sync::Arc;
 use std::time::Duration;
-
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::StreamExt;
-use kube::runtime::watcher::{self, Event};
+use kube::runtime::watcher;
+use kube::runtime::watcher::Event;
 use kube::ResourceExt;
 use tokio::sync::{OnceCell, mpsc};
 use tracing::{debug, error, info, warn};
 
-
+use crate::prediction::{get_next_reconcile_prediction, PredictionModel};
 use crate::kubernetes::crd::WasmOperator as WasmOperatorCRD;
 use crate::kubernetes::KubernetesService;
-use crate::runtime::wasmengine::WasmEngineSingleton;
+use crate::runtime::wasmengine::{WasmEngineSingleton,GlobalMonotonicClock};
 use crate::runtime::wasmoperator::{OperatorUid, WORCommand, WasmOperatorReduced, WasmOperatorRuntime};
 
 mod stats;

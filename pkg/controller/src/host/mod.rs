@@ -6,4 +6,6 @@
 //! access and resource management.
 
 pub mod api;
+pub mod helper;
 pub mod state;
+pub mod watch_stream_handler;
