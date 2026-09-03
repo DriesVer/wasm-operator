@@ -1,3 +1,0 @@
-[build.env]
-passthrough = ["COMPILE_NONCE","COMPILE_WITH_UNINSTANTIATE"]
-
