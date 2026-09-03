@@ -11,6 +11,8 @@ For more information, read the paper [Adapting Kubernetes controllers to the edg
 This project builds upon [this proof of concept](https://github.com/slinkydeveloper/extending-kubernetes-api-in-process-poc).
 
 ```text
+TODO: layout repo
+
 +-- 📂controllers                       # All child operators / components used for testing
 |   +-- 📂comb-rust-controller          # Rust combined operator (no isolation)
 |   +-- 📂ring-go-controller            # Go operator (container-based)

@@ -1,102 +1,167 @@
-# Setup of the WASM-operator
+# Setting Up the WASM-Operator
 
-The project is setup with automated scripts that manage this process automatically.
-This guide however allows to fine-tune the deployment and to gain a better understanding of the project.
-We will highlight which shell file automates the process
+This guide walks you through setting up the WASM-operator using the project's Development CLI. You can also perform these steps manually if your cluster requires a custom configuration.
+
+To get started, load the Development CLI helper script by sourcing it from the root of the repository:
+
+```sh
+source ./devel/cli.sh
+```
+
+## Cloning the Repository
+
+The repository relies on submodules. Clone it with the `--recurse-submodules` flag to ensure all nested components are checked out:
+
+```sh
+git clone --recurse-submodules git@github.com:DriesVer/wasm-operator.git
+```
+
+If you already cloned the repository without submodules, initialize and update them by running:
+
+```sh
+git submodule update --init --recursive
+```
 
 ## Dependencies
->
-> These are managed by [`devel/tool.sh`](../devel/tool.sh) and often installed (through curl in a local folder) when not present
 
-### Setting up the Kubernetes environment
+Make sure the following tools are installed on your host:
 
-- [Kind](https://kind.sigs.k8s.io/) - Used as a local, lightweight Kubernetes cluster
-- [Kubectl](https://kubernetes.io/docs/reference/kubectl/)
-- [Docker](https://www.docker.com/)
+- Kind
+- Kubectl
+- Docker
+- Rust
+- Cargo
+- Cargo Zigbuild (required on macOS)
 
-### Compiling the projects
-
-- [Rust](https://www.rust-lang.org/) - Required to build the parent controller and child controllers
-- [Cargo component](https://github.com/bytecodealliance/cargo-component) - Easier to build WASM with included interfaces
-- [Go](https://go.dev/) - Required to build the `ring-go-controller` which is used as a comparison
-- [Cross](https://crates.io/crates/cross) - Easier cross-compilation than with cargo, while providing isolation through Docker containers
-- [wasm-opt](https://github.com/WebAssembly/binaryen) - Required to optimize the WASM output from cross
-
-### Optional
-
-> - [sccache](https://github.com/mozilla/sccache) - Compiler caching tool which can be used to speed up compilation through setting `export RUSTC_WRAPPER=sccache`
-> - [Python3 + pip3](https://www.python.org/) - Can be used to setup the webserver for predictions locally
-
-### Tools mentioned in [`devel/tool.sh`](../devel/tool.sh), but not used
-
-- [sccache](https://github.com/mozilla/sccache)  
-  Automatically installed when executing a shell script from devel
-- [Python3 + pip3](https://www.python.org/)
-- [Helm](https://helm.sh/)
-- [kube-apiserver + etcd](https://github.com/kubernetes-sigs/kubebuilder)
-
-## Getting the source code
-
-```shell
-git clone --recurse-submodules git@github.com:idlab-discover/wasm-operator.git
-```
-
-## Creating a Kind cluster
-
-> Original file: [`devel/create_cluster.sh`](../devel/create_cluster.sh)
-
-**Kind** (Kubernetes IN Docker) is a tool designed to run Kubernetes clusters locally using Docker containers. It is lightweight, easy to configure, and ideal for testing and development environments.
-
-It is the recommended way of testing out the project and thus most tested.
-Be sure to create an issue if any problems arise on other Kubernetes environments however.
-
-The following code snippet creates a Kind cluster using our default config.
-This config does the following:
-
-- Mounts the containerd directory
-- Sets static values for the `dnsDomain`, `podSubnet` and `serviceSubnet`
-- Increases the `maxPods` setting for the kubelet to support up to 1100 pods
-- Enables performance improvement for etcd
+Verify your development environment with the CLI check tool:
 
 ```sh
-kind create cluster \
-  --name "wasm-operator" \
-  --config "./devel/kind-config.yaml"
+wasmop check
 ```
 
-## Setting up the Flask server
+## Cluster Setup
 
-> Original file: [`devel/setup_flask_server.sh`](../devel/setup_flask_server.sh)
-
-The Flask server is in order to enable prediction.
-It is deployed within our Kubernetes cluster and provides POST method "/prediction" to enable predictions on when to wake up.
-The code can be found in the `./prediction/webserver` directory.
-
-To build the docker container and load the image into Kind:
+For developing the WasmOperator framework or building child operators, we recommend a local Kind cluster. Start the interactive configuration wizard:
 
 ```sh
-docker build -t prediction_webserver:webserver ./prediction/webserver
-kind load docker-image --name wasm-operator prediction_webserver:webserver
+wasmop setup
 ```
 
-We then just need to create a Deployment + Service to deploy and expose our pod. This can be done using the following manifest:
+The interactive prompt will guide you through:
+
+- **Creating a Kind cluster (recommended):** Prompts for the cluster name.
+- **Directory mounting:** Mounts a host directory into the cluster. The `wasmop build child` command places compiled child operators here so the cluster can read them. You can use the local `./tests/wasm_source_dir` path.
+- **Installing WasmOperator CRD:** Applies the `WasmOperator` Custom Resource Definition to either the newly created Kind cluster or your current kubectl context. This step uses a helper Rust script which will automatically be compiled and executed.
+
+For this tutorial, enter the following values when prompted:
+
+- **Cluster name:** `wasmoperator`
+- **Mount a local directory:** `yes`
+- **Mount local directory:** `[Absolute path]/tests/wasm_source_dir`
+- **Container mount path:** `/mnt/host`
+
+> **Important:** If you mount a local host directory, ensure it is world-writable. The parent operator runs as a non-root user and needs write access:
 
 ```sh
-kubectl apply -f ./tests/yaml/deploymentFlask.yaml
+chmod 777 /tests/wasm_source_dir
 ```
 
-## Building the parent WASM-operator
+## Parent Controller Setup
 
-> Original file: [`devel/setup_wasm_rust_simple.sh`](../devel/setup_wasm_rust_simple.sh) / [`devel/setup_wasm_rust.sh`](../devel/setup_wasm_rust.sh)
-
-The operator can be built using cross. Setting the target to x86_64-unknown-linux-musl allows the binary to remain light weight and work on many Linux distributions due to static linking with musl libc.
-It is a great fit for the Docker image we're going to use: gcr.io/distroless/cc:nonroot
-
-The parent operator currently does not support loading child operators at runtime.
-Due to the difficulties with mounting volumes in Kubernetes environments, the operator image copies over the config file (wasm_config.yaml) and the WASM files for the child operators
+Install the target for `unknown-linux-musl` matching your system architecture:
 
 ```sh
-cd ./pkg/controller
-export COMPILE_WITH_UNINSTANTIATE=TRUE
-cross build --release --target=x86_64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl
 ```
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+```
+
+Next, ensure the musl development libraries and compiler toolchain are available. On Ubuntu/Debian, install them via `apt`:
+
+```sh
+sudo apt install -y musl musl-dev musl-tools build-essential
+```
+
+Build and load the parent controller into the cluster:
+
+```sh
+wasmop load parent wasmoperator
+```
+
+This command creates a controller pod that contains both the parent operator and a prediction webserver sidecar. It also provisions the necessary ServiceAccount, applies required RBAC rules, and binds the host directory volume.
+
+Verify that the controller started cleanly:
+
+```sh
+kubectl logs -f controller
+```
+
+The output should resemble:
+
+```
+Defaulted container "controller" out of: controller, prediction-sidecar
+2026-09-03T02:34:54.197029Z  INFO controller: Logging initialized with base level: debug
+2026-09-03T02:34:54.197204Z  INFO controller: HTTP logging level set to: info
+2026-09-03T02:34:54.197213Z  INFO controller: Kubernetes logging level set to: info
+2026-09-03T02:34:54.197257Z  INFO controller: Detected 4 CPU cores, using 4 worker threads for the async runtime.
+2026-09-03T02:34:54.258048Z DEBUG controller::runtime: Starting idle check loop with inactive threshold 5s and idle threshold 500ms
+```
+
+## Deploying Your First Child Operator
+
+Next, deploy the sample `simple-rust-operator`. This operator watches for `TestResource` custom resources and multiplies the resource's `factor` value by an internal execution counter, storing the result in the `outcome` field.
+
+Navigate to the example directory:
+
+```sh
+cd examples/simple-rust-operator/
+```
+
+Apply the `TestResource` CRD and grant the parent controller permissions to reconcile it:
+
+```sh
+kubectl apply -f test-manifests/TestResource_CRD.yaml
+kubectl apply -f test-manifests/rbac.yaml
+```
+
+Compile and register the child operator:
+
+```sh
+wasmop load child simple_rust_operator
+```
+
+This compiles the child operator to the `wasm32-wasip2` target, copies the WebAssembly code into the shared mount directory, and creates a corresponding `WasmOperator` custom resource. The parent operator will automatically detect the new resource and load the module.
+
+Check the parent controller logs to confirm the module loaded. Once ready, test reconciliation by creating a `TestResource`:
+
+```sh
+kubectl apply -f test-manifests/function1.yaml
+kubectl get testresource
+```
+
+The output should confirm the calculated result:
+
+```
+NAME        FACTOR   OUTCOME   LAST UPDATED
+function1   1        1         84s
+```
+
+Test state persistence by applying a second resource with a different factor. The child operator multiplies the factor by its internal counter (now `2`):
+
+```
+NAME        FACTOR   OUTCOME   LAST UPDATED
+function1   1        1         2m13s
+function2   10       20        1s
+```
+
+## Deploying Parent and Child Operators Concurrently
+
+To build and load both the parent controller and child operator in a single step, combine the commands:
+
+```sh
+wasmop load wasmoperator simple_rust_operator
+```
+
+If previous versions are active, this stops them and deploys the new builds. Other running child operators remain scheduled, though any in-memory state will reset when the parent operator restarts.
