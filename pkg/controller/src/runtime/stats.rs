@@ -29,6 +29,7 @@ impl<T> AsyncFixedFifoBuffer<T> {
         data.push_back(item);
     }
 
+    #[allow(unused)]
     async fn get_last_added(&self) -> Option<T>
     where
         T: Clone,
@@ -49,6 +50,7 @@ impl<T> AsyncFixedFifoBuffer<T> {
         }
     }
 
+    #[allow(unused)]
     async fn clear(&self) {
         let mut data = self.data.lock().await;
         data.clear();
@@ -61,8 +63,6 @@ pub struct WasmOperatorStatisticsRecorder {
     reconciles: [AtomicU16; 24], // Number of reconciles per hour (0-23) (max ~65000 reconciles per hour)
 
     reconcile_total: AtomicU64,
-    reconcile_total_duration_ms: AtomicU64,
-    reconcile_max_duration_ms: AtomicU32, // Max 49 days
 
     load_unload_op_total: AtomicU64,
     last_load_op: AtomicI64, // Unix timestamp in seconds of last load operation
@@ -89,8 +89,6 @@ impl WasmOperatorStatisticsRecorder {
             recent_reconcile_history: AsyncFixedFifoBuffer::new(25),
             reconciles: Default::default(),
             reconcile_total: AtomicU64::new(0),
-            reconcile_total_duration_ms: AtomicU64::new(0),
-            reconcile_max_duration_ms: AtomicU32::new(0),
             load_unload_op_total: AtomicU64::new(0),
             last_load_op: AtomicI64::new(0),
             load_total_duration_ms: AtomicU64::new(0),
@@ -104,7 +102,7 @@ impl WasmOperatorStatisticsRecorder {
         }
     }
 
-    pub async fn record_reconcile(&self, duration_ms: u32) {
+    pub async fn record_reconcile(&self) {
         let now = Utc::now().timestamp_millis();
         let last_reconcile = self
             .recent_reconcile_history
@@ -131,10 +129,6 @@ impl WasmOperatorStatisticsRecorder {
         // Update the reconcile count/duration stats
         self.reconciles[(now % 24) as usize].fetch_add(1, Ordering::Relaxed);
         self.reconcile_total.fetch_add(1, Ordering::Relaxed);
-        self.reconcile_total_duration_ms
-            .fetch_add(duration_ms as u64, Ordering::Relaxed);
-        self.reconcile_max_duration_ms
-            .fetch_max(duration_ms, Ordering::Relaxed);
     }
 
     pub fn record_load_duration(&self, duration_ms: u32) {
@@ -225,14 +219,6 @@ impl WasmOperatorStatisticsRecorder {
         (self.load_total_duration_ms.load(Ordering::Relaxed) / load_total) as u32
     }
 
-    fn get_reconcile_duration_msec_avg(&self) -> u32 {
-        let reconcile_total = self.reconcile_total.load(Ordering::Relaxed);
-        if reconcile_total == 0 {
-            return 0;
-        }
-        (self.reconcile_total_duration_ms.load(Ordering::Relaxed) / reconcile_total) as u32
-    }
-
     fn get_activity_ratio(&self) -> u8 {
         let idle_duration = self.idle_total_duration_s.load(Ordering::Relaxed);
         let running_duration = self.active_total_duration_s.load(Ordering::Relaxed);
@@ -265,8 +251,6 @@ impl WasmOperatorStatisticsRecorder {
             reconcile_cold_start_ratio: self.get_reconcile_cold_start_ratio(),
             wasm_load_duration_msec_avg: self.get_wasm_load_duration_msec_avg(),
             wasm_load_duration_msec_max: self.load_max_duration_ms.load(Ordering::Relaxed),
-            reconcile_duration_msec_avg: self.get_reconcile_duration_msec_avg(),
-            reconcile_duration_msec_max: self.reconcile_max_duration_ms.load(Ordering::Relaxed),
             memory_usage_bytes: self.memory_usage_bytes.load(Ordering::Relaxed),
             activity_ratio: self.get_activity_ratio(),
             idle_duration_sec_avg: self.get_idle_duration_sec_avg(),
@@ -286,9 +270,5 @@ impl WasmOperatorStatisticsRecorder {
                 DateTime::from_timestamp_millis(ts).expect("Invalid timestamp in reconcile history")
             })
             .collect()
-    }
-
-    pub async fn clear_recent_reconcile_history(&self) {
-        self.recent_reconcile_history.clear().await;
     }
 }

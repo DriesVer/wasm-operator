@@ -39,6 +39,7 @@ fn main() -> anyhow::Result<()> {
         worker_threads
     );
 
+    // Maybe add thread_keep_alive to reduce the overhead of construction of construction of new OS threads for spawn_blocking
     let global_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .enable_all()

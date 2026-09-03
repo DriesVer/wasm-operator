@@ -47,10 +47,17 @@ impl wasip2::exports::cli::run::Guest for Component {
         if !IS_MAIN_RUNNING.swap(true, Ordering::SeqCst) {
             // Start the main async function in the localset if it hasn't been started yet
             local.spawn_local(main_async());
+
+            // Drive the async runtime for at least 1 second to allow the operator to start and obtain watch events
+            local.block_on(rt, async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            });
         }
         // Drive the async runtime to completion for a single tick
         local.block_on(rt, async {
-            tokio::task::yield_now().await;
+            // We need to park this task for a short delay to allow tokio to check OS timers etc
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            //tokio::task::yield_now().await;
         });
         Ok(())
     }
@@ -181,8 +188,6 @@ async fn main_async() {
 }
 
 async fn reconcile(resource: Arc<RingTestResource>, ctx: Arc<Data>) -> Result<Action, Error> {
-    std::thread::sleep(Duration::from_millis(1000)); // Simulate some processing time
-
     // Do not start reconciling if nonce is 0 (initial state)
     if resource.spec.nonce == 0 {
         return Ok(Action::await_change());

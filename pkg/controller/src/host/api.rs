@@ -35,7 +35,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    host::state::State, kubernetes::KubernetesService, runtime::wasmoperator::WasmOperatorRuntime,
+    host::state::State,
+    kubernetes::KubernetesService,
+    runtime::wasmoperator::{WORCommand, WasmOperatorRuntime},
 };
 use anyhow::Result;
 
@@ -762,7 +764,7 @@ pub struct WatchStreamSignature {
     send_initial_events: bool,
 
     temporary: u64,
-    hash: u64, // Precomputed internal hash
+    hash: u64, // Precomputed internal hash for performance
 }
 
 impl WatchStreamSignature {
@@ -899,6 +901,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(StreamManagerCmd::Register { signature, cluster_version, bookmarks, operator }) => {
+                            debug!("Registering watch stream for signature: {:?}, cluster_version: {}, operator: {}", signature, cluster_version, &operator.cr.name);
                             let watch_id = signature.get_hash();
                             if signature.temporary > 0 {
                                 let stream_res = if signature.send_initial_events {
@@ -928,7 +931,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                     Err(e) => {
                                         warn!("Failed to create temporary watch stream for signature {:?}: {}", watch_id, e);
                                         let watch_event = WatchEvent::Error(e);
-                                        let _ = operator.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(watch_id, watch_event));
+                                        let _ = operator.cmd_tx.send(WORCommand::ProcessWatchEvent(watch_id, watch_event));
                                     }
                                 }
                             } else {
@@ -946,7 +949,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                         Err(e) => {
                                             warn!("Failed to create watch stream for signature {:?}: {}", watch_id, e);
                                             let watch_event = WatchEvent::Error(e);
-                                            let _ = operator.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(watch_id, watch_event));
+                                            let _ = operator.cmd_tx.send(WORCommand::ProcessWatchEvent(watch_id, watch_event));
                                         }
                                     }
                                 }
@@ -961,7 +964,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                 }
 
                 // Handle next event from any registered stream
-                Some((mut id, stream_event)) = streams.next(), if !streams.is_empty() => {
+                Some((id, stream_event)) = streams.next(), if !streams.is_empty() => {
                     let op_list = operators
                         .get(&id.get_hash())
                         .map(|entry| entry.value().clone())
@@ -987,22 +990,32 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                     if id.temporary > 0 {
                                         // If the stream is temporary and sends bookmark, it means initial events are done and we can switch to the main stream.
                                         streams.remove(&id);
-                                        let old_ops = operators.remove(&id.get_hash());
+                                        let old_ops: Option<(WatchId, Vec<(Arc<WasmOperatorRuntime>, bool)>)>
+                                            = operators.remove(&id.get_hash());
                                         cluster_resource_versions.remove(&id.get_hash());
 
                                         let cv: String = bookmark.metadata.resource_version.clone();
-                                        id.set_temporary(0);
-                                        id.send_initial_events = false;
-                                        id.calculate_hash();
-                                        let norm_hash = id.get_hash();
+                                        let mut new_id = id.clone();
+                                        new_id.set_temporary(0);
+                                        new_id.send_initial_events = false;
+                                        new_id.calculate_hash();
+                                        let norm_hash = new_id.get_hash();
 
                                         if let Some((_, ops)) = old_ops {
-                                            if streams.contains_key(&id) {
+                                            // Send last bookmark to operators and redirect them to the new stream.
+                                            let watch_event = WatchEvent::UpgradeBookmark((norm_hash,serde_json::to_string(&bookmark).unwrap_or_else(|e| format!("Bookmark serialization error: {e}"))));
+
+                                            for (op, _) in ops.clone() {
+                                                let _ = op.cmd_tx.send(WORCommand::ProcessWatchEvent(id.get_hash(), watch_event.clone()));
+                                            }
+
+                                            // If the new stream is already active, just add the operators to it. Otherwise, create a new stream to Kube API server.
+                                            if streams.contains_key(&new_id) {
                                                 operators.entry(norm_hash).or_default().extend(ops);
                                             } else {
-                                                match WatchStreamHandler::get_watch_stream_from_signature(&id, &cv).await {
+                                                match WatchStreamHandler::get_watch_stream_from_signature(&new_id, &cv).await {
                                                     Ok(stream) => {
-                                                        streams.insert(id.clone(), stream);
+                                                        streams.insert(new_id.clone(), stream);
                                                         cluster_resource_versions.insert(norm_hash, cv);
                                                         operators.entry(norm_hash).or_default().extend(ops);
                                                     },
@@ -1021,6 +1034,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                 }
 
                                 Ok(KubeWatchEvent::Error(status)) => {
+                                    warn!("Received error from watch stream for signature {:?}: {:?}", id.get_hash(), status);
                                     if status.code == 410 {
                                         gone_streams.insert(id.get_hash());
                                     }
@@ -1032,7 +1046,16 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                 },
 
                                 // Handle a stream transport error
-                                Err(e) => WatchEvent::Error(Error::Other(format!("Kubernetes watch stream error: {e}"))),
+                                Err(e) =>  {
+                                    error!("Error in watch stream for signature {:?}: {}", id.get_hash(), e);
+                                    let wit_err = to_wit_error(e);
+                                    if let Error::Http(ref status) = wit_err {
+                                        if status.code == 410 {
+                                            gone_streams.insert(id.get_hash());
+                                        }
+                                    }
+                                    WatchEvent::Error(wit_err)
+                                }
                             };
 
                             for (operator, op_accepts_bookmarks) in &op_list {
@@ -1041,7 +1064,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                         continue;
                                     }
                                 }
-                                if let Err(e) = operator.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(id.get_hash(), watch_event.clone())) {
+                                if let Err(e) = operator.cmd_tx.send(WORCommand::ProcessWatchEvent(id.get_hash(), watch_event.clone())) {
                                     warn!("Failed to queue watch event for stream {} and operator {}, removing the operator as listener: {:?}", id.get_hash(), operator.cr.name, e);
                                     let mut ops = operators.entry(id.get_hash()).or_default();
                                     ops.retain(|(op, _)| !Arc::ptr_eq(op, operator));
@@ -1075,7 +1098,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                     if let Some((_, ops)) = operators.remove(&hash) {
                                         let watch_event = WatchEvent::Error(e);
                                         for (op, _) in ops {
-                                            let _ = op.cmd_tx.send(crate::runtime::wasmoperator::WORCommand::ProcessWatchEvent(hash, watch_event.clone()));
+                                            let _ = op.cmd_tx.send(WORCommand::ProcessWatchEvent(hash, watch_event.clone()));
                                         }
                                     }
                                 }

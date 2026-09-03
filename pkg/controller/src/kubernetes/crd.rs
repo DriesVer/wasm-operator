@@ -74,8 +74,6 @@ pub struct WasmOperatorStatistics {
     pub reconcile_cold_start_ratio: u8, // If higher than 100, it means it loaded more (due to predicted loads) than it reconciled
     pub wasm_load_duration_msec_avg: u32,
     pub wasm_load_duration_msec_max: u32,
-    pub reconcile_duration_msec_avg: u32,
-    pub reconcile_duration_msec_max: u32,
     pub memory_usage_bytes: u32,
 
     #[schemars(range(min = 0, max = 100))]

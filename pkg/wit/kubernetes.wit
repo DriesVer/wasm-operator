@@ -154,6 +154,8 @@ interface api {
     ) -> result<json-value, error>;
 
     // Watch k8s resource
+    type watch-id = u64;
+
     record watch-params {
         label-selector: option<string>,
         field-selector: option<string>,
@@ -167,9 +169,8 @@ interface api {
         deleted(json-value),
         bookmark(json-value),
         error(error),
+        upgrade-bookmark(tuple<watch-id, json-value>),
     }
-
-    type watch-id = u64;
 
     subscribe-watch-stream: func(
         api: api-resource,

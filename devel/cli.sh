@@ -323,6 +323,8 @@ wasmop_build_child() {
 
     echo -e "\033[1m\n>> Building the child controller\033[0m"
     cd "${CMD_ROOT}"
+
+    # Is needed?
     export RUSTFLAGS="--cfg tokio_unstable"
     cargo build --release --target wasm32-wasip2
 

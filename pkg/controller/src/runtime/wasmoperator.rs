@@ -27,6 +27,7 @@ use crate::runtime::stats::WasmOperatorStatisticsRecorder;
 use crate::runtime::CONTROLLER_UUID;
 use crate::runtime::{WasmEngineSingleton, WASMOP_CACHE_DIR};
 
+// TODO: make this configurable via env var
 const STATUS_PATCH_THROTTLE_DURATION: Duration = Duration::from_secs(5);
 
 pub type OperatorUid = String;
@@ -68,7 +69,7 @@ pub enum WORCommand {
         bindings::local::kube::api::WatchId,
         bindings::local::kube::api::WatchEvent,
     ),
-    CheckIdle(Duration, tokio::sync::oneshot::Sender<bool>),
+    CheckIdle(Duration, Duration, tokio::sync::oneshot::Sender<bool>),
 }
 
 struct LoadedState {
@@ -77,6 +78,7 @@ struct LoadedState {
 }
 
 struct UnloadedState {
+    // TODO: state path is deterministic, we can remove it
     // Path to the serialized memory file.
     state_path: PathBuf,
 }
@@ -205,9 +207,10 @@ impl WasmOperatorRuntime {
                                 } else {
                                     watch_events.push_back((id, watch_event));
                                     latest_bookmark = None; // Bookmark is not relevant if there is a newer normal event
+                                    self.stats.record_reconcile().await;
                                 }
                             },
-                            WORCommand::CheckIdle(threshold, reply_tx) => {
+                            WORCommand::CheckIdle(idle_threshold, execute_threshold, reply_tx) => {
                                 if !watch_events.is_empty() {
                                     // Operator still needs to process watch events
                                     let _ = reply_tx.send(false);
@@ -218,18 +221,18 @@ impl WasmOperatorRuntime {
                                     let _ = reply_tx.send(false);
                                     continue;
                                 }
-                                let threshold = threshold.as_millis() as i64;
+                                let idle_threshold = idle_threshold.as_millis() as i64;
 
                                 // Check if operator has been long enough in loaded state
                                 let last_active = self.last_active.load(Ordering::SeqCst);
                                 let now = Utc::now().timestamp_millis();
                                 let diff = now - last_active;
-                                let is_active_long = diff > threshold;
+                                let is_active_long = diff > idle_threshold;
 
                                 // Check if operator has been executing for too long without yielding
                                 let executed_idle = self.executed_idle.load(Ordering::SeqCst);
-                                // TODO: make this maybe another configurable threshold, or maybe a percentage of the threshold
-                                let is_executing_idle = executed_idle > threshold/4;
+                                let execute_threshold = execute_threshold.as_millis() as i64;
+                                let is_executing_idle = executed_idle > execute_threshold;
 
                                 let is_idle = is_active_long && is_executing_idle;
 
@@ -247,7 +250,7 @@ impl WasmOperatorRuntime {
                         let result = self.clone().execute_via_wit(
                             |operator, store| {
                                 operator.call_receive_watch_event(&mut *store, id, &watch_event).map_err(anyhow::Error::from)
-                            }
+                            }, true
                         ).await;
 
                         if let Err(e) = result {
@@ -261,7 +264,7 @@ impl WasmOperatorRuntime {
                         let result = self.clone().execute_via_wit(
                             |operator, store| {
                                 operator.call_receive_watch_event(&mut *store, id, &watch_event).map_err(anyhow::Error::from)
-                            }
+                            }, false
                         ).await;
 
                         if let Err(e) = result {
@@ -371,25 +374,20 @@ impl WasmOperatorRuntime {
         };
         let mut store_guard = loaded_state.store.lock().await;
 
-        // Serialize the linear memory of the WASM component
-        let memory_data = store_guard.get_snapshot()?;
-
-        self.stats.record_memory_usage(memory_data.len() as u32);
-
-        info!(
-            "Serializing {} bytes of memory for operator {}",
-            memory_data.len(),
-            self.cr.name
-        );
-
-        // Write state to memory to a file
         let state_path = self.get_swap_path();
 
         // TODO: move this to a Lazy static or similar to avoid trying to create the directory every time
         if let Some(parent) = state_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&state_path, &memory_data).await?;
+
+        let mut file = std::fs::File::create(&state_path)?;
+        store_guard.snapshot_to_writer(&mut file)?;
+
+        let file_metadata = tokio::fs::metadata(&state_path).await?;
+        let mem_size = file_metadata.len() as u32;
+
+        self.stats.record_memory_usage(mem_size);
 
         self.patch_k8s_status_throttled(WasmOperatorState::Idle, true)
             .await?;
@@ -399,7 +397,10 @@ impl WasmOperatorRuntime {
 
         self.stats.record_unloading_operation();
 
-        debug!("Unload completed for operator {}", self.cr.name);
+        info!(
+            "Serialized {} bytes of memory for operator {}",
+            mem_size, self.cr.name
+        );
 
         Ok(())
     }
@@ -422,13 +423,18 @@ impl WasmOperatorRuntime {
 
         // Restore the memory of the operator if a save file exists
         if unloaded_state.state_path.exists() {
-            let saved_state = tokio::fs::read(&unloaded_state.state_path).await?;
-            store.set_snapshot(&saved_state)?;
+            let file = std::fs::File::open(&unloaded_state.state_path)?;
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+            store.set_snapshot(&mmap)?;
 
             info!(
                 "Successfully restored memory state for operator {}",
                 self.cr.name
             );
+
+            drop(mmap);
+            drop(file);
 
             tokio::fs::remove_file(&unloaded_state.state_path).await?;
         }
@@ -449,8 +455,6 @@ impl WasmOperatorRuntime {
 
         let duration = start_load.elapsed().as_millis();
         self.stats.record_load_duration(duration as u32);
-
-        //self.run_until_unloaded();
 
         Ok(())
     }
@@ -568,11 +572,21 @@ impl WasmOperatorRuntime {
             })?;
         }
 
-        tokio::fs::write(&cache_path, component_bytes)
+        let temp_path = cache_path.with_extension(format!("{}.tmp", self.cr.uid));
+        tokio::fs::write(&temp_path, component_bytes)
             .await
             .with_context(|| {
                 format!(
-                    "Failed to write compiled cwasm for component {}",
+                    "Failed to write compiled cwasm to temp file for component {}",
+                    self.cr.name
+                )
+            })?;
+
+        tokio::fs::rename(&temp_path, &cache_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to rename temp file to cache path for component {}",
                     self.cr.name
                 )
             })?;
@@ -597,6 +611,7 @@ impl WasmOperatorRuntime {
                     .collect::<Vec<_>>(),
             )
             .allow_blocking_current_thread(true) // Operator is mostly ran from a blocking thread (spawn_blocking), so allow blocking current thread for wasi calls,
+            .monotonic_clock(GlobalMonotonicClock) // Needed for the tokio timer wheel
             .build();
 
         let state = State {
@@ -705,6 +720,7 @@ impl WasmOperatorRuntime {
 
     async fn pause(&self) -> Result<()> {
         info!("Pausing operator '{}'...", self.cr.name);
+        // TODO: first unload the operator to disk so state can be shared
         self.stop_execution().await;
         self.patch_k8s_status_throttled(WasmOperatorState::Paused, true)
             .await?;
@@ -717,7 +733,7 @@ impl WasmOperatorRuntime {
         self.executed_idle.store(0, Ordering::SeqCst);
     }
 
-    pub async fn execute_via_wit<F, T>(self: Arc<Self>, f: F) -> Result<T>
+    pub async fn execute_via_wit<F, T>(self: Arc<Self>, f: F, update_last_active: bool) -> Result<T>
     where
         for<'a> F: FnOnce(&'a bindings::Wasmoperator, &'a mut Store<State>) -> Result<T>,
     {
@@ -742,25 +758,52 @@ impl WasmOperatorRuntime {
 
         // Execute the function
         let mut store_guard = loaded_state.store.lock().await;
+        // TODO: could be changed to spawn_blocking, but then we would need to make sure that the function f is Send + 'static, which might not be the case for all functions. For now, we will use block_in_place to avoid blocking the async runtime.
         let result = tokio::task::block_in_place(|| f(&loaded_state.operator, &mut store_guard));
 
-        self.update_last_active();
+        if update_last_active {
+            self.update_last_active();
+        }
         result
     }
 
-    pub async fn is_idle(&self, threshold: Duration) -> bool {
+    pub async fn is_idle(&self, idle_threshold: Duration, execute_threshold: Duration) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if let Err(e) = self.cmd_tx.send(WORCommand::CheckIdle(threshold, tx)) {
+        if let Err(e) =
+            self.cmd_tx
+                .send(WORCommand::CheckIdle(idle_threshold, execute_threshold, tx))
+        {
             error!(
                 "Failed to send CheckIdle command to operator '{}': {}",
                 self.cr.name, e
             );
             return false;
         }
-        rx.await.unwrap_or(false)
+        // If the command channel is blocked (e.g., operator is executing WASM), it's not idle.
+        match tokio::time::timeout(std::time::Duration::from_millis(100), rx).await {
+            Ok(Ok(res)) => res,
+            _ => false, // Timeout or error
+        }
     }
 
     pub async fn get_reconcile_history(&self) -> Vec<DateTime<Utc>> {
         self.stats.get_recent_reconcile_history().await
+    }
+}
+
+// TODO: move to wasmengine.rs
+use std::sync::OnceLock;
+static HOST_MONOTONIC_START: OnceLock<Instant> = OnceLock::new();
+
+struct GlobalMonotonicClock;
+
+impl wasmtime_wasi::HostMonotonicClock for GlobalMonotonicClock {
+    fn resolution(&self) -> u64 {
+        1_000_000 // 1ms resolution, safe bet for most systems, (Most systems are ns, even browsers are couple microseconds)
+    }
+
+    fn now(&self) -> u64 {
+        let start = HOST_MONOTONIC_START.get_or_init(Instant::now);
+        start.elapsed().as_nanos() as u64
     }
 }

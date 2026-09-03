@@ -35,38 +35,41 @@ pub const WASMOP_CACHE_DIR: &str = match option_env!("WASMOP_CACHE_DIR") {
     None => "/tmp/wasmop-cache",
 };
 
-/// Parses a duration string (e.g. "300", "300s", "5m", "2h", "1d") at compile time.
-/// Defaults to 300 seconds if the environment variable is missing or invalid.
-const fn parse_duration(s: Option<&'static str>) -> Duration {
-    const DEFAULT_SECS: u64 = 5;
-
+/// Parses a duration string (e.g. "300000", "300000ms" "300s", "5m", "2h", "1d") at compile time.
+const fn parse_duration(s: Option<&'static str>, default_ms: u64) -> Duration {
     // Convert to character bytes for easier manipulation
     let s = match s {
         Some(val) => val.as_bytes(),
-        None => return Duration::from_secs(DEFAULT_SECS),
+        None => return Duration::from_millis(default_ms),
     };
 
     if s.is_empty() {
-        return Duration::from_secs(DEFAULT_SECS);
+        return Duration::from_millis(default_ms);
     }
 
     // Determine unit multiplier based on suffix
     let len = s.len();
     if len == 0 {
-        return Duration::from_secs(DEFAULT_SECS);
+        return Duration::from_millis(default_ms);
     }
     let last_byte = s[len - 1];
     let (digits_len, multiplier) = match last_byte {
-        b's' | b'S' => (len - 1, 1),
-        b'm' | b'M' => (len - 1, 60),
-        b'h' | b'H' => (len - 1, 3600),
-        b'd' | b'D' => (len - 1, 86400),
-        b'0'..=b'9' => (len, 1),
-        _ => return Duration::from_secs(DEFAULT_SECS),
+        b's' | b'S' => {
+            if len >= 2 && (s[len - 2] == b'm' || s[len - 2] == b'M') {
+                (len - 2, 1) // ms
+            } else {
+                (len - 1, 1_000) // seconds
+            }
+        }
+        b'm' | b'M' => (len - 1, 60_000), // minutes
+        b'h' | b'H' => (len - 1, 3_600_000), // hours
+        b'd' | b'D' => (len - 1, 86_400_000), // days
+        b'0'..=b'9' => (len, 1), // Default to ms if no unit is given
+        _ => return Duration::from_millis(default_ms),
     };
 
     if digits_len == 0 {
-        return Duration::from_secs(DEFAULT_SECS);
+        return Duration::from_millis(default_ms);
     }
 
     // Parse ascii digits manually for const context
@@ -79,15 +82,22 @@ const fn parse_duration(s: Option<&'static str>) -> Duration {
                 let digit = (byte - b'0') as u64; // Convert ASCII to numeric value
                 num = num * 10 + digit;
             }
-            _ => return Duration::from_secs(DEFAULT_SECS), // Invalid character, fallback to default
+            _ => return Duration::from_millis(default_ms), // Invalid character, fallback to default
         }
         i += 1;
     }
 
-    Duration::from_secs(num * multiplier)
+    Duration::from_millis(num * multiplier)
 }
 
-pub const IDLE_THRESHOLD: Duration = parse_duration(option_env!("WASMOP_IDLE_THRESHOLD"));
+pub const IDLE_THRESHOLD: Duration = parse_duration(option_env!("WASMOP_IDLE_THRESHOLD"), 5000);
+pub const EXECUTE_THRESHOLD: Duration = parse_duration(option_env!("WASMOP_EXECUTE_THRESHOLD"), 500);
+const _: () = {
+    assert!(
+        IDLE_THRESHOLD.as_millis() > EXECUTE_THRESHOLD.as_millis(),
+        "WASMOP_IDLE_THRESHOLD must be greater than WASMOP_EXECUTE_THRESHOLD"
+    );
+};
 
 pub static CONTROLLER_UUID: OnceCell<String> = OnceCell::const_new();
 
@@ -211,6 +221,7 @@ impl MainController {
     }
 
     async fn idle_check_loop(self: Arc<Self>) {
+        debug!("Starting idle check loop with inactive threshold {:?} and idle threshold {:?}", IDLE_THRESHOLD, EXECUTE_THRESHOLD);
         let shutdown_token = crate::shutdown::shutdown_token();
         loop {
             tokio::select! {
@@ -220,9 +231,9 @@ impl MainController {
                 }
 
                 _ = tokio::time::sleep(IDLE_THRESHOLD / 2) => {
-                    for entry in self.operators.iter() {
-                        let op = entry.value();
-                        if op.is_idle(IDLE_THRESHOLD).await {
+                    let ops: Vec<_> = self.operators.iter().map(|e| e.value().clone()).collect();
+                    for op in ops {
+                        if op.is_idle(IDLE_THRESHOLD, EXECUTE_THRESHOLD).await {
                             info!(
                                 "Operator '{}' is idle for more than {:?}, unloading it.",
                                 op.cr.name, IDLE_THRESHOLD
