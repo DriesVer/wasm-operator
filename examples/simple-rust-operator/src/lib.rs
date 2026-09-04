@@ -21,8 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::runtime::Runtime;
 use tokio::task::LocalSet;
 
-static RUNTIME: OnceLock<Mutex<SendWrapper<(Runtime, LocalSet)>>> =
-    OnceLock::new();
+static RUNTIME: OnceLock<Mutex<SendWrapper<(Runtime, LocalSet)>>> = OnceLock::new();
 
 fn get_runtime() -> &'static Mutex<SendWrapper<(Runtime, LocalSet)>> {
     RUNTIME.get_or_init(|| {
@@ -180,7 +179,6 @@ fn error_policy(resource: Arc<TestResource>, error: &Error, _ctx: Arc<Data>) -> 
     Action::requeue(std::time::Duration::from_secs(5))
 }
 
-
 // --- 6. Main Async Function ---
 async fn main_async() {
     let client = Client::try_default().await.unwrap();
@@ -193,7 +191,7 @@ async fn main_async() {
         client,
         counter: Arc::new(Mutex::new(0)),
     });
-        
+
     info!("Starting TestResource controller loop...");
 
     Controller::new(api, Config::default())

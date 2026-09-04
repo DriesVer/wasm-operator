@@ -4,22 +4,24 @@
 //! It manages the Wasmtime engine and orchestrates the execution of individual Wasm components,
 //! ensuring they can interact with the Kubernetes API and other host functionalities.
 
-use std::sync::Arc;
-use std::time::Duration;
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::StreamExt;
 use kube::runtime::watcher;
 use kube::runtime::watcher::Event;
 use kube::ResourceExt;
-use tokio::sync::{OnceCell, mpsc};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, OnceCell};
 use tracing::{debug, error, info, warn};
 
-use crate::prediction::{get_next_reconcile_prediction, PredictionModel};
 use crate::kubernetes::crd::WasmOperator as WasmOperatorCRD;
 use crate::kubernetes::KubernetesService;
-use crate::runtime::wasmengine::{WasmEngineSingleton,GlobalMonotonicClock};
-use crate::runtime::wasmoperator::{OperatorUid, WORCommand, WasmOperatorReduced, WasmOperatorRuntime};
+use crate::prediction::{get_next_reconcile_prediction, PredictionModel};
+use crate::runtime::wasmengine::{GlobalMonotonicClock, WasmEngineSingleton};
+use crate::runtime::wasmoperator::{
+    OperatorUid, WORCommand, WasmOperatorReduced, WasmOperatorRuntime,
+};
 
 mod stats;
 pub mod wasmengine;
@@ -59,10 +61,10 @@ const fn parse_duration(s: Option<&'static str>, default_ms: u64) -> Duration {
                 (len - 1, 1_000) // seconds
             }
         }
-        b'm' | b'M' => (len - 1, 60_000), // minutes
-        b'h' | b'H' => (len - 1, 3_600_000), // hours
+        b'm' | b'M' => (len - 1, 60_000),     // minutes
+        b'h' | b'H' => (len - 1, 3_600_000),  // hours
         b'd' | b'D' => (len - 1, 86_400_000), // days
-        b'0'..=b'9' => (len, 1), // Default to ms if no unit is given
+        b'0'..=b'9' => (len, 1),              // Default to ms if no unit is given
         _ => return Duration::from_millis(default_ms),
     };
 
@@ -89,7 +91,8 @@ const fn parse_duration(s: Option<&'static str>, default_ms: u64) -> Duration {
 }
 
 pub const IDLE_THRESHOLD: Duration = parse_duration(option_env!("WASMOP_IDLE_THRESHOLD"), 5000);
-pub const EXECUTE_THRESHOLD: Duration = parse_duration(option_env!("WASMOP_EXECUTE_THRESHOLD"), 500);
+pub const EXECUTE_THRESHOLD: Duration =
+    parse_duration(option_env!("WASMOP_EXECUTE_THRESHOLD"), 500);
 const _: () = {
     assert!(
         IDLE_THRESHOLD.as_millis() > EXECUTE_THRESHOLD.as_millis(),
@@ -137,7 +140,11 @@ impl MainController {
     }
 
     /// Applies a WasmOperator Custom Resource, starting or updating the operator.
-    async fn apply_operator(&self, wasmop_cr: &WasmOperatorCRD, op_shutdown_tx: mpsc::Sender<String>) -> Result<()> {
+    async fn apply_operator(
+        &self,
+        wasmop_cr: &WasmOperatorCRD,
+        op_shutdown_tx: mpsc::Sender<String>,
+    ) -> Result<()> {
         let op_uid = wasmop_cr
             .uid()
             .ok_or_else(|| anyhow::anyhow!("Kubernetes object is missing a UID"))?;
@@ -146,7 +153,7 @@ impl MainController {
         if wasmop_cr.metadata.generation <= crash_gen {
             warn!(
                     "Skipping operator '{}' with generation '{}' since it previously crashed with generation '{}'",
-                    wasmop_cr.name_any(), 
+                    wasmop_cr.name_any(),
                     wasmop_cr.metadata.generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string()), 
                     crash_gen.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string())
                 );
@@ -175,7 +182,12 @@ impl MainController {
                 .insert(op_uid.clone(), op.cr.generation);
             error!(
                 "Failed to send starting command for operator '{}' with generation '{}': {}",
-                op.cr.name, op.cr.generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string()), e
+                op.cr.name,
+                op.cr
+                    .generation
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "None".to_string()),
+                e
             );
             return Ok(());
         }
@@ -191,7 +203,12 @@ impl MainController {
             if let Err(e) = op.cmd_tx.send(WORCommand::Shutdown) {
                 error!(
                     "Failed to send shutdown command to operator '{}' with generation '{}': {}",
-                    op.cr.name, op.cr.generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string()), e
+                    op.cr.name,
+                    op.cr
+                        .generation
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "None".to_string()),
+                    e
                 );
             }
             drop(op);
@@ -201,7 +218,6 @@ impl MainController {
     /// Handles operator shutdowns originating from fatal errors.
     async fn handle_operator_shutdown(&self, mut rx: mpsc::Receiver<String>) {
         while let Some(op_uid) = rx.recv().await {
-
             // Extract the operator info from the dashmap to avoind holding the lock
             let op_info = if let Some(op_ref) = self.operators.get(&op_uid) {
                 let op = op_ref.value();
@@ -213,7 +229,7 @@ impl MainController {
             if let Some((name, generation)) = op_info {
                 warn!(
                     "Operator '{}' with generation '{}' has shut down unexpectedly, removing it from execution",
-                    name, 
+                    name,
                     generation.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string())
                 );
 
@@ -225,7 +241,10 @@ impl MainController {
 
     /// Background loop that checks for idle operators and unloads them.
     async fn idle_check_loop(self: Arc<Self>) {
-        debug!("Starting idle check loop with inactive threshold {:?} and idle threshold {:?}", IDLE_THRESHOLD, EXECUTE_THRESHOLD);
+        debug!(
+            "Starting idle check loop with inactive threshold {:?} and idle threshold {:?}",
+            IDLE_THRESHOLD, EXECUTE_THRESHOLD
+        );
         let shutdown_token = crate::shutdown::shutdown_token();
         loop {
             tokio::select! {
@@ -272,7 +291,10 @@ impl MainController {
     }
 
     /// Watches for changes to WasmOperator Custom Resources in the cluster and act accordingly.
-    async fn wasmoperator_watch_loop(self: Arc<Self>, op_shutdown_tx: mpsc::Sender<String>) -> Result<()> {
+    async fn wasmoperator_watch_loop(
+        self: Arc<Self>,
+        op_shutdown_tx: mpsc::Sender<String>,
+    ) -> Result<()> {
         let k8s_service: Arc<KubernetesService> = KubernetesService::global().await?;
 
         // Get the K8S watcher stream for the WasmOperator CRD.
