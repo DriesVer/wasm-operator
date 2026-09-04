@@ -1,8 +1,8 @@
 //! # Kubernetes Module
 //!
-//! This module provides a service for interacting with the Kubernetes API. It handles
-//! the creation of a Kubernetes client, execution of HTTP requests against the API,
-//! and serialization/deserialization of Kubernetes API responses.
+//! This module provides the KubernetesService singleton for interacting with the cluster API.
+//! It handles the creation of a Kubernetes client, execution of HTTP requests, and
+//! dynamic resource management for both the parent controller and child operators.
 
 pub mod crd;
 

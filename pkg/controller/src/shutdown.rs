@@ -1,3 +1,8 @@
+//! # Shutdown Module
+//!
+//! Handles graceful shutdown logic for the parent controller, providing a global cancellation
+//! token to coordinate termination across asynchronous tasks.
+
 use std::sync::LazyLock;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};

@@ -1,3 +1,8 @@
+//! # Watch Stream Handler
+//!
+//! Manages active Kubernetes watch streams for child operators within the host subpackage.
+//! It converts Kubernetes watch events into WIT watch events for the Wasm operators.
+
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};

@@ -1,9 +1,9 @@
 //! # Main Module
 //!
-//! This module serves as the entry point for the Wasm Operator. It is responsible for
-//! parsing command-line arguments, setting up logging, loading the WASM component
-//! configuration, and orchestrating the Kubernetes service and the WASM runtime
-//! to execute the Wasm modules.
+//! This module serves as the entry point for the parent controller. It is responsible for
+//! parsing command-line arguments, setting up logging, initializing global singletons
+//! (Kubernetes service, Wasmtime engine), and starting the MainController to orchestrate
+//! child Wasm operators.
 
 mod host;
 mod kubernetes;

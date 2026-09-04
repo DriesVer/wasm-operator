@@ -1,9 +1,8 @@
 //! # Host Module
 //!
-//! This module defines the host-side functionalities and state management for the
-//! WebAssembly (Wasm) operator. It provides the necessary interfaces and structures
-//! for Wasm modules to interact with the host environment, including Kubernetes API
-//! access and resource management.
+//! This module defines the host-side functionality and state management for the Wasmtime
+//! environment. It provides the necessary WebAssembly System Interface (WASI) and custom
+//! bindings for Wasm modules to interact with the host, including Kubernetes API access.
 
 pub mod api;
 pub mod helper;

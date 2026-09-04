@@ -1,3 +1,8 @@
+//! # Host Helper Module
+//!
+//! Provides utility functions and wrappers for executing Kubernetes API calls from the
+//! WebAssembly host environment, facilitating parameter conversion and API interaction.
+
 use anyhow::Result;
 use kube::api::{
     ApiResource as KubeApiResource, DeleteParams as KubeDeleteParams,

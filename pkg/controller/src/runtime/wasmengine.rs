@@ -1,3 +1,8 @@
+//! # Wasm Engine
+//!
+//! Manages the global Wasmtime engine instance within the runtime subpackage,
+//! providing a shared environment for compiling and executing WebAssembly modules.
+
 use anyhow::Result;
 use std::sync::OnceLock;
 use std::time::Instant;

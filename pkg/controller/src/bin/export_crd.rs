@@ -1,3 +1,8 @@
+//! # CRD Export Utility
+//!
+//! A standalone binary in the controller package that generates and prints the WasmOperator
+//! Custom Resource Definition (CRD) in YAML format.
+
 use controller::kubernetes::crd::WasmOperator;
 use kube::CustomResourceExt;
 

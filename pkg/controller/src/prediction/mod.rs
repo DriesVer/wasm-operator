@@ -1,3 +1,8 @@
+//! # Prediction Module
+//!
+//! Handles communication with the prediction sidecar to forecast optimal loading
+//! and unloading times for child Wasm operators based on their reconciliation history.
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use reqwest::Client;

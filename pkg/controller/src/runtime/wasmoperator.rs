@@ -1,3 +1,7 @@
+//! # WasmOperator Runtime
+//!
+//! Implements the core lifecycle and execution logic for individual  WasmOperators in the runtime subpackage.
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use kube::{Resource, ResourceExt};

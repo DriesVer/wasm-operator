@@ -1,3 +1,8 @@
+//! # Runtime Statistics
+//!
+//! Collects and maintains operational metrics (e.g., memory usage, cold starts, and active durations)
+//! for Wasm operators in the runtime subpackage to update their Kubernetes status.
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::cmp::min;
 use std::collections::VecDeque;

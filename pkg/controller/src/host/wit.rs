@@ -1,3 +1,8 @@
+//! # WIT Bindings
+//!
+//! Exposes the WebAssembly Interface Types (WIT) generated bindings for the host subpackage,
+//! linking the controller runtime capabilities to the Wasm component interfaces.
+
 /// Module containing the generated WIT bindings for the Wasm Operator.
 pub mod bindings {
     wasmtime::component::bindgen!({

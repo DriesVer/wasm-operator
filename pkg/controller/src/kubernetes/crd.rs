@@ -1,7 +1,8 @@
 //! # Custom Resource Definitions
 //!
-//! This module defines the Rust structs for Kubernetes Custom Resources (CRDs)
-//! used by the operator to represent Wasm components and their configuration.
+//! This module defines the Rust structs for the WasmOperator Kubernetes Custom Resource
+//! Definition (CRD). It specifies the schema for configuring Wasm modules (Spec)
+//! and tracking their runtime metrics (Status).
 
 use chrono::{DateTime, Utc};
 use kube::CustomResource;

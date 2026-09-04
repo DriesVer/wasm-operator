@@ -1,8 +1,8 @@
 //! # Runtime Module
 //!
-//! This module provides the core WebAssembly (Wasm) runtime capabilities for the operator.
-//! It manages the Wasmtime engine and orchestrates the execution of individual Wasm components,
-//! ensuring they can interact with the Kubernetes API and other host functionalities.
+//! This module provides the core orchestration logic for the parent controller. It implements
+//! the MainController to watch WasmOperator Custom Resources in the cluster, and manages the
+//! lifecycle, caching, and execution of the corresponding child WasmOperator Runtimes. It also handles idle detection, prediction-based scheduling, and operator shutdowns.
 
 use anyhow::Result;
 use dashmap::DashMap;
