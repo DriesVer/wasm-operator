@@ -1,6 +1,6 @@
 # Setting Up the WASM-Operator
 
-This guide walks you through setting up the WASM-operator using the project's Development CLI. You can also perform these steps manually if your cluster requires a custom configuration.
+This guide walks you through setting up the WASM-operator using the project's Development CLI. You can also perform these steps manually if your cluster requires a custom configuration. Use the [setup documentation](./setup.md) and [usage documentation](./usage.md) for more information on manual setup and usage. When using the WasmOperator framework outside a local development kind cluster, the manual setup steps are required.
 
 To get started, load the Development CLI helper script by sourcing it from the root of the repository:
 
@@ -24,7 +24,7 @@ git submodule update --init --recursive
 
 ## Dependencies
 
-Make sure the following tools are installed on your host:
+Make sure the following tools are installed on your device:
 
 - Kind
 - Kubectl
