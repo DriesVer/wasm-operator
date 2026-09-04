@@ -83,7 +83,7 @@ wasmop() (
 )
 
 wasmop_test() {
-    echo "This works!"
+    echo "The WasmOperator Development CLI is correctly sourced and operational!"
 }
 
 wasmop_config_list() {

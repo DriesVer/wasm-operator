@@ -6,28 +6,21 @@
 //! Kubernetes API and handling asynchronous responses.
 use anyhow::Result;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::GetParams as KubeGetParams;
+use kube::api::{
+    ApiResource as KubeApiResource, DeleteParams as KubeDeleteParams,
+    EvictParams as KubeEvictParams, GetParams as KubeGetParams, ListParams as KubeListParams,
+    LogParams as KubeLogParams, PatchParams as KubePatchParams, PostParams as KubePostParams,
+};
 use kube::core::{dynamic::DynamicObject, metadata::PartialObjectMeta};
 use kube::Api;
 use tracing::{debug, error};
 
-use crate::host::helper::{
-    get_dynamic_api, get_meta_api, to_kube_api_resource, to_kube_delete_params,
-    to_kube_evict_params, to_kube_list_params, to_kube_log_params, to_kube_patch,
-    to_kube_patch_params, to_kube_post_params, to_serde_error, to_wit_error,
-};
+use crate::host::helper::{get_dynamic_api, get_meta_api, to_kube_patch};
 use crate::host::state::State;
 use crate::host::watch_stream_handler::{WatchStreamHandler, WatchStreamSignature};
 use crate::kubernetes::KubernetesService;
 
-pub mod bindings {
-    wasmtime::component::bindgen!({
-        path: "../wit",
-        world: "wasmoperator",
-    });
-}
-
-use bindings::local::kube::api::{
+use crate::host::wit::bindings::local::kube::api::{
     ApiCategory, ApiResource, CreateParams, DeleteParams, Error, EvictParams, Host, JsonValue,
     ListParams, LogParams, PatchParams, PatchType, Scope, WatchId, WatchParams,
 };
@@ -40,37 +33,29 @@ impl Host for State {
         resource_version: Option<String>,
         scope: Scope,
     ) -> Result<JsonValue, Error> {
-        let api_res = to_kube_api_resource(&api);
+        let api_res = KubeApiResource::from(&api);
         let gp = KubeGetParams { resource_version };
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             let obj_str = match scope {
                 Scope::Full => {
                     let kube_api =
                         get_dynamic_api(k8s_client.clone(), api.namespace.clone(), &api_res);
-                    let obj = kube_api.get_with(&name, &gp).await.map_err(to_wit_error)?;
-                    serde_json::to_string(&obj).map_err(to_serde_error)?
+                    let obj = kube_api.get_with(&name, &gp).await?;
+                    serde_json::to_string(&obj)?
                 }
                 Scope::MetadataOnly => {
                     let kube_api = get_meta_api(k8s_client.clone(), &api, &api_res);
-                    let obj = kube_api
-                        .get_metadata_with(&name, &gp)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&obj).map_err(to_serde_error)?
+                    let obj = kube_api.get_metadata_with(&name, &gp).await?;
+                    serde_json::to_string(&obj)?
                 }
                 Scope::Subresource(sub) => {
                     let kube_api =
                         get_dynamic_api(k8s_client.clone(), api.namespace.clone(), &api_res);
-                    let obj = kube_api
-                        .get_subresource(&sub, &name)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&obj).map_err(to_serde_error)?
+                    let obj = kube_api.get_subresource(&sub, &name).await?;
+                    serde_json::to_string(&obj)?
                 }
             };
 
@@ -84,23 +69,21 @@ impl Host for State {
         params: ListParams,
         scope: Scope,
     ) -> Result<JsonValue, Error> {
-        let api_res = to_kube_api_resource(&api);
-        let lp = to_kube_list_params(params);
+        let api_res = KubeApiResource::from(&api);
+        let lp = KubeListParams::from(params);
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
             match scope {
                 Scope::Full => {
                     let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
-                    let list = kube_api.list(&lp).await.map_err(to_wit_error)?;
-                    serde_json::to_string(&list).map_err(to_serde_error)
+                    let list = kube_api.list(&lp).await?;
+                    Ok(serde_json::to_string(&list)?)
                 }
                 Scope::MetadataOnly => {
                     let kube_api = get_meta_api(k8s_client, &api, &api_res);
-                    let list = kube_api.list_metadata(&lp).await.map_err(to_wit_error)?;
-                    serde_json::to_string(&list).map_err(to_serde_error)
+                    let list = kube_api.list_metadata(&lp).await?;
+                    Ok(serde_json::to_string(&list)?)
                 }
                 Scope::Subresource(_) => Err(Error::Other(
                     "List operation is not supported on subresources".to_string(),
@@ -115,18 +98,16 @@ impl Host for State {
         body: JsonValue,
         params: CreateParams,
     ) -> Result<JsonValue, Error> {
-        let api_res = to_kube_api_resource(&api);
-        let pp = to_kube_post_params(params);
-        let data: DynamicObject = serde_json::from_str(&body).map_err(to_serde_error)?;
+        let api_res = KubeApiResource::from(&api);
+        let pp = KubePostParams::from(params);
+        let data: DynamicObject = serde_json::from_str(&body)?;
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
-            let obj = kube_api.create(&pp, &data).await.map_err(to_wit_error)?;
-            serde_json::to_string(&obj).map_err(to_serde_error)
+            let obj = kube_api.create(&pp, &data).await?;
+            Ok(serde_json::to_string(&obj)?)
         })
     }
 
@@ -138,21 +119,18 @@ impl Host for State {
         body: JsonValue,
         params: CreateParams,
     ) -> Result<JsonValue, Error> {
-        let api_res = to_kube_api_resource(&api);
-        let pp = to_kube_post_params(params);
-        let data: serde_json::Value = serde_json::from_str(&body).map_err(to_serde_error)?;
+        let api_res = KubeApiResource::from(&api);
+        let pp = KubePostParams::from(params);
+        let data: serde_json::Value = serde_json::from_str(&body)?;
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
             let obj: serde_json::Value = kube_api
                 .create_subresource(&subresource, &main_resource, &pp, &data)
-                .await
-                .map_err(to_wit_error)?;
-            serde_json::to_string(&obj).map_err(to_serde_error)
+                .await?;
+            Ok(serde_json::to_string(&obj)?)
         })
     }
 
@@ -163,40 +141,30 @@ impl Host for State {
         params: DeleteParams,
         scope: Scope,
     ) -> std::prelude::v1::Result<JsonValue, Error> {
-        let api_res = to_kube_api_resource(&api);
-        let dp = to_kube_delete_params(params);
+        let api_res = KubeApiResource::from(&api);
+        let dp = KubeDeleteParams::from(params);
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             match scope {
                 Scope::Full | Scope::Subresource(_) => {
                     let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
-                    let res = kube_api.delete(&name, &dp).await.map_err(to_wit_error)?;
+                    let res = kube_api.delete(&name, &dp).await?;
                     let val = match res {
-                        either::Either::Left(obj) => {
-                            serde_json::to_value(&obj).map_err(to_serde_error)?
-                        }
-                        either::Either::Right(status) => {
-                            serde_json::to_value(&status).map_err(to_serde_error)?
-                        }
+                        either::Either::Left(obj) => serde_json::to_value(&obj)?,
+                        either::Either::Right(status) => serde_json::to_value(&status)?,
                     };
-                    serde_json::to_string(&val).map_err(to_serde_error)
+                    Ok(serde_json::to_string(&val)?)
                 }
                 Scope::MetadataOnly => {
                     let kube_api = get_meta_api(k8s_client, &api, &api_res);
-                    let res = kube_api.delete(&name, &dp).await.map_err(to_wit_error)?;
+                    let res = kube_api.delete(&name, &dp).await?;
                     let val = match res {
-                        either::Either::Left(meta) => {
-                            serde_json::to_value(&meta).map_err(to_serde_error)?
-                        }
-                        either::Either::Right(status) => {
-                            serde_json::to_value(&status).map_err(to_serde_error)?
-                        }
+                        either::Either::Left(meta) => serde_json::to_value(&meta)?,
+                        either::Either::Right(status) => serde_json::to_value(&status)?,
                     };
-                    serde_json::to_string(&val).map_err(to_serde_error)
+                    Ok(serde_json::to_string(&val)?)
                 }
             }
         })
@@ -209,47 +177,31 @@ impl Host for State {
         list_params: ListParams,
         scope: Scope,
     ) -> std::prelude::v1::Result<JsonValue, Error> {
-        let api_res = to_kube_api_resource(&api);
-        let dp = to_kube_delete_params(delete_params);
-        let lp = to_kube_list_params(list_params);
+        let api_res = KubeApiResource::from(&api);
+        let dp = KubeDeleteParams::from(delete_params);
+        let lp = KubeListParams::from(list_params);
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             match scope {
                 Scope::Full | Scope::Subresource(_) => {
                     let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
-                    let res = kube_api
-                        .delete_collection(&dp, &lp)
-                        .await
-                        .map_err(to_wit_error)?;
+                    let res = kube_api.delete_collection(&dp, &lp).await?;
                     let val = match res {
-                        either::Either::Left(list) => {
-                            serde_json::to_value(&list).map_err(to_serde_error)?
-                        }
-                        either::Either::Right(status) => {
-                            serde_json::to_value(&status).map_err(to_serde_error)?
-                        }
+                        either::Either::Left(list) => serde_json::to_value(&list)?,
+                        either::Either::Right(status) => serde_json::to_value(&status)?,
                     };
-                    serde_json::to_string(&val).map_err(to_serde_error)
+                    Ok(serde_json::to_string(&val)?)
                 }
                 Scope::MetadataOnly => {
                     let kube_api = get_meta_api(k8s_client, &api, &api_res);
-                    let res = kube_api
-                        .delete_collection(&dp, &lp)
-                        .await
-                        .map_err(to_wit_error)?;
+                    let res = kube_api.delete_collection(&dp, &lp).await?;
                     let val = match res {
-                        either::Either::Left(list) => {
-                            serde_json::to_value(&list).map_err(to_serde_error)?
-                        }
-                        either::Either::Right(status) => {
-                            serde_json::to_value(&status).map_err(to_serde_error)?
-                        }
+                        either::Either::Left(list) => serde_json::to_value(&list)?,
+                        either::Either::Right(status) => serde_json::to_value(&status)?,
                     };
-                    serde_json::to_string(&val).map_err(to_serde_error)
+                    Ok(serde_json::to_string(&val)?)
                 }
             }
         })
@@ -264,39 +216,30 @@ impl Host for State {
         params: PatchParams,
         scope: Scope,
     ) -> std::prelude::v1::Result<JsonValue, Error> {
-        let api_res = to_kube_api_resource(&api);
-        let pp = to_kube_patch_params(params);
+        let api_res = KubeApiResource::from(&api);
+        let pp = KubePatchParams::from(params);
         let kube_patch = to_kube_patch(patch_type, body)?;
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             match scope {
                 Scope::Full => {
                     let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
-                    let obj = kube_api
-                        .patch(&name, &pp, &kube_patch)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&obj).map_err(to_serde_error)
+                    let obj = kube_api.patch(&name, &pp, &kube_patch).await?;
+                    Ok(serde_json::to_string(&obj)?)
                 }
                 Scope::MetadataOnly => {
                     let kube_api = get_meta_api(k8s_client, &api, &api_res);
-                    let obj = kube_api
-                        .patch_metadata(&name, &pp, &kube_patch)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&obj).map_err(to_serde_error)
+                    let obj = kube_api.patch_metadata(&name, &pp, &kube_patch).await?;
+                    Ok(serde_json::to_string(&obj)?)
                 }
                 Scope::Subresource(sub) => {
                     let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                     let obj = kube_api
                         .patch_subresource(&sub, &name, &pp, &kube_patch)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&obj).map_err(to_serde_error)
+                        .await?;
+                    Ok(serde_json::to_string(&obj)?)
                 }
             }
         })
@@ -310,44 +253,32 @@ impl Host for State {
         params: CreateParams,
         scope: Scope,
     ) -> std::prelude::v1::Result<JsonValue, Error> {
-        let api_res = to_kube_api_resource(&api);
-        let pp = to_kube_post_params(params);
+        let api_res = KubeApiResource::from(&api);
+        let pp = KubePostParams::from(params);
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             match scope {
                 Scope::Full => {
-                    let data: DynamicObject =
-                        serde_json::from_str(&body).map_err(to_serde_error)?;
+                    let data: DynamicObject = serde_json::from_str(&body)?;
                     let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
-                    let obj = kube_api
-                        .replace(&name, &pp, &data)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&obj).map_err(to_serde_error)
+                    let obj = kube_api.replace(&name, &pp, &data).await?;
+                    Ok(serde_json::to_string(&obj)?)
                 }
                 Scope::MetadataOnly => {
-                    let data: PartialObjectMeta<DynamicObject> =
-                        serde_json::from_str(&body).map_err(to_serde_error)?;
+                    let data: PartialObjectMeta<DynamicObject> = serde_json::from_str(&body)?;
                     let kube_api = get_meta_api(k8s_client, &api, &api_res);
-                    let obj = kube_api
-                        .replace(&name, &pp, &data)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&obj).map_err(to_serde_error)
+                    let obj = kube_api.replace(&name, &pp, &data).await?;
+                    Ok(serde_json::to_string(&obj)?)
                 }
                 Scope::Subresource(sub) => {
-                    let data: serde_json::Value =
-                        serde_json::from_str(&body).map_err(to_serde_error)?;
+                    let data: serde_json::Value = serde_json::from_str(&body)?;
                     let kube_api = get_dynamic_api(k8s_client, api.namespace.clone(), &api_res);
                     let obj = kube_api
                         .replace_subresource(&sub, &name, &pp, &data)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&obj).map_err(to_serde_error)
+                        .await?;
+                    Ok(serde_json::to_string(&obj)?)
                 }
             }
         })
@@ -395,12 +326,10 @@ impl Host for State {
         params: LogParams,
     ) -> Result<String, Error> {
         let namespace = api.namespace.as_deref();
-        let lp = to_kube_log_params(params);
+        let lp = KubeLogParams::from(params);
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             let kube_api = if let Some(ns) = namespace {
                 Api::<Pod>::namespaced(k8s_client.clone(), ns)
@@ -408,7 +337,7 @@ impl Host for State {
                 Api::<Pod>::all(k8s_client.clone())
             };
 
-            kube_api.logs(&name, &lp).await.map_err(to_wit_error)
+            Ok(kube_api.logs(&name, &lp).await?)
         })
     }
 
@@ -419,12 +348,10 @@ impl Host for State {
         params: EvictParams,
     ) -> Result<JsonValue, Error> {
         let namespace = api.namespace.as_deref();
-        let ep = to_kube_evict_params(params);
+        let ep = KubeEvictParams::from(params);
 
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             let kube_api = if let Some(ns) = namespace {
                 Api::<Pod>::namespaced(k8s_client.clone(), ns)
@@ -432,19 +359,17 @@ impl Host for State {
                 Api::<Pod>::all(k8s_client.clone())
             };
 
-            let status = kube_api.evict(&name, &ep).await.map_err(to_wit_error)?;
-            serde_json::to_string(&status).map_err(to_serde_error)
+            let status = kube_api.evict(&name, &ep).await?;
+            Ok(serde_json::to_string(&status)?)
         })
     }
 
     fn get_api_server_version(&mut self) -> Result<String, Error> {
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
-            let info = k8s_client.apiserver_version().await.map_err(to_wit_error)?;
-            serde_json::to_string(&info).map_err(to_serde_error)
+            let info = k8s_client.apiserver_version().await?;
+            Ok(serde_json::to_string(&info)?)
         })
     }
 
@@ -454,35 +379,24 @@ impl Host for State {
         aggregated: bool,
     ) -> Result<String, Error> {
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             match (category, aggregated) {
                 (ApiCategory::Core, false) => {
-                    let res = k8s_client
-                        .list_core_api_versions()
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&res).map_err(to_serde_error)
+                    let res = k8s_client.list_core_api_versions().await?;
+                    Ok(serde_json::to_string(&res)?)
                 }
                 (ApiCategory::Core, true) => {
-                    let res = k8s_client
-                        .list_core_api_versions_aggregated()
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&res).map_err(to_serde_error)
+                    let res = k8s_client.list_core_api_versions_aggregated().await?;
+                    Ok(serde_json::to_string(&res)?)
                 }
                 (ApiCategory::Named, false) => {
-                    let res = k8s_client.list_api_groups().await.map_err(to_wit_error)?;
-                    serde_json::to_string(&res).map_err(to_serde_error)
+                    let res = k8s_client.list_api_groups().await?;
+                    Ok(serde_json::to_string(&res)?)
                 }
                 (ApiCategory::Named, true) => {
-                    let res = k8s_client
-                        .list_api_groups_aggregated()
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&res).map_err(to_serde_error)
+                    let res = k8s_client.list_api_groups_aggregated().await?;
+                    Ok(serde_json::to_string(&res)?)
                 }
             }
         })
@@ -494,24 +408,16 @@ impl Host for State {
         version: String,
     ) -> Result<String, Error> {
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             match category {
                 ApiCategory::Core => {
-                    let res = k8s_client
-                        .list_core_api_resources(&version)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&res).map_err(to_serde_error)
+                    let res = k8s_client.list_core_api_resources(&version).await?;
+                    Ok(serde_json::to_string(&res)?)
                 }
                 ApiCategory::Named => {
-                    let res = k8s_client
-                        .list_api_group_resources(&version)
-                        .await
-                        .map_err(to_wit_error)?;
-                    serde_json::to_string(&res).map_err(to_serde_error)
+                    let res = k8s_client.list_api_group_resources(&version).await?;
+                    Ok(serde_json::to_string(&res)?)
                 }
             }
         })
@@ -519,9 +425,7 @@ impl Host for State {
 
     fn get_default_namespace(&mut self) -> Result<String, Error> {
         self.execute_host_function(|| async move {
-            let k8s_client = KubernetesService::global_client()
-                .await
-                .map_err(to_wit_error)?;
+            let k8s_client = KubernetesService::global_client().await?;
 
             let ns = k8s_client.default_namespace();
             Ok(ns.to_string())

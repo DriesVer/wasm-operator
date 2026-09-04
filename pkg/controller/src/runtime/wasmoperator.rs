@@ -16,8 +16,8 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::Store;
 use wasmtime_wasi::WasiCtxBuilder;
 
-use crate::host::api::bindings;
 use crate::host::state::State;
+use crate::host::wit::bindings;
 use crate::kubernetes::crd::{
     EnvironmentVariable, WasmOperator as WasmOperatorCR, WasmOperatorState, WasmOperatorStatus,
     WasmSource,

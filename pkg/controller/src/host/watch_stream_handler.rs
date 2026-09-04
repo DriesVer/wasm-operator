@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::host::api::bindings::local::kube::api::{
+use crate::host::helper::get_dynamic_api;
+use crate::host::wit::bindings::local::kube::api::{
     ApiResource, Error, HttpError, WatchEvent, WatchId, WatchParams,
 };
-use crate::host::helper::{get_dynamic_api, to_wit_error};
 use crate::kubernetes::KubernetesService;
 use crate::runtime::wasmoperator::{WORCommand, WasmOperatorRuntime};
 
@@ -337,7 +337,7 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
                                 // Handle a stream transport error
                                 Err(e) =>  {
                                     error!("Error in watch stream for signature {:?}: {}", id.get_hash(), e);
-                                    let wit_err = to_wit_error(e);
+                                    let wit_err = Error::from(e);
                                     if let Error::Http(ref status) = wit_err {
                                         if status.code == 410 {
                                             gone_streams.insert(id.get_hash());
@@ -414,15 +414,10 @@ impl WatchStreamHandler {
         let api_res = KubeApiResource::from(signature);
         let wp = KubeWatchParams::from(signature);
 
-        let k8s_client = KubernetesService::global_client()
-            .await
-            .map_err(to_wit_error)?;
+        let k8s_client = KubernetesService::global_client().await?;
         let kube_api = get_dynamic_api(k8s_client, signature.namespace.clone(), &api_res);
 
-        let stream = kube_api
-            .watch(&wp, cluster_version)
-            .await
-            .map_err(to_wit_error)?;
+        let stream = kube_api.watch(&wp, cluster_version).await?;
 
         let stream_with_eof = stream
             .map(Some) // Wrap each event in Some to indicate it's a valid event
