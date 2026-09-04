@@ -25,7 +25,9 @@ use crate::host::wit::bindings::local::kube::api::{
     ListParams, LogParams, PatchParams, PatchType, Scope, WatchId, WatchParams,
 };
 
+/// This provides the actual implementations of the host functions that can be called by the WasmOperators.
 impl Host for State {
+    /// Fetches a resource from the Kubernetes API.
     fn get_resource(
         &mut self,
         api: ApiResource,
@@ -63,6 +65,7 @@ impl Host for State {
         })
     }
 
+    /// Lists resources from the Kubernetes API.
     fn list_resources(
         &mut self,
         api: ApiResource,
@@ -92,6 +95,7 @@ impl Host for State {
         })
     }
 
+    /// Creates a new resource in the Kubernetes API.
     fn create_resource(
         &mut self,
         api: ApiResource,
@@ -111,6 +115,7 @@ impl Host for State {
         })
     }
 
+    /// Creates a subresource in the Kubernetes API.
     fn create_subresource(
         &mut self,
         api: ApiResource,
@@ -134,6 +139,7 @@ impl Host for State {
         })
     }
 
+    /// Deletes a resource from the Kubernetes API.
     fn delete_resource(
         &mut self,
         api: ApiResource,
@@ -170,6 +176,7 @@ impl Host for State {
         })
     }
 
+    /// Deletes a collection of resources from the Kubernetes API.
     fn delete_collection(
         &mut self,
         api: ApiResource,
@@ -207,6 +214,7 @@ impl Host for State {
         })
     }
 
+    /// Patches an existing resource in the Kubernetes API.
     fn patch_resource(
         &mut self,
         api: ApiResource,
@@ -245,6 +253,7 @@ impl Host for State {
         })
     }
 
+    /// Replaces an existing resource in the Kubernetes API.
     fn replace_resource(
         &mut self,
         api: ApiResource,
@@ -284,6 +293,7 @@ impl Host for State {
         })
     }
 
+    /// Subscribes to a watch stream for Kubernetes resources.
     fn subscribe_watch_stream(
         &mut self,
         api: ApiResource,
@@ -319,6 +329,7 @@ impl Host for State {
         })
     }
 
+    /// Retrieves logs from a Kubernetes Pod.
     fn get_logs_string(
         &mut self,
         api: ApiResource,
@@ -341,6 +352,7 @@ impl Host for State {
         })
     }
 
+    /// Evicts a pod using the Kubernetes Eviction API.
     fn evict_subresource(
         &mut self,
         api: ApiResource,
@@ -364,6 +376,7 @@ impl Host for State {
         })
     }
 
+    /// Gets the version of the Kubernetes API server.
     fn get_api_server_version(&mut self) -> Result<String, Error> {
         self.execute_host_function(|| async move {
             let k8s_client = KubernetesService::global_client().await?;
@@ -373,6 +386,7 @@ impl Host for State {
         })
     }
 
+    /// Lists supported API versions from the Kubernetes cluster.
     fn list_api_version(
         &mut self,
         category: ApiCategory,
@@ -402,6 +416,7 @@ impl Host for State {
         })
     }
 
+    /// Lists API resources supported by the Kubernetes cluster.
     fn list_api_resources(
         &mut self,
         category: ApiCategory,
@@ -423,6 +438,7 @@ impl Host for State {
         })
     }
 
+    /// Returns the default namespace configured for the client.
     fn get_default_namespace(&mut self) -> Result<String, Error> {
         self.execute_host_function(|| async move {
             let k8s_client = KubernetesService::global_client().await?;

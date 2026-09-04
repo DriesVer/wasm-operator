@@ -62,11 +62,13 @@ impl KubernetesService {
         Ok(Arc::clone(instance))
     }
 
+    /// Returns a clone of the global Kubernetes client.
     pub async fn global_client() -> Result<Client> {
         let service = Self::global().await?;
         Ok(service.client.clone())
     }
 
+    /// Refreshes the cached Kubernetes API discovery.
     pub async fn refresh_discovery(&self) -> Result<()> {
         let discovery = Discovery::new(self.client.clone())
             .run()
@@ -76,6 +78,7 @@ impl KubernetesService {
         Ok(())
     }
 
+    /// Finds an API resource by its kind in the discovered groups.
     pub async fn find_api_resource(&self, kind: &str) -> Result<ApiResource> {
         let discovery_guard = self.discovery.read().await;
 
@@ -100,10 +103,12 @@ impl KubernetesService {
         Api::namespaced_with(self.client.clone(), namespace, &ar)
     }
 
+    /// Returns a typed API client for the WasmOperator Custom Resource.
     pub fn wasmoperator_api(&self, namespace: &str) -> Api<WasmOperatorCRD> {
         Api::namespaced(self.client.clone(), namespace)
     }
 
+    /// Patches the status of a Kubernetes resource using a JSON string.
     pub async fn patch_status(
         &self,
         kind: &str,

@@ -99,12 +99,14 @@ const _: () = {
 
 pub static CONTROLLER_UUID: OnceCell<String> = OnceCell::const_new();
 
+/// Main controller orchestrating WasmOperator Runtimes and their lifecycle based on WasmOperator CRs.
 pub struct MainController {
     operators: DashMap<OperatorUid, Arc<WasmOperatorRuntime>>,
     crashed_operators: DashMap<OperatorUid, Option<i64>>,
 }
 
 impl MainController {
+    /// Creates a new instance. (should only be called once)
     pub fn new() -> Arc<Self> {
         let _ = CONTROLLER_UUID.set(uuid::Uuid::new_v4().to_string());
         Arc::new(Self {
@@ -134,6 +136,7 @@ impl MainController {
         Ok(())
     }
 
+    /// Applies a WasmOperator Custom Resource, starting or updating the operator.
     async fn apply_operator(&self, wasmop_cr: &WasmOperatorCRD, op_shutdown_tx: mpsc::Sender<String>) -> Result<()> {
         let op_uid = wasmop_cr
             .uid()
@@ -182,6 +185,7 @@ impl MainController {
         Ok(())
     }
 
+    /// Deletes a WasmOperator, triggering its shutdown.
     async fn delete_operator(&self, uid: &str) {
         if let Some((_, op)) = self.operators.remove(uid) {
             if let Err(e) = op.cmd_tx.send(WORCommand::Shutdown) {
@@ -194,6 +198,7 @@ impl MainController {
         }
     }
 
+    /// Handles operator shutdowns originating from fatal errors.
     async fn handle_operator_shutdown(&self, mut rx: mpsc::Receiver<String>) {
         while let Some(op_uid) = rx.recv().await {
 
@@ -218,6 +223,7 @@ impl MainController {
         }
     }
 
+    /// Background loop that checks for idle operators and unloads them.
     async fn idle_check_loop(self: Arc<Self>) {
         debug!("Starting idle check loop with inactive threshold {:?} and idle threshold {:?}", IDLE_THRESHOLD, EXECUTE_THRESHOLD);
         let shutdown_token = crate::shutdown::shutdown_token();
@@ -265,6 +271,7 @@ impl MainController {
         }
     }
 
+    /// Watches for changes to WasmOperator Custom Resources in the cluster and act accordingly.
     async fn wasmoperator_watch_loop(self: Arc<Self>, op_shutdown_tx: mpsc::Sender<String>) -> Result<()> {
         let k8s_service: Arc<KubernetesService> = KubernetesService::global().await?;
 

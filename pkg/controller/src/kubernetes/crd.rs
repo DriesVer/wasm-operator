@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+/// Represents an environment variable for a Wasm component.
 pub struct EnvironmentVariable {
     pub name: String,
     pub value: String,
@@ -29,6 +30,7 @@ pub struct EnvironmentVariable {
     printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
+/// Specification for a WasmOperator Custom Resource.
 pub struct WasmOperatorSpec {
     pub wasm: WasmSource,
     #[serde(default)]
@@ -39,6 +41,7 @@ pub struct WasmOperatorSpec {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+/// Defines the source of the WebAssembly module.
 pub enum WasmSource {
     #[serde(rename_all = "camelCase")]
     Pvc { path: String, file: String },
@@ -47,6 +50,7 @@ pub enum WasmSource {
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+/// Status information for a WasmOperator Custom Resource.
 pub struct WasmOperatorStatus {
     pub state: WasmOperatorState,
     pub last_updated: DateTime<Utc>,
@@ -58,6 +62,7 @@ pub struct WasmOperatorStatus {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+/// Represents the current state of a WasmOperator.
 pub enum WasmOperatorState {
     Unclaimed,
     Running,
@@ -68,6 +73,7 @@ pub enum WasmOperatorState {
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+/// Runtime statistics for a WasmOperator.
 pub struct WasmOperatorStatistics {
     pub reconcile_total_24h: u32,
     #[schemars(range(min = 0, max = 255))]

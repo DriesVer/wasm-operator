@@ -14,6 +14,7 @@ use crate::host::wit::bindings::local::kube::api::{
     PatchParams, PatchType, Preconditions, PropagationPolicy, ValidationDirective, VersionMatch,
 };
 
+/// Returns a dynamic Kubernetes API client for a given resource.
 pub fn get_dynamic_api(
     client: Client,
     namespace: Option<String>,
@@ -26,6 +27,7 @@ pub fn get_dynamic_api(
     }
 }
 
+/// Returns a metadata-only Kubernetes API client for a given resource.
 pub fn get_meta_api(
     client: Client,
     api: &ApiResource,
@@ -144,6 +146,7 @@ impl From<PatchParams> for KubePatchParams {
     }
 }
 
+/// Converts a WIT patch representation to a Kubernetes Patch.
 pub fn to_kube_patch(
     patch_type: PatchType,
     body: JsonValue,

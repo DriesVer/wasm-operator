@@ -11,30 +11,24 @@ For more information, read the paper [Adapting Kubernetes controllers to the edg
 This project builds upon [this proof of concept](https://github.com/slinkydeveloper/extending-kubernetes-api-in-process-poc).
 
 ```text
-TODO: layout repo
++-- 📂examples                          # All child operators / wasmoperators that can be used as reference
+|   +-- 📂ring-rust-operator            # Rust operator used in a ring benchmark
+|   +-- 📂simple-rust-operator          # Rust operator used for simple tests and demonstrations
 
-+-- 📂controllers                       # All child operators / components used for testing
-|   +-- 📂comb-rust-controller          # Rust combined operator (no isolation)
-|   +-- 📂ring-go-controller            # Go operator (container-based)
-|   +-- 📂ring-rust-controller          # Rust operator (container-based and WASM-based)
-|   +-- 📂simple-rust-controller        # simple child operator (container-based and WASM-based)
-|   +-- 📂value-changer                 # script to change watched resources based on traces to emulate resource changes
-    +-- 📂mongodbSpammer                # script that spams a mongodb server, to test influence of heavy load server on reconcile time
+|   :
++-- 📂pkg                               # Packages developed for the WasmOperator Framework
+|   +-- 📂controller                    # Parent controller
+|   +-- 📂kube-rs                       # Modified kube-rs library used in WasmOperators to communicate with the parent controller
+|   +-- 📂wasmtime                      # Modified Wasmtime library that enables snapshotting of the WebAssembly Store of Wasm Components
+|   +-- 📂wit                           # WIT Interface for the communication between a WasmOperator and parent controller
 
 |   :
 +-- 📂devel                             # Tools for building & deploying
-+-- 📂full_test                         # Scripts for running e2e test & benchmark
-    +-- run_wasm.sh                     # Script to run the  wasm based operator inside our framework, this is the main script
-+-- 📂pkg
-|   +-- 📂controller                    # Parent controller
-|   +-- 📂kube-rs                       # Modified kube-rs library
-|   +-- 📂kube-runtime-abi              # ABI for making Kubernetes API requests from within child operator
+
 |   :
-+-- 📂profile                           # Cgroup v2 memory usage measuring
-+-- 📂test                              # Deployment files for tests
++-- 📂test                              # Deployment files for parent and metrics sever, and directory used as wasm source
 +-- 📂prediction                        # Prediction related benchmarks/server
-    +-- 📂models                        # Tests/experiments using different prediction models
-    +-- 📂webserver                     # Webserver flask api that predicts future values
+    +-- 📂webserver                     # Webserver flask api that predicts future values, used to predict wakeup times
 :
 ```
 
@@ -50,45 +44,7 @@ We greatly value feedback, bug reports, contributions,... during this stage of t
 
 ### Setup of the project
 
-A list of dependencies and the steps for setting up the project can be found in the [Setup documentation](./docs/setup.md).
-
-Note that this does not deploy the parent operator (yet).
-Due to this project still being in active development, child operators can't be loaded at runtime and have to be copied (in combination with the configuration) to the Docker image.
-It is thus more appropriate to explain the setup of the operator in the [Usage section](./docs/usage.md).
-
-### Using the prototype and deploying child operators
-
-The project currently contains 3 operators that have been created to test the WASM prototype. The setup of the parent operator and these child operators can be found in [Usage documentation](./docs/usage.md). There is currently no reason why operators that can be compiled down to WASM wouldn't work out of the box, but this has currently not been tested. We welcome contributions / experiences about the use of the prototype.
-
-> [!NOTE]
-> The current [Usage documentation](./docs/usage.md) mainly focusses on the simple-rust-controller, since this is the most recent one.
-> The instructions should however also work for the comb-rust-controller and ring-rust-controller since these are very similar.
-
-### Testing the simple-rust, ring-rust and comb-rust controllers
-
-The deployed operator should work as normal when the setup and usage sections have been fulfilled. In order to test this for the provided examples, we have provided a test function that can be executed. This is however very WIP. It can be found in the [Testing documentation](./docs/testing.md)
-
-### Profiling the simple-rust, ring-rust and comb-rust controllers
-
-Profiling currently happens through a Python script.
-More information can be found (WIP) in the [Profiling documentation](./docs/profiling.md)
-
-## Benchmark the solutions
-
-The scripts below are the original way the project was to be tested.
-They install the required dependencies in case they can't be found and execute the other steps outlined in the Setup and Usage sections above.
-
-### Testing the native Rust, Go and WASM-Rust solutions for different parameters
-
-```sh
-./full_test/run.sh
-```
-
-## Testing the WASM-Rust solution with prediction
-
-```sh
-./full_test/run_wasm.sh
-```
+A list of dependencies and the steps for getting started with the project can be found in the [Quick Start documentation](./docs/quick_start.md).
 
 ## Copyright
 

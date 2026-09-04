@@ -1,3 +1,4 @@
+/// Module containing the generated WIT bindings for the Wasm Operator.
 pub mod bindings {
     wasmtime::component::bindgen!({
         path: "../wit",

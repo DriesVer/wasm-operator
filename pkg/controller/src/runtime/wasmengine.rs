@@ -6,11 +6,13 @@ use wasmtime::Engine;
 
 static WASM_ENGINE: OnceCell<Engine> = OnceCell::const_new();
 
+/// Trait for managing a global singleton instance of the Wasmtime Engine.
 pub trait WasmEngineSingleton {
     fn global() -> impl std::future::Future<Output = anyhow::Result<&'static wasmtime::Engine>>;
 }
 
 impl WasmEngineSingleton for wasmtime::Engine {
+    /// Returns a reference to the global engine.
     async fn global() -> Result<&'static Engine> {
         WASM_ENGINE
             .get_or_try_init(|| async {
@@ -31,13 +33,16 @@ impl WasmEngineSingleton for wasmtime::Engine {
 
 static HOST_MONOTONIC_START: OnceLock<Instant> = OnceLock::new();
 
+/// A global monotonic clock to have a consistent time reference across all Wasm operators and between wakeups. This is important for the correct functioning of the `sleep` function in the Wasm operators, as it relies on a consistent time reference to determine when to wake up.
 pub struct GlobalMonotonicClock;
 
 impl wasmtime_wasi::HostMonotonicClock for GlobalMonotonicClock {
+    /// Returns the resolution of the clock.
     fn resolution(&self) -> u64 {
         1_000_000 // 1ms resolution, safe bet for most systems, (Most systems are ns, even browsers are couple microseconds)
     }
 
+    /// Returns the current time of the monotonic clock.
     fn now(&self) -> u64 {
         let start = HOST_MONOTONIC_START.get_or_init(Instant::now);
         start.elapsed().as_nanos() as u64

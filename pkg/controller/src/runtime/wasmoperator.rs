@@ -36,6 +36,7 @@ pub type OperatorUid = String;
 // TODO: add wasm_hash to wasmoperator CRD
 
 // This struct is a reduced version of the WasmOperator CRD that only contains the fields relevant for the runtime, this way we can reduce the memory usage of one WasmOperatorRuntime instance by not storing the entire CRD spec in memory.
+/// A memory-efficient representation of a WasmOperator Custom Resource.
 pub struct WasmOperatorReduced {
     pub name: String,
     pub generation: Option<i64>,
@@ -47,6 +48,7 @@ pub struct WasmOperatorReduced {
     pub args: Vec<String>,
 }
 impl From<&WasmOperatorCR> for WasmOperatorReduced {
+    /// Converts a full WasmOperator Custom Resource into a reduced version.
     fn from(cr: &WasmOperatorCR) -> Self {
         Self {
             name: cr.name_any(),
@@ -60,6 +62,7 @@ impl From<&WasmOperatorCR> for WasmOperatorReduced {
     }
 }
 
+/// Commands that can be sent to a WasmOperatorRuntime.
 pub enum WORCommand {
     StartOperator,
     LoadAt(DateTime<Utc>),
@@ -73,11 +76,13 @@ pub enum WORCommand {
     CheckIdle(Duration, Duration, tokio::sync::oneshot::Sender<bool>),
 }
 
+/// State of an operator when it is actively loaded in memory.
 struct LoadedState {
     operator: bindings::Wasmoperator,
     store: Mutex<Store<State>>,
 }
 
+/// State of an operator when it is unloaded to disk.
 struct UnloadedState {
     // TODO: state path is deterministic, we can remove it
     // Path to the serialized memory file.
@@ -85,11 +90,13 @@ struct UnloadedState {
 }
 
 // Use boxed variants to reduce enum size
+/// Enum representing the current loaded or unloaded state of an operator.
 enum OperatorState {
     Loaded(Arc<LoadedState>),
     Unloaded(Arc<UnloadedState>),
 }
 
+/// Manages the runtime execution and lifecycle of a specific WasmOperator.
 pub struct WasmOperatorRuntime {
     pub cr: WasmOperatorReduced,
     pub cmd_tx: mpsc::UnboundedSender<WORCommand>, // Channel for sending commands to the operator's command handler
@@ -106,6 +113,7 @@ pub struct WasmOperatorRuntime {
 }
 
 impl WasmOperatorRuntime {
+    /// Creates a new WasmOperatorRuntime and starts its command handler.
     pub fn new(
         wasmop_cr: WasmOperatorReduced,
         shutdown_tx: mpsc::Sender<OperatorUid>,
@@ -137,6 +145,7 @@ impl WasmOperatorRuntime {
         self_
     }
 
+    /// Main loop for handling incoming commands to the operator.
     async fn handle_commands_loop(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<WORCommand>) {
         let mut watch_events: VecDeque<(
             bindings::local::kube::api::WatchId,
@@ -287,6 +296,7 @@ impl WasmOperatorRuntime {
         }
     }
 
+    /// Checks if the operator is currently loaded in memory.
     fn is_loaded(&self) -> bool {
         if let Ok(state_guard) = self.state.try_read() {
             matches!(*state_guard, OperatorState::Loaded(_))
@@ -295,6 +305,7 @@ impl WasmOperatorRuntime {
         }
     }
 
+    /// Patches the status of the operator Kubernetes Custom Resource.
     async fn patch_k8s_status(&self, state: WasmOperatorState) -> Result<()> {
         let k8s_service: Arc<KubernetesService> = KubernetesService::global()
             .await
@@ -322,6 +333,7 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    /// Throttled version of patch_k8s_status to prevent excessive API calls.
     async fn patch_k8s_status_throttled(
         &self,
         state: WasmOperatorState,
@@ -335,6 +347,7 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    /// Logs a fatal error and signals the operator to shut down.
     async fn throw_fatal_error<T>(&self, message: &str) -> Result<T> {
         self.stats.record_error(message).await;
         self.patch_k8s_status_throttled(WasmOperatorState::Error, true)
@@ -347,6 +360,7 @@ impl WasmOperatorRuntime {
         Err(anyhow::anyhow!(message.to_string()))
     }
 
+    /// Determines the file path for swapping the operator state to disk.
     fn get_swap_path(&self) -> PathBuf {
         PathBuf::from(format!(
             "{}/memory/{}_{}.mem",
@@ -356,6 +370,7 @@ impl WasmOperatorRuntime {
         ))
     }
 
+    /// Determines the file path for caching the compiled WASM component.
     async fn get_cache_path(&self) -> PathBuf {
         let wasm_hash = self.cr.wasm_hash.lock().await.clone().unwrap_or_default();
         let target_arch = Triple::host();
@@ -365,6 +380,7 @@ impl WasmOperatorRuntime {
         ))
     }
 
+    /// Unloads the operator from memory, serializing its state to disk.
     async fn unload(&self) -> Result<()> {
         // Acquire write lock and extract the loaded state
         let mut state_guard = self.state.write().await;
@@ -406,6 +422,7 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    /// Loads the operator into memory, restoring state from disk if available.
     async fn load(self: Arc<Self>) -> Result<()> {
         info!("Loading operator {}...", self.cr.name);
 
@@ -460,6 +477,7 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    /// Schedules the operator to be loaded at a specific time.
     async fn load_at(self: Arc<Self>, timestamp: DateTime<Utc>) {
         let self_clone = self.clone();
 
@@ -489,6 +507,7 @@ impl WasmOperatorRuntime {
         });
     }
 
+    /// Loads a compiled WASM component from the disk cache.
     async fn load_cached_cwasm_file(&self, cache_path: &PathBuf) -> Result<Component> {
         let wasmtime_engine = wasmtime::Engine::global().await?;
         let component_bytes = tokio::fs::read(cache_path).await?;
@@ -506,6 +525,7 @@ impl WasmOperatorRuntime {
         }
     }
 
+    /// Retrieves a cached component or compiles the WASM from source.
     async fn get_or_compile_component(&self) -> Result<Component> {
         // Get hash or compute it if not present
         let mut wasm_hash_guard = self.cr.wasm_hash.lock().await;
@@ -595,6 +615,7 @@ impl WasmOperatorRuntime {
         Ok(component)
     }
 
+    /// Instantiates a new WASM component and sets up its WASI environment.
     async fn load_wasm_instance(self: Arc<Self>) -> Result<(bindings::Wasmoperator, Store<State>)> {
         let component = self.get_or_compile_component().await?;
 
@@ -632,6 +653,7 @@ impl WasmOperatorRuntime {
         Ok((operator, store))
     }
 
+    /// Loads the raw WASM binary file from the configured source.
     async fn load_wasm_file(&self) -> Result<Vec<u8>> {
         match self.cr.wasm.clone() {
             WasmSource::Pvc { path, file } => {
@@ -648,6 +670,7 @@ impl WasmOperatorRuntime {
         }
     }
 
+    /// Executes the operator until it yields or stalls.
     async fn run_until_stalled(self: &Arc<Self>) -> Result<()> {
         let owned_state_guard = self.state.clone().read_owned().await;
 
@@ -694,6 +717,7 @@ impl WasmOperatorRuntime {
         out
     }
 
+    /// Cancels ongoing execution and waits for tasks to finish.
     async fn stop_execution(&self) {
         // Cancel all active loops including watchers
         self.shutdown_token.cancel();
@@ -703,6 +727,7 @@ impl WasmOperatorRuntime {
         self.task_tracker.wait().await;
     }
 
+    /// Shuts down the operator and cleans up temporary files.
     async fn shutdown(&self) -> Result<()> {
         info!("Shutting down operator '{}'...", self.cr.name);
         self.stop_execution().await;
@@ -719,6 +744,7 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    /// Pauses the operator execution and updates its status.
     async fn pause(&self) -> Result<()> {
         info!("Pausing operator '{}'...", self.cr.name);
         // TODO: first unload the operator to disk so state can be shared
@@ -728,12 +754,14 @@ impl WasmOperatorRuntime {
         Ok(())
     }
 
+    /// Updates the timestamp of the operator last activity.
     pub fn update_last_active(&self) {
         let now_ms: i64 = Utc::now().timestamp_millis();
         self.last_active.store(now_ms, Ordering::SeqCst);
         self.executed_idle.store(0, Ordering::SeqCst);
     }
 
+    /// Executes a function via the operator WIT interface, loading it if necessary.
     pub async fn execute_via_wit<F, T>(self: Arc<Self>, f: F, update_last_active: bool) -> Result<T>
     where
         for<'a> F: FnOnce(&'a bindings::Wasmoperator, &'a mut Store<State>) -> Result<T>,
@@ -768,6 +796,7 @@ impl WasmOperatorRuntime {
         result
     }
 
+    /// Determines if the operator has been idle based on configured thresholds.
     pub async fn is_idle(&self, idle_threshold: Duration, execute_threshold: Duration) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Err(e) =
@@ -787,6 +816,7 @@ impl WasmOperatorRuntime {
         }
     }
 
+    /// Retrieves the history of recent reconciles for the operator.
     pub async fn get_reconcile_history(&self) -> Vec<DateTime<Utc>> {
         self.stats.get_recent_reconcile_history().await
     }

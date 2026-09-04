@@ -8,12 +8,14 @@ use crate::kubernetes::crd::WasmOperatorStatistics;
 
 // TODO: maybe use prometheus but prometheus can be more resource intensive
 
+/// An asynchronous, fixed-size FIFO buffer.
 struct AsyncFixedFifoBuffer<T> {
     data: Mutex<VecDeque<T>>,
     limit: usize,
 }
 
 impl<T> AsyncFixedFifoBuffer<T> {
+    /// Creates a new instance.
     fn new(limit: usize) -> Self {
         Self {
             data: Mutex::new(VecDeque::with_capacity(limit)),
@@ -21,6 +23,7 @@ impl<T> AsyncFixedFifoBuffer<T> {
         }
     }
 
+    /// Pushes a new item into the buffer, removing the oldest if at the limit.
     async fn push(&self, item: T) {
         let mut data = self.data.lock().await;
         if data.len() >= self.limit {
@@ -30,6 +33,7 @@ impl<T> AsyncFixedFifoBuffer<T> {
     }
 
     #[allow(unused)]
+    /// Returns the most recently added item in the buffer.
     async fn get_last_added(&self) -> Option<T>
     where
         T: Clone,
@@ -38,6 +42,7 @@ impl<T> AsyncFixedFifoBuffer<T> {
         data.back().cloned()
     }
 
+    /// Returns all items in the buffer, optionally in reverse order.
     async fn get_all(&self, reverse: bool) -> Vec<T>
     where
         T: Clone,
@@ -51,12 +56,14 @@ impl<T> AsyncFixedFifoBuffer<T> {
     }
 
     #[allow(unused)]
+    /// Clears all items from the buffer.
     async fn clear(&self) {
         let mut data = self.data.lock().await;
         data.clear();
     }
 }
 
+/// Records runtime statistics and metrics for a WasmOperator.
 pub struct WasmOperatorStatisticsRecorder {
     //last_reconcile: AtomicI64,   // Unix timestamp in hours of last reconcile
     recent_reconcile_history: AsyncFixedFifoBuffer<i64>, // Unix timestamps in milis of last reconciles
@@ -81,6 +88,7 @@ pub struct WasmOperatorStatisticsRecorder {
 }
 
 impl WasmOperatorStatisticsRecorder {
+    /// Creates a new instance.
     pub fn new() -> Self {
         let err_buffer_size = option_env!("WASMOP_ERROR_LOG_SIZE")
             .and_then(|s| s.parse().ok())
@@ -102,6 +110,7 @@ impl WasmOperatorStatisticsRecorder {
         }
     }
 
+    /// Records a reconcile event, updating historical data and counters.
     pub async fn record_reconcile(&self) {
         let now = Utc::now().timestamp_millis();
         let last_reconcile = self
@@ -131,6 +140,7 @@ impl WasmOperatorStatisticsRecorder {
         self.reconcile_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records the duration of a Wasm module load operation.
     pub fn record_load_duration(&self, duration_ms: u32) {
         self.load_total_duration_ms
             .fetch_add(duration_ms as u64, Ordering::Relaxed);
@@ -138,10 +148,12 @@ impl WasmOperatorStatisticsRecorder {
             .fetch_max(duration_ms, Ordering::Relaxed);
     }
 
+    /// Records the current memory usage of the operator.
     pub fn record_memory_usage(&self, bytes: u32) {
         self.memory_usage_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Records a load operation, updating idle durations.
     pub fn record_loading_operation(&self) {
         self.load_unload_op_total.fetch_add(1, Ordering::Relaxed);
 
@@ -157,6 +169,7 @@ impl WasmOperatorStatisticsRecorder {
         }
     }
 
+    /// Records an unload operation, updating active durations.
     pub fn record_unloading_operation(&self) {
         self.load_unload_op_total.fetch_add(1, Ordering::Relaxed);
 
@@ -172,6 +185,7 @@ impl WasmOperatorStatisticsRecorder {
         }
     }
 
+    /// Logs an error encountered during operator execution.
     pub async fn record_error(&self, error: &str) {
         self.error_log
             .push(format!(
@@ -182,24 +196,28 @@ impl WasmOperatorStatisticsRecorder {
             .await;
     }
 
+    /// Calculates the total number of reconciles in the last 24 hours.
     fn get_reconcile_total_24h(&self) -> u32 {
         self.reconciles.iter().fold(0, |acc, hour_count| {
             acc + hour_count.load(Ordering::Relaxed) as u32
         })
     }
 
+    /// Calculates the total number of load operations.
     fn get_load_total(&self) -> u64 {
         // The load counter is represented in the odd state of the load/unload counter
         // We use a ceil to get the total number of load operations
         (self.load_unload_op_total.load(Ordering::Relaxed) + 1) / 2
     }
 
+    /// Calculates the total number of unload operations.
     fn get_unload_total(&self) -> u64 {
         // The unload counter is represented in the even state of the load/unload counter
         // We use a floor to get the total number of unload operations
         self.load_unload_op_total.load(Ordering::Relaxed) / 2
     }
 
+    /// Calculates the ratio of cold starts to total reconciles.
     fn get_reconcile_cold_start_ratio(&self) -> u8 {
         let total_reconciles = self.reconcile_total.load(Ordering::Relaxed);
         if total_reconciles == 0 {
@@ -211,6 +229,7 @@ impl WasmOperatorStatisticsRecorder {
         cold_start_ratio as u8
     }
 
+    /// Calculates the average duration of WASM load operations.
     fn get_wasm_load_duration_msec_avg(&self) -> u32 {
         let load_total = self.get_load_total();
         if load_total == 0 {
@@ -219,6 +238,7 @@ impl WasmOperatorStatisticsRecorder {
         (self.load_total_duration_ms.load(Ordering::Relaxed) / load_total) as u32
     }
 
+    /// Calculates the ratio of active time to total time.
     fn get_activity_ratio(&self) -> u8 {
         let idle_duration = self.idle_total_duration_s.load(Ordering::Relaxed);
         let running_duration = self.active_total_duration_s.load(Ordering::Relaxed);
@@ -229,6 +249,7 @@ impl WasmOperatorStatisticsRecorder {
         ((running_duration * 100) / total_duration) as u8
     }
 
+    /// Calculates the average duration of idle periods.
     fn get_idle_duration_sec_avg(&self) -> u64 {
         let unload_total = self.get_unload_total();
         if unload_total == 0 {
@@ -237,6 +258,7 @@ impl WasmOperatorStatisticsRecorder {
         self.idle_total_duration_s.load(Ordering::Relaxed) / unload_total
     }
 
+    /// Calculates the average duration of active running periods.
     fn get_running_duration_s_avg(&self) -> u64 {
         let load_total = self.get_load_total();
         if load_total == 0 {
@@ -245,6 +267,7 @@ impl WasmOperatorStatisticsRecorder {
         self.active_total_duration_s.load(Ordering::Relaxed) / load_total
     }
 
+    /// Generates a comprehensive statistics report for the operator.
     pub async fn get_statistics(&self) -> WasmOperatorStatistics {
         WasmOperatorStatistics {
             reconcile_total_24h: self.get_reconcile_total_24h(),
@@ -261,6 +284,7 @@ impl WasmOperatorStatisticsRecorder {
         }
     }
 
+    /// Returns the recent reconcile history as timestamps.
     pub async fn get_recent_reconcile_history(&self) -> Vec<DateTime<Utc>> {
         self.recent_reconcile_history
             .get_all(false)

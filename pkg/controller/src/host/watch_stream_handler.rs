@@ -26,6 +26,7 @@ use tokio_stream::StreamMap;
 type WatcherResult = Result<KubeWatchEvent<DynamicObject>, KubeError>;
 type BoxedWatchStream = Pin<Box<dyn Stream<Item = Option<WatcherResult>> + Send>>;
 
+/// Commands for the stream manager background worker.
 enum StreamManagerCmd {
     Register {
         signature: WatchStreamSignature,
@@ -35,6 +36,8 @@ enum StreamManagerCmd {
     },
 }
 
+/// Manages Kubernetes watch streams and distributes events to operators.
+/// Is used in tandem with a WatchStreamHandler in the WasmOperator itself. (Inside Kube-rs package)
 pub struct WatchStreamHandler {
     cmd_tx: mpsc::UnboundedSender<StreamManagerCmd>,
     last_event_versions: DashMap<u64, String>, // Maps WatchStreamSignature hash to last seen resource version that was an actual event (not a bookmark)
@@ -42,6 +45,7 @@ pub struct WatchStreamHandler {
 }
 
 #[derive(Clone, Debug)]
+/// Signature identifying a unique watch stream configuration.
 pub struct WatchStreamSignature {
     group: String,
     api_version: String,
@@ -63,6 +67,7 @@ impl WatchStreamSignature {
         self.hash
     }
 
+    /// Calculates and caches the hash for the watch stream signature.
     fn calculate_hash(&mut self) {
         let mut hasher = DefaultHasher::new();
         self.group.hash(&mut hasher);
@@ -403,10 +408,12 @@ static WATCH_STREAM_HANDLER: LazyLock<Arc<WatchStreamHandler>> = LazyLock::new(|
 });
 
 impl WatchStreamHandler {
+    /// Returns the global instance of the watch stream handler.
     pub fn get_instance() -> Arc<Self> {
         WATCH_STREAM_HANDLER.clone()
     }
 
+    /// Creates a new watch stream from the Kubernetes API.
     async fn get_watch_stream_from_signature(
         signature: &WatchStreamSignature,
         cluster_version: &str,
@@ -426,6 +433,7 @@ impl WatchStreamHandler {
         Ok(Box::pin(stream_with_eof))
     }
 
+    /// Registers an operator to a watch stream and returns the watch ID.
     pub async fn register_watch_stream(
         &self,
         operator: Arc<WasmOperatorRuntime>,

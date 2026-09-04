@@ -7,6 +7,7 @@ const PREDICTION_SERVICE_PORT: u16 = 5000;
 
 #[allow(dead_code)]
 #[derive(Serialize)]
+/// Supported prediction models for reconcile forecasting.
 pub enum PredictionModel {
     AutoReg,
     ARIMA,
@@ -17,16 +18,19 @@ pub enum PredictionModel {
 }
 
 #[derive(Serialize)]
+/// Request payload for the prediction service.
 struct PredictionRequest {
     history: Vec<DateTime<Utc>>,
     function: PredictionModel,
 }
 
 #[derive(Deserialize, Debug)]
+/// Response from the prediction service containing the next prediction.
 struct PredictionResponse {
     prediction: DateTime<Utc>,
 }
 
+/// Fetches the next reconcile prediction from the prediction service.
 pub async fn get_next_reconcile_prediction(
     history: Vec<DateTime<Utc>>,
     model: PredictionModel,

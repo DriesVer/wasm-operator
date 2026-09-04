@@ -12,6 +12,7 @@ use crate::runtime::wasmoperator::WasmOperatorRuntime;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
+/// Holds the context and resources for a WebAssembly component instance.
 pub struct State {
     pub operator: Arc<WasmOperatorRuntime>,
     pub wasi_ctx: WasiCtx,

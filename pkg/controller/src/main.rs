@@ -21,6 +21,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use crate::runtime::wasmengine::WasmEngineSingleton;
 use crate::shutdown::wait_for_shutdown;
 
+/// Main entry point for the parent controller.
 fn main() -> anyhow::Result<()> {
     let debug = parse_args()?;
 
@@ -68,12 +69,14 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parameters for configuring logging levels/
 struct LoggingParams {
     base_level: String,
     http_level: Option<String>,
     kube_level: Option<String>,
 }
 
+/// Initializes the global logging subscriber.
 fn setup_logging(params: LoggingParams) {
     let mut filter = EnvFilter::new(&params.base_level);
 
@@ -111,6 +114,7 @@ fn setup_logging(params: LoggingParams) {
     }
 }
 
+/// Parses command-line arguments to determine logging levels.
 fn parse_args() -> anyhow::Result<LoggingParams> {
     let args: Vec<String> = env::args().collect();
     let mut logging_params = LoggingParams {
